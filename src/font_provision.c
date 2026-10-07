@@ -70,7 +70,7 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t *p, uint32_t n)
 
 /* 从 XIP（memory-mapped）读回算 CRC，用来复核记账头。
  * 调用前必须已进入映射模式 —— 见 font_provision_ensure()。 */
-static uint32_t crc32_of_xip(uint32_t off, uint32_t n)
+uint32_t font_crc32_xip(uint32_t off, uint32_t n)
 {
     const uint8_t *p = (const uint8_t *)(QSPI_XIP_BASE + off);
     uint32_t       crc = 0xFFFFFFFFu;
@@ -125,7 +125,7 @@ int font_provision_ensure(void)
     {
         if (qspi_enter_mmap() == QSPI_OK)
         {
-            g_font_crc_calc = crc32_of_xip(0u, src_size);
+            g_font_crc_calc = font_crc32_xip(0u, src_size);
             if (g_font_crc_calc == hdr.crc)
             {
                 g_font_ok = 1;
@@ -181,7 +181,7 @@ int font_provision_ensure(void)
             }
         }
         g_font_cmp_bytes = src_size;
-        g_font_crc_calc  = crc32_of_xip(0u, src_size);
+        g_font_crc_calc  = font_crc32_xip(0u, src_size);
     }
 
     if (g_font_mismatch != 0u)

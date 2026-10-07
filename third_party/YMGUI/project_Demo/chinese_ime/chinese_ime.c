@@ -960,7 +960,7 @@ int main(int argc, char** argv)
 #else
 	loadEnglishDictionary();
 #endif
-	if (S_CHAR_COUNT > 0) s_char_matches = (const ImeCharEntry**)GY_malloc1((size_t)S_CHAR_COUNT * sizeof(*s_char_matches));
+	if (s_char_match_cap > 0) s_char_matches = (ImeCharEntry*)GY_malloc1((size_t)s_char_match_cap * sizeof(*s_char_matches));
 	GYOBJ title = YMGUI_Creat_Label_Creat(g_ctx->root, 24, 18, SCR_W - 48, 28);
 	YMGUI_Label_SetText(title, "中文拼音输入法"); YMGUI_Label_SetTextColor(title, GY_ARGB(0xFF, 0x70, 0xD8, 0xFF));
 	g_output = YMGUI_Creat_EditView_Creat(g_ctx->root, 24, 54, SCR_W - 48, 106, 4096);

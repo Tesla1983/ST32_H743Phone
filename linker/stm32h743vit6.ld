@@ -117,6 +117,32 @@ SECTIONS
     _edma_bss = .;
   } > SRAM1
 
+  /* ---- QSPI 灌库暂存区（2026-10-07，方案 B 配套）----
+   * 词组词典 1.27 MB 装不进内部 flash，只能由 host 经 SWD **分块**送进来
+   * （见 src/qspi_provision.h 的长注释）。暂存区 16 KB。
+   *
+   * 为什么也放 SRAM1：
+   *   1. 与 .bss_dma 同区、且不抢 heap1（AXI）；SRAM1 有 128 KB，
+   *      .bss_dma 只用了 512 B，这里再占 16 KB 无压力；
+   *   2. QSPI 的 indirect 收发是 **CPU 轮询 DR**（见 qspi_port.c，无 DMA），
+   *      所以源缓冲只要在 CPU 能直访的地址上就行，不存在 DMA 可达性问题；
+   *   3. MPU region3 把 0x3000_0000 起配成 cacheable —— 而 CPU 刚写完这块缓冲
+   *      就要交给 QSPI 发走，缓存一致性靠 FORCEWT=1（写直达）保证，
+   *      与 .bss_dma 台架实测的"0/64 失配"是同一条依据。
+   *
+   * ⚠ 两条位置陷阱同 .bss_dma：必须在 `.bss` 输出段**之前**（否则被 `*(.bss*)`
+   *   通配静静吃掉），且 NOLOAD（16 KB 不占 bin 体积）。
+   *   **不需要**在 board_startup.c 清零：每块都由 host 完整填满后才触发搬运。 */
+  .bss_prov (NOLOAD) :
+  {
+    . = ALIGN(32);
+    _sprov_bss = .;
+    *(.bss_prov)
+    *(.bss_prov.*)
+    . = ALIGN(32);
+    _eprov_bss = .;
+  } > SRAM1
+
   /* ---- 第二块 band buffer（2026-10-04，第 7a 项：flush 与渲染重叠）----
    * 放 **D2 域 SRAM3（0x3004_0000，32 KB）**，此前完全空闲。理由：
    *   1. 与 DMA1 同属 D2 域，DMA 读它不必跨域；且**不占 heap1（AXI）** ——

@@ -47,6 +47,7 @@
  *   同一 TU 里 typedef 重复声明在 C99 是错误，两处各写一份迟早会撞上。 */
 #include "YMGUI_DrawPx.h"
 #include "qspi_port.h"
+#include "qspi_provision.h"
 #include "font_provision.h"
 #include "phone_locale.h"
 #include "phone_lang.h"
@@ -68,6 +69,12 @@ volatile int32_t  g_ctx_rc     = 0;           /* 1 = 上下文创建成功 */
 volatile int32_t  g_shell_rc   = 99;          /* PhoneShell_BoardInit 的返回值，0 = 成功 */
 volatile uint32_t g_tick_ms    = 0;           /* 上一拍实测经过的毫秒数 */
 volatile uint32_t g_dwt_hz     = 0;           /* DWT 计数频率（= CPU 主频），用于核对时基 */
+
+/* CYCCNT 快照：给不直接包含 CMSIS 头的模块（如 phone_ime.c 的按键耗时台架）用。 */
+uint32_t BoardCycNow(void)
+{
+	return DWT->CYCCNT;
+}
 /* 循环内打点：用于定位主循环卡在哪一步（0=没到，>0=已到） */
 volatile uint32_t g_mark_tick  = 0;           /* 已注入 Tick */
 volatile uint32_t g_mark_poll  = 0;           /* 已跑完 touch_port_poll */
@@ -414,6 +421,123 @@ static void run_render_micro(void)
     g_micro_test = 0u;
 }
 
+#if defined(YMGUI_XIP_BENCH)
+/* ---- XIP 读延迟台架（2026-10-07）------------------------------------------
+ *
+ * 【为什么必须有它】docs/IME_PHRASE_DICT_FEASIBILITY.md §6：词组词典要不要上
+ * 外部 flash（方案 B），唯一没解决的是 XIP 的**随机读延迟**。理论下界算得出来
+ * （QSPI 100MHz：指令单线 + 地址四线 + 6 dummy + 数据四线 ≈ 22~28 clk
+ * ⇒ 220~280 ns），但 XIP 区是 NOT_CACHEABLE + NOT_BUFFERABLE 强序，
+ * "每条 load 一次事务"这条推论**必须上板量**，不能靠算 —— 它直接决定
+ * 方案 B 是"亚毫秒"还是"每次击键掉一帧"。
+ *
+ * 【原语 case：ns/次事务】
+ * case 20  XIP 随机 4 字节对齐读       → 单次 QSPI 事务的真实成本（随机，必踩空）
+ * case 21  XIP 顺序 4 字节读（步长 16）→ 稀疏顺序流（每 16 B 取 4 B）
+ * case 22  XIP 随机 1 字节读           → readLe32 逐字节拼 / 字符串比较的代价
+ * case 26  内部 flash 随机 4 字节对齐读（与 20 对照，算倍率）
+ * case 27  XIP 顺序 1 字节读（步长 1） → **探测有没有 read-ahead 红利**：
+ *                                       若它远快于 22，说明 QUADSPI 会把顺序流
+ *                                       预取进 FIFO，那么"布局密度"就是决定性变量
+ *
+ * 【扫描模型 case：ms/次查询】每条记录 16 B：3 次对齐 u32 读（拼音/词/词频三个
+ * 偏移）+ 6 次字节读（前缀比较，按查询长度 6 计）+ 3 次字节读（词串 UTF-8）
+ * = **12 次事务/条**。保守上界：真实查询里只有前缀命中的条目才需要读词串。
+ *   case 23  472 条（二级桶均值）   · 密集：字符串步长 7 / 4（重排后的理想布局）
+ *   case 24  3256 条（最坏桶 sh）   · 密集
+ *   case 28  472 条                 · **真实步长**：字符串步长 17（实测 17.4 B/条）
+ *   case 29  3256 条                · 真实步长
+ *   case 30  472 条                 · 记录间地址全随机（只有记录内 3 次读连续）
+ *   case 25  472 条，打内部 flash   · 与 23 同模式，算倍率
+ *
+ * ⚠ 模型不依赖被读区域的内容（地址按固定步长推进、每次读固定字节数），
+ *   所以可以直接打在还是空白（全 0xFF）的 IME 保留区 0x90300000 上 ——
+ *   事务时序只跟地址和总线属性有关，跟读到什么值无关。
+ *
+ * 【窗口】外部与内部都用 960 KB（0xF0000），苹果对苹果。内部那份是
+ * .rodata.gb2312（982 KB，运行期唯一的大块只读常量），并向上对齐到 4 字节，
+ * 免得未对齐 u32 读把内部那一侧人为拖慢。
+ */
+extern const uint8_t _binary_gb2312_bin_start[];
+
+#define XB_WIN           0xF0000u                     /* 960 KB */
+#define XB_XIP           (QSPI_XIP_BASE + 0x300000u)  /* 0x90300000：IME 词典预留区 */
+#define XB_N_RAND        8192u
+#define XB_ENTRIES_MEAN  472u                         /* 二级桶均值 */
+#define XB_ENTRIES_WORST 3256u                        /* 二级桶最大（'sh'） */
+
+static uint32_t xb_lcg(uint32_t s) { return s * 1103515245u + 12345u; }
+
+static void run_xip_micro(void)
+{
+    uint32_t t = g_micro_test;
+    volatile uint32_t sink = 0u;
+    uint32_t cyc = 0u, ops = 0u;
+
+    if (t < 20u || t > 30u) return;
+
+    if (t == 20u || t == 21u || t == 22u || t == 26u || t == 27u)
+    {
+        const uint8_t* base = (t == 26u)
+            ? (const uint8_t*)(uintptr_t)(((uint32_t)_binary_gb2312_bin_start + 3u) & ~3u)
+            : (const uint8_t*)(uintptr_t)XB_XIP;
+        volatile const uint8_t*  b8  = (volatile const uint8_t*)base;
+        volatile const uint32_t* b32 = (volatile const uint32_t*)base;
+        uint32_t s = 0x12345678u, i, acc = 0u;
+        uint32_t c0 = DWT->CYCCNT;
+        for (i = 0u; i < XB_N_RAND; ++i)
+        {
+            uint32_t off;
+            if (t == 21u)      off = (i * 16u) & (XB_WIN - 4u);
+            else if (t == 27u) off = i & (XB_WIN - 1u);
+            else { s = xb_lcg(s); off = ((s >> 9) & (XB_WIN - 4u)) & ~3u; }
+            if (t == 22u || t == 27u) acc += b8[off];
+            else                      acc += b32[off >> 2];
+        }
+        cyc = DWT->CYCCNT - c0;
+        ops = XB_N_RAND;
+        sink = acc;
+    }
+    else
+    {
+        const uint8_t* base = (t == 25u)
+            ? (const uint8_t*)(uintptr_t)(((uint32_t)_binary_gb2312_bin_start + 3u) & ~3u)
+            : (const uint8_t*)(uintptr_t)XB_XIP;
+        uint32_t entries = XB_ENTRIES_MEAN, stride_py = 7u, stride_wd = 4u, rnd = 0u;
+        uint32_t i, k, acc = 0u, s = 0x87654321u;
+        uint32_t c0;
+
+        if (t == 24u) { entries = XB_ENTRIES_WORST; stride_py = 7u;  stride_wd = 4u;  }
+        else if (t == 28u) { stride_py = 17u; stride_wd = 17u; }            /* 真实步长 */
+        else if (t == 29u) { entries = XB_ENTRIES_WORST; stride_py = 17u; stride_wd = 17u; }
+        else if (t == 30u) { stride_py = 17u; stride_wd = 17u; rnd = 1u; }  /* 记录间全随机 */
+
+        c0 = DWT->CYCCNT;
+        for (i = 0u; i < entries; ++i)
+        {
+            uint32_t off_rec = rnd ? ((((s = xb_lcg(s)) >> 9) & (XB_WIN - 16u)) & ~3u) : (i * 16u);
+            uint32_t off_py  = rnd ?  (((s = xb_lcg(s)) >> 9) & (XB_WIN - 16u))
+                                   : (0x40000u + i * stride_py);
+            uint32_t off_wd  = rnd ?  (((s = xb_lcg(s)) >> 9) & (XB_WIN - 16u))
+                                   : (0x80000u + i * stride_wd);
+            volatile const uint32_t* rec = (volatile const uint32_t*)(const void*)(base + off_rec);
+            volatile const uint8_t*  py  = (volatile const uint8_t*)(base + off_py);
+            volatile const uint8_t*  wd  = (volatile const uint8_t*)(base + off_wd);
+            acc += rec[0]; acc += rec[1]; acc += rec[2];
+            for (k = 0u; k < 6u; ++k) acc += py[k];
+            for (k = 0u; k < 3u; ++k) acc += wd[k];
+        }
+        cyc = DWT->CYCCNT - c0;
+        ops = entries * 12u;
+        sink = acc;
+    }
+    g_micro_cyc  = cyc;
+    g_micro_px   = ops;
+    g_micro_test = 0u;
+    (void)sink;
+}
+#endif
+
 static GYCTX s_ctx;
 
 /* 语言持久化回调：phone_lang 在语言**真的变化**时调它一次。
@@ -635,6 +759,12 @@ int main(void)
             AppConfig_FactoryReset();
         }
 
+        /* QSPI 分块灌库（方案 B 的一次性产线动作，见 src/qspi_provision.h）。
+         * ⚠ 与恢复出厂设置同样的位置理由：擦写扇区要几十~几百 ms，期间不重绘，
+         *   但必须保证同一拍里不会往屏上推半帧。放在渲染之前正好满足。
+         *   非灌库构建里这个函数是空的（g_prov_enabled = 0）。 */
+        qspi_provision_poll();
+
         if (g_ctx_rc == 1)
         {
             uint32_t c0 = DWT->CYCCNT;
@@ -742,6 +872,18 @@ int main(void)
          * FORCEWT 恒为 1（厂商策略），好处是"CPU 写必达内存"变成结构性保证，
          * SWD 抓屏 / 读变量永远拿到最新值，不需要任何手动 clean。
          * 开关为何删除、删之前做过哪些确认，见文件上方 g_cache_wb 的替换注释。 */
+
+#if defined(YMGUI_XIP_BENCH)
+#if defined(YMGUI_XIP_BENCH)
+        /* 输入法按键耗时台架（见 phone_shell_board.h 的说明）。
+         * 与 case 20~30 同一口径：只在测量构建里存在。 */
+        PhoneIME_BoardBenchPoll();
+#endif
+
+        /* XIP 读延迟台架（case 20~26，见 run_xip_micro 上方注释）：
+         * 默认不编译（CMake 的 YMGUI_XIP_BENCH），只为量 XIP 延迟而临时打开。 */
+        run_xip_micro();
+#endif
 
         /* 渲染原语微基准（见变量处注释）：写 g_micro_test 触发，跑完自动清 0 */
         run_render_micro();

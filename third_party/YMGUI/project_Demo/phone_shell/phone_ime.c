@@ -8,6 +8,7 @@
 #include "YMGUI_Anim.h"
 #include "ime_candidates.inc"
 #include "ime_symbols.h"
+#include "phone_shell_board.h"   /* BoardCycNow() —— 按键耗时台架要用 */
 
 #define RGB(r, g, b) GY_ARGB(255, r, g, b)
 #define KEYBOARD_Y 226
@@ -630,8 +631,11 @@ void PhoneIME_Init(GYCTX ctx)
 	loadCharDictionary();
 	loadPhraseDictionary();
 	loadEnglishDictionary();
-	if (S_CHAR_COUNT)
-		s_char_matches = GY_malloc1(S_CHAR_COUNT * sizeof(*s_char_matches));
+	/* 容量按"最大桶跨度"而不是"全词典条数"（2026-10-07）：
+	 * resetCharSearch 一次只扫一个桶，见 ime_candidates.inc 里 imeCharMatchCap 的推导。
+	 * pinyin_gb2312：7291 → 614，省 26.1 KB heap1。 */
+	if (s_char_match_cap > 0)
+		s_char_matches = (ImeCharEntry*)GY_malloc1((size_t)s_char_match_cap * sizeof(*s_char_matches));
 	keyboard = YMGUI_Creat_Obj_Creat(ctx->top_layer, 0, KEYBOARD_Y, 320, 222);
 	if (!keyboard)
 		return;
@@ -717,6 +721,40 @@ void PhoneIME_Shutdown(void)
 char PhoneIME_BoardCand[6][24];
 int PhoneIME_BoardCandCount;
 char PhoneIME_BoardText[192];   /* 上屏后目标输入框的文本（够放整段笔记） */
+
+#if defined(YMGUI_XIP_BENCH)
+/* ---- 按键耗时台架（2026-10-07，方案 B 验收）----
+ * 说明见 phone_shell_board.h。这里能直接调 imeCandidatesReset / extendPrefixCandidates
+ * 是因为本文件 include 了 ime_candidates.inc（它们是那边的 static）；
+ * main.c 拿不到，所以台架必须落在这里，由 main 循环 poll。 */
+volatile char     g_ime_bench_py[32];
+volatile uint32_t g_ime_bench_cmd;
+volatile uint32_t g_ime_bench_cyc_r;
+volatile uint32_t g_ime_bench_cyc_f;
+volatile uint32_t g_ime_bench_words;
+
+void PhoneIME_BoardBenchPoll(void)
+{
+	if (g_ime_bench_cmd != 1u) return;
+	g_ime_bench_cmd = 0u;
+	if (!s_char_matches) return;         /* 词典没起来就别量，免得量到一半的路径 */
+
+	uint32_t start = BoardCycNow();
+	imeCandidatesReset((const char*)g_ime_bench_py);
+	uint32_t mid = BoardCycNow();
+	extendPrefixCandidates(6);
+	uint32_t end = BoardCycNow();
+	g_ime_bench_cyc_r = mid - start;
+	g_ime_bench_cyc_f = end - mid;
+	g_ime_bench_words = (uint32_t)g_word_count;
+
+	int n = g_word_count < 6 ? g_word_count : 6;
+	for (int i = 0; i < 6; ++i) PhoneIME_BoardCand[i][0] = 0;
+	for (int i = 0; i < n; ++i)
+		snprintf(PhoneIME_BoardCand[i], sizeof(PhoneIME_BoardCand[i]), "%s", g_words[i]);
+	PhoneIME_BoardCandCount = n;
+}
+#endif
 
 int PhoneIME_BoardSnapshot(void)
 {

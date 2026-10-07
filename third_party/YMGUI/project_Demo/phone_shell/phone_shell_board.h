@@ -76,4 +76,33 @@ extern volatile int g_ime_step;
 extern volatile int g_ime_rc;
 extern volatile char g_ime_pinyin[16];
 
+/* ---- 输入法按键耗时台架（2026-10-07，方案 B 验收用）----
+ * 目的：把"每次按键要多久"从估算变成板上实测。方案 B 把词组词典搬去外部 flash
+ * 之后，`imeCandidatesReset()` 里多了一段 XIP 顺序读，这笔钱必须量出来。
+ *
+ * 只在 YMGUI_XIP_BENCH=ON 的构建里存在（与 case 20~30 同一口径，不进出货构建）。
+ *
+ *   g_ime_bench_py[32]  待测拼音串（SWD 先写串，再置 g_ime_bench_cmd = 1）
+ *   g_ime_bench_cmd     1 = 跑一次；跑完固件清 0
+ *   g_ime_bench_cyc_r   imeCandidatesReset() 的周期数（建候选索引：扫词典）
+ *   g_ime_bench_cyc_f   extendPrefixCandidates(6) 的周期数（惰性取满 6 个候选）
+ *   g_ime_bench_words   这次一共产生了多少个候选
+ * 候选串照旧落在 PhoneIME_BoardCand[] / PhoneIME_BoardCandCount。
+ *
+ * 【为什么拆成两段】reset 是"扫词典 + 组合 DP"，fill 是"惰性从游标里取词"。
+ * 前者随拼音长度线性放大（每多一个字母多扫一次桶），后者基本恒定 —— 拆开
+ * 才知道该优化哪一段。 */
+#if defined(YMGUI_XIP_BENCH)
+extern volatile char     g_ime_bench_py[32];
+extern volatile uint32_t g_ime_bench_cmd;
+extern volatile uint32_t g_ime_bench_cyc_r;
+extern volatile uint32_t g_ime_bench_cyc_f;
+extern volatile uint32_t g_ime_bench_words;
+void PhoneIME_BoardBenchPoll(void);
+#endif
+
+/* DWT_CYCCNT 快照。phone_ime.c 不直接碰 CMSIS 寄存器，走板级这一层。
+ * ⚠ 调用前必须已开 DWT 的 CYCCNT（main.c 的 board_init 里做的）。 */
+uint32_t BoardCycNow(void);
+
 #endif /* PHONE_SHELL_BOARD_H */

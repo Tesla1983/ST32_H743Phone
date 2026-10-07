@@ -69,12 +69,39 @@ add_compile_definitions(PHONE_SHELL_BOARD=1)
 #   ime_candidates.inc 的 YMGUI_IME_CHARS_ROM 分支**原地解析**（零拷贝），
 #   entries 索引在大对象池构建（7291 × 12 ≈ 85 KB，heap1 放得下）。
 #   词组词典 phrases_rime.bin 的 RAM 索引要 739 KB（47280 × 16B），
-#   本板任何 RAM 都放不下 → OFF（记录为已知缺口，见 README 阶段 5）。
+#   本板任何 RAM 都放不下 → 不能走"索引 + 随机访问"那条路（见 README 阶段 5）。
 #   英文词典同样 OFF（走库的 direct English input 模式）。
+#
+# ★方案 B（2026-10-07）：词组词典上外部 flash XIP，全量 47280 条，
+#   载荷原地顺序扫、不建索引。开关在下面的 option(YMGUI_IME_PHRASES_XIP)。
+#   OFF 时退回 YMGUI_IME_PHRASES_OFF（只有单字候选）。
+# ★方案 B 开关：词组词典（全量 47280 条 / phrases_xip.bin 1.27 MB）走外部 flash XIP。
+#   OFF = 退回单字候选（YMGUI_IME_PHRASES_OFF）。
+#   ON  = 编 XIP 分支；但**必须先灌库**（tools/qspi_provision.py），
+#         没灌时 loadPhraseDictionary 会因 magic 不匹配安静退回单字模式，不会读飞。
+option(YMGUI_IME_PHRASES_XIP "词组词典放外部 flash XIP（需先用 tools/qspi_provision.py 灌库）" ON)
+if(YMGUI_IME_PHRASES_XIP)
+	add_compile_definitions(YMGUI_IME_PHRASES_XIP=1 PHRASE_XIP_ADDR=0x90300000u)
+	message(STATUS "词组词典: XIP @0x90300000（全量 47280 条，需先灌库；未灌则自动退回单字）")
+else()
+	add_compile_definitions(YMGUI_IME_PHRASES_OFF=1)
+	message(STATUS "词组词典: OFF（只有单字候选）")
+endif()
+
+# 灌库支持：**默认关**。它是一次性产线动作，编进默认构建会永久占 16 KB SRAM1。
+# 用法：和 YMGUI_IME_PHRASES_XIP 一起打开 → 烧 → 跑 tools/qspi_provision.py 灌库
+#       → 关掉本 option 重新编出货形态（词典留在外部 flash，不受影响）。
+option(YMGUI_QSPI_PROVISION "编入 QSPI 分块灌库支持（一次性产线动作）" OFF)
+if(YMGUI_QSPI_PROVISION)
+	add_compile_definitions(YMGUI_QSPI_PROVISION=1)
+	message(STATUS "QSPI 灌库: ON（一次性产线动作，灌完请关掉重编）")
+else()
+	message(STATUS "QSPI 灌库: OFF（出货形态）")
+endif()
+
 add_compile_definitions(
 	YAOMI_IME=1
 	YMGUI_IME_CHARS_ROM=1
-	YMGUI_IME_PHRASES_OFF=1
 	# IME 的大静态池（候选词池等 ≈60 KB）放进 SRAM2 的 .bss_ime 段，
 	# 否则 DTCM 的 .bss 会被挤到 heap0 区间倒挂（实测）。
 	# 段名不带引号地传（Windows 上 CMake/Ninja 会把带引号定义的引号吃掉，实测），
@@ -120,6 +147,20 @@ endif()
 #   · tools/grab_ymgui.py 抓屏还原 PNG
 # 默认 0 = **不做这次拷贝**。注意 g_frame_mirror 仍是可读写全局量，
 # 所以 SWD 写 1 就能临时打开（跑 A2/抓屏前写 1、并让它跑满一帧让镜像追上）。
+# XIP 读延迟台架（2026-10-07）：main.c 的 case 20~26，量外部 flash（0x90300000）
+# 与内部 flash 的随机/顺序读延迟，用来给"词组词典上不上 XIP"拍板。
+# **默认 OFF = 不进出货构建**（与 YMGUI_DIAG 同一口径）：它只是个只读的地址遍历，
+# 不进渲染热路径，但会吃掉几百字节 text，且被测区域尚未灌数据。
+# 量法：cmake -S . -B build -DYMGUI_XIP_BENCH=ON → 烧录 → python tools/micro.py 20 21 22 23 24 25 26
+#       → 量完再 -DYMGUI_XIP_BENCH=OFF 编回出货形态。
+option(YMGUI_XIP_BENCH "编译 XIP/内部 flash 读延迟台架（micro case 20~26，仅供测量）" OFF)
+if(YMGUI_XIP_BENCH)
+	add_compile_definitions(YMGUI_XIP_BENCH=1)
+	message(STATUS "XIP 读延迟台架: ON（micro case 20~26 可用，仅供测量）")
+else()
+	message(STATUS "XIP 读延迟台架: OFF（出货形态）")
+endif()
+
 option(YMGUI_PORT_FRAME_MIRROR "flush 时同步 300KB 全帧镜像（抓屏/A2 需要）" OFF)
 if(YMGUI_PORT_FRAME_MIRROR)
 	add_compile_definitions(YMGUI_PORT_FRAME_MIRROR=1)
@@ -184,6 +225,10 @@ set(APP_SRC
 	# "总线主设备绕过 D-Cache"这条风险量成板上实测证据。只需要 HAL DMA（已编入），
 	# 不需要 SD 卡、不占引脚、不用中断。
 	src/dma_bench.c
+	# QSPI 分块灌库（方案 B 配套）：源文件始终编入，但是**空壳** —— 真正的逻辑
+	# 由 option(YMGUI_QSPI_PROVISION) 里的宏决定编不编。这样 g_prov_enabled 这个
+	# 符号永远存在，tools/qspi_provision.py 能明确区分"没编进来" vs "编了但失败"。
+	src/qspi_provision.c
 	# ---- phone_shell 应用层（阶段 5）----
 	# 与官方 project_Demo/phone_shell/CMakeLists.txt 同一组源；区别只有：
 	#   加 PHONE_SHELL_BOARD 宏 → 用板级入口代替宿主 main（不依赖 SDL/stdio）；

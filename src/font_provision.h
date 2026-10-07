@@ -32,6 +32,13 @@ int font_provision_ensure(void);
 /* 调试用：强制重灌（忽略记账头）。 */
 void font_provision_set_force(int force);
 
+/* 从 **XIP（memory-mapped）** 读回一段并算 CRC32（IEEE 802.3，与 zlib.crc32 一致）。
+ * 原先是 font_provision.c 内部的 static；灌库台架要用它做"写完之后再读一遍"的
+ * 端到端复核，所以对外暴露 —— 校验走的是**真正运行时的那条读路径**（XIP），
+ * 而不是 indirect 读，这样"灌库成功但 XIP 读不通"也能被抓出来。
+ * 调用前必须已进入映射模式。 */
+uint32_t font_crc32_xip(uint32_t off, uint32_t n);
+
 /* ---- 供 SWD 阅读 ---- */
 extern volatile uint32_t g_font_ok;         /* 1 = 字库可用 */
 extern volatile uint32_t g_font_written;    /* 1 = 本次上电真的写了 QSPI */
