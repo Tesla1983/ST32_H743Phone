@@ -59,3 +59,5 @@ third_party/YMGUI/project_Demo/video_player/*.mp4
 # CI / 本地干净构建用的临时构建目录
 build_ci/
 .toolchain/
+# 从 GH Actions 下载回来做比对用的产物解压目录
+.ci_artifact/
