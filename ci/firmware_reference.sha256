@@ -1,5 +1,13 @@
 # 参考固件哈希 —— CI 用它判断"编出来的固件"和"板上跑的固件"是否同一份字节。
 # 来源与更新规则见 ci/README.md。
-# 基线：2026-10-07 由干净重建 + 机内 flash 全量读回比对确立（工具链 14.3.Rel1）。
+#
+# 基线建立过程（2026-10-07，可复跑）：
+#   1. 干净重建得到 elf / bin
+#   2. tools/verify_board_image.py 把 STM32H743 的 0x08000000 起 1576644 字节全量读回，
+#      与 .bin 逐字节比对 ⇒ 完全一致 ⇒ 这两个哈希就是"板上正在跑的那份"
+#   3. 加上 -Wl,--strip-debug 之后重编：.bin 哈希**没有变**（证明剥离调试节不影响代码），
+#      .elf 哈希随之更新成下面的值；原因是工具链自带的 libgcc/newlib 里 DWARF 记录了
+#      各自编译服务器的路径（Windows 版 arm-14-5 / Linux 版 arm-14），跨主机 ELF 无法一致，
+#      只能在链接期丢掉 .debug_*，详见 CMakeLists.txt 里 --strip-debug 那段注释。
 22ec63a893c1b4d3f0eed19734a130cab98b5fe94e20c83237ae89e29ad09c22  ymgui-h743.bin
-8569865bc3628118862c80ea5a515c1813a17e0088d16fa4a8fbf262ca38381f  ymgui-h743.elf
+a1fba87ba112717c45426a0766d71dc5f1ad41e48a8187ee6d3ce5e6af4ab25e  ymgui-h743.elf

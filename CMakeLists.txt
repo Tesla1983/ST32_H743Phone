@@ -342,6 +342,19 @@ target_link_options(ymgui-h743.elf PRIVATE
 	-nostartfiles
 	-Wl,-Map=${ROOT}/build/ymgui-h743.map
 	-Wl,--print-memory-usage
+	# ---- 可复现构建：剥离调试节 ----
+	# 为什么必须加这条：
+	#   本机 Windows 版和 CI 的 Linux 版 Arm GNU Toolchain 是**同一个 release（14.3.Rel1）**，
+	#   但两边预编译好的 libgcc / libc_nano 里，DWARF 记录的是各自那台编译服务器的路径：
+	#     Windows: /data/jenkins/workspace/GNU-toolchain/arm-14-5/build-...
+	#     Linux  : /data/jenkins/workspace/GNU-toolchain/arm-14/build-...
+	#   两边差 22 字节，全部落在 .debug_line_str ⇒ 代码字节完全一致，ELF 哈希却不一致。
+	#   这是**编译期改动覆盖不到、也无法用 -ffile-prefix-map 改写**的部分（库是预编译好的），
+	#   所以只能在链接期把调试节全部丢掉。
+	# 为什么用 --strip-debug 而不是 -s：
+	#   tools/bench.py 等 SWD 诊断脚本要靠 `arm-none-eabi-nm` 从 .symtab 解析符号地址
+	#   （g_loop_count、g_cfg_brightness 等），符号表必须留下，只删 .debug_*。
+	-Wl,--strip-debug
 )
 
 target_link_libraries(ymgui-h743.elf PRIVATE m)
