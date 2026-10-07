@@ -60,4 +60,4 @@ third_party/YMGUI/project_Demo/video_player/*.mp4
 build_ci/
 .toolchain/
 # 从 GH Actions 下载回来做比对用的产物解压目录
-.ci_artifact/
+.ci_artifact*/
