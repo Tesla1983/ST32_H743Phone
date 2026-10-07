@@ -1,5 +1,7 @@
 # ymgui-h743 —— YMGUI 移植到 STM32H743VIT6 小系统板
 
+一个运行在 STM32H743 上的移植手机 OS。
+
 > 目标：在本板（320×480 8080 并口 ST7796 + GT1158 触摸 + W25Q128 16MB QSPI）上跑起  
 > [YMGUI](https://github.com/Yao-Mi/YMGUI)，承载其自带的中文手机界面 `project_Demo/phone_shell`。
 >
