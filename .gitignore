@@ -1,0 +1,58 @@
+# ---------- 构建产物 ----------
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+Makefile
+*.o
+*.obj
+*.a
+*.lib
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+*.su
+*.gch
+*.d
+
+# ---------- 主机仿真 / 调试输出 ----------
+host_check/out/
+# 板上抓屏与本轮调试产生的 PNG
+/*.png
+tools/*.png
+!assets/**
+
+# ---------- Python ----------
+__pycache__/
+*.pyc
+*.pyo
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ---------- 例外：固件构建输入必须入库 ----------
+# 上面 *.bin / *.map 是排除规则，但这两个 bin 是构建期的真输入：
+# CMakeLists.txt 用 objcopy 把它们内嵌进 .rodata（中文字模 982 KB + IME 单字词典 116 KB），
+# 丢了它们 pull 下来就编译不过。上游 YMGUI 也已主动移除 *.bin 排除，此处同步。
+!third_party/YMGUI/tools/gb2312_glyphs.bin
+!third_party/YMGUI/project_Demo/chinese_ime/pinyin_gb2312.bin
+# 下面两个虽未启用（heap1 峰值 97%，词组/英文词典保持关闭），但属上游已跟踪数据，一并保留
+!third_party/YMGUI/project_Demo/chinese_ime/english_words.bin
+!third_party/YMGUI/project_Demo/chinese_ime/phrases_rime.bin
+
+# ---------- 第三方：体积过大或含版权媒体，本机保留但不入库 ----------
+# 这两个是 YMGUI 上游 music_player / video_player 演示用的外部库，
+# 本工程（phone_shell 嵌入式 UI）不依赖它们。
+third_party/YMGUI/extern_lib/FFmpeg/
+third_party/YMGUI/extern_lib/GeneralUser-GS/
+# 上游演示用的受版权保护的音频 / 视频素材，不入库。
+third_party/YMGUI/project_Demo/music_player/*.mp3
+third_party/YMGUI/project_Demo/video_player/*.mp4
