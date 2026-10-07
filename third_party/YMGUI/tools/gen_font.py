@@ -108,7 +108,15 @@ HDR = [
 ]
 def emit_ascii(out_path, bpp):
     FIRST, LAST = 32, 126
-    CELL_W, CELL_H, PT, Y_OFF = 8, 16, 15, -1
+    # ★CELL_W 由 8 改为 9（2026-10-07）★
+    # 15pt 的 DejaVuSansMono 是等宽字，font.getlength('W') = 9.0 px —— 自然步进就是 9。
+    # 旧值 8 有两个后果（详见 docs/FONT_GLYPH_CLIPPING.md）：
+    #   ① 裁字：glyph_bytes() 里 `nib = ... if x < cell_w else 0` 把第 9 列整列归零，
+    #      95 个字形里 41 个被切，其中 W 丢的是覆盖度 15/15 的**整条实心右竖** —— 最扎眼。
+    #   ② 挤字：步进 8 < 自然步进 9，英文每行被挤掉 1 px，左右边白被吃掉。
+    # cell_w=9 时被裁 0/95，代价是字模 6 080 B → 7 600 B（+1 520 B flash）。
+    # 不要改回 8；也不要用"PT 降到 14 换 cell_w 保持 8"—— 实测那样仍切 10 个（含 W）。
+    CELL_W, CELL_H, PT, Y_OFF = 9, 16, 15, -1
     bpr = (CELL_W * bpp + 7) // 8
     font = ImageFont.truetype(ASCII_TTF, PT)
     fname = out_path.split("/")[-1]
