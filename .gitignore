@@ -56,3 +56,6 @@ third_party/YMGUI/extern_lib/GeneralUser-GS/
 # 上游演示用的受版权保护的音频 / 视频素材，不入库。
 third_party/YMGUI/project_Demo/music_player/*.mp3
 third_party/YMGUI/project_Demo/video_player/*.mp4
+# CI / 本地干净构建用的临时构建目录
+build_ci/
+.toolchain/

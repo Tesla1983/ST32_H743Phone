@@ -1,0 +1,114 @@
+name: Firmware build & reproducibility
+
+# 这个 workflow 要回答两个问题：
+#   1. 这份代码在干净环境里能不能编出来？（环境自足性）
+#   2. 编出来的固件，跟板上正在跑的那份是不是**同一份字节**？（可复现性）
+# 第 2 问是主菜：由 ci/check_firmware_hash.py 拿 ci/firmware_reference.sha256 比对，
+# 那个参考哈希是"把板内 flash 全量读回来比对过"的真实基准，不是随手一算。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # ⚠ 工具链版本是可复现性的一部分：换了版本，字节大概率变。
+  #   改动这里必须同步 ci/firmware_reference.sha256，并在 commit message 里写清。
+  TOOLCHAIN_VERSION: "14.3.rel1"
+  TOOLCHAIN_DIR: ${{ github.workspace }}/.toolchain
+
+jobs:
+  build:
+    name: Build firmware (arm-none-eabi)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      # ---- 0. 先把"必须入库却被 .gitignore 排除"的那两个构建输入钉死 ----
+      # 这两个 .bin 是 objcopy 进固件 .rodata 的真输入，也是 .gitignore 里
+      # `*.bin` 规则的反向例外。缺了它们 configure 才失败，报错很难读懂。
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 构建输入完整性（字库/IME 词典必须在库里）
+        run: python3 ci/check_build_inputs.py
+
+      # ---- 1. 工具链：钉死版本，用缓存避免每次拉 150 MB ----
+      - name: 恢复工具链缓存
+        id: tc-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TOOLCHAIN_DIR }}
+          key: ${{ runner.os }}-arm-gnu-toolchain-${{ env.TOOLCHAIN_VERSION }}
+
+      - name: 下载 Arm GNU Toolchain ${{ env.TOOLCHAIN_VERSION }}
+        if: steps.tc-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          URL="https://developer.arm.com/-/media/Files/downloads/gnu/${TOOLCHAIN_VERSION}/binrel/arm-gnu-toolchain-${TOOLCHAIN_VERSION}-x86_64-arm-none-eabi.tar.xz"
+          echo "下载 ${URL}"
+          mkdir -p "${TOOLCHAIN_DIR}"
+          curl -fsSL --retry 3 --retry-delay 5 "${URL}" \
+            | tar -xJ -C "${TOOLCHAIN_DIR}" --strip-components=1
+
+      - name: 把工具链放进 PATH 并核对版本
+        run: |
+          echo "${TOOLCHAIN_DIR}/bin" >> "$GITHUB_PATH"
+          arm-none-eabi-gcc --version | head -1
+
+      - name: 安装 Ninja
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ninja-build
+          ninja --version
+
+      # ---- 2. 构建 ----
+      # 注意：CMakeLists 里 linker map 的输出路径写死成 ${ROOT}/build/ymgui-h743.map，
+      # 所以构建目录必须叫 build，不要用别的名字。
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi.cmake -G Ninja
+
+      - name: Build (elf + bin + hex)
+        run: cmake --build build --target ymgui-bin
+
+      - name: 尺寸报告
+        run: |
+          arm-none-eabi-size build/ymgui-h743.elf
+          echo
+          echo "--- 各段明细（顶层 5 个大段）---"
+          arm-none-eabi-size -A build/ymgui-h743.elf | sort -k2 -n -r | head -6
+
+      # ---- 3. 可复现性闸门：与板上固件（参考哈希）逐字节比对 ----
+      - name: 可复现性检查（CI 产物 vs 参考固件）
+        run: python3 ci/check_firmware_hash.py build ci/firmware_reference.sha256
+
+      # ---- 4. 产物留存：红黄都要能拿到 elf 去查 ----
+      - name: Upload firmware artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ymgui-h743-firmware-${{ github.sha }}
+          path: |
+            build/ymgui-h743.elf
+            build/ymgui-h743.bin
+            build/ymgui-h743.hex
+            build/ymgui-h743.map
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: 摘要
+        run: |
+          {
+            echo "### 固件构建"
+            echo ""
+            echo "- 工具链：$(arm-none-eabi-gcc --version | head -1)"
+            echo "- \`text / data / bss\`：$(arm-none-eabi-size build/ymgui-h743.elf | awk 'NR==2{printf "%s / %s / %s 字节", $1, $2, $3}')"
+            echo "- \`bin\` sha256：\`$(sha256sum build/ymgui-h743.bin | cut -c1-16)…\`"
+            echo "- 可复现性：与 \`ci/firmware_reference.sha256\` 一致 ⇒ CI 产物 == 板上固件"
+          } >> "$GITHUB_STEP_SUMMARY"
