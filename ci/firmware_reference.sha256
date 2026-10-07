@@ -9,5 +9,18 @@
 #      .elf 哈希随之更新成下面的值；原因是工具链自带的 libgcc/newlib 里 DWARF 记录了
 #      各自编译服务器的路径（Windows 版 arm-14-5 / Linux 版 arm-14），跨主机 ELF 无法一致，
 #      只能在链接期丢掉 .debug_*，详见 CMakeLists.txt 里 --strip-debug 那段注释。
-22ec63a893c1b4d3f0eed19734a130cab98b5fe94e20c83237ae89e29ad09c22  ymgui-h743.bin
-a1fba87ba112717c45426a0766d71dc5f1ad41e48a8187ee6d3ce5e6af4ab25e  ymgui-h743.elf
+# 上一基准（2026-10-07 早，词组词典方案 B 出货形态）：
+# 22ec63a893c1b4d3f0eed19734a130cab98b5fe94e20c83237ae89e29ad09c22  ymgui-h743.bin
+# a1fba87ba112717c45426a0766d71dc5f1ad41e48a8187ee6d3ce5e6af4ab25e  ymgui-h743.elf
+
+# ---------------------------------------------------------------- 新基准（2026-10-07 深夜）
+# 属于 ci/README.md 允许更新的第 a 类：**有意为之的功能改动** —— 修复字母 W 渲染残缺。
+#   根因与完整证据链见 docs/FONT_GLYPH_CLIPPING.md。一句话：
+#   gen_font.py 的 ASCII 单元宽 CELL_W=8 而当时字号 PT=15 的 DejaVuSansMono 等宽步进是
+#   9.0 px，glyph_bytes() 把第 9 列整列归零 ⇒ 95 个字形里 41 个被裁（W 丢整条实心右竖最扎眼）。
+#   本次把 CELL_W 改为 9（gen_font.py 与 YMGUI_FontData.c 同步重生成，字模 +1 520 B），
+#   上板实测被裁 0/95、W 右竖恢复；出货形态 FLASH 1 579 052 B（+1 520 B），
+#   heap1 峰值 71 064 B 不变，A2 ramp/gram = 0，IME 3/3，光标正常。
+# 板上核验：烧录后 flash_and_verify.py 全部 PASS（语言三层 + A2 + IME + caret）。
+371532c63523d1d18f61c3fe6ae64ddf0b8892baff10a97d304c25e402c1b390  ymgui-h743.bin
+1d15a6d60fea5fcf9a395344cfbe2db3ba4aefe8025ffb5563fb7c47c4841e73  ymgui-h743.elf
