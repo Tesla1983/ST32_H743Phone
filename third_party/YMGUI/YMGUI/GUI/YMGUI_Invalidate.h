@@ -55,4 +55,20 @@ void YMGUI_Ctx_InvalidateArea(GYCTX ctx, const GYrect* area);
 //  无脏区时直接返回(保留模式空闲不耗)
 void YMGUI_Refresh(GYCTX ctx);
 
+//===========================================================================
+// 绘制规模诊断（2026-10-09，常驻编译）
+//   用来把"脏区有多大""裁剪剔掉了多少"变成可读的整数，判断优化值不值得做。
+//   ⚠ 无脏区时**保留上一帧的值**（Refresh 直接 return），不是"当前值"。
+//===========================================================================
+extern uint32 g_inv_px;      //本帧脏区总面积（像素）；满屏 320×480 = 153 600
+extern uint32 g_inv_cnt;     //本帧脏区块数（>1 说明有多块互不接触的脏区）
+extern uint32 g_inv_frames;  //累计有脏区的帧数
+extern uint32 g_draw_visit;  //本帧访问到的对象次数（含被裁剪掉的）
+extern uint32 g_draw_draw;   //本帧真正调用 draw_cb 的次数（visit − draw = 被裁剪挡掉的）
+//峰值版（写 0 清零）：取"这段时间里最糟糕的一帧"。测操作期间的规模必须用它 ——
+//  普通版只留最近一帧，操作后等一会儿就被时间刷新的小脏区盖掉了。
+extern uint32 g_inv_px_max;
+extern uint32 g_visit_max;
+extern uint32 g_draw_max;
+
 #endif // !YMGUI_INVALIDATE_H

@@ -151,5 +151,24 @@
 # 回归：lang_check 三项全 PASS（交互 / 扇区 240 落盘 CRC / 掉电重启保持）；
 #   clock_shot 状态栏与大时间与 $DT 一致、天气链路正常。
 # FLASH 1 791 308 B（85.42%），比第五版 +1 832 B。
-bef0f3e0136c294ea565e575508717b22a393296f52359296a124fccd12b4b87  ymgui-h743.bin
-b9f3fdd702bec03171fb9715105e3917f738ffa961df75771950e2ea84c7d0f9  ymgui-h743.elf
+# bef0f3e0136c294ea565e575508717b22a393296f52359296a124fccd12b4b87  ymgui-h743.bin
+# b9f3fdd702bec03171fb9715105e3917f738ffa961df75771950e2ea84c7d0f9  ymgui-h743.elf
+
+# ---- 第七版（2026-10-09）：文件管理器接真实目录 + 渲染规模诊断 ----
+#
+# 为什么变（按「更新时机」的 a：有意为之的功能改动）：
+#   1. 文件管理器四个分类里"照片""笔记"接 TF 卡真实目录：
+#      src/img_store.c 新增目录扫描（img_scan_*）与 note 读写（BoardNote_*），
+#      apps/files.c 与 apps/notes.c 从硬编码假文案改成读写真实文件。
+#      ⚠ 两个 FatFs 坑：f_mkdir **不级联**创建（先建父目录）；卷必须先
+#         fatfs_ensure_mounted()，否则 f_opendir 返回 FR_NOT_ENABLED(12)。
+#   2. YMGUI_Invalidate.c 新增常驻诊断量 g_inv_px / g_draw_visit / g_draw_draw
+#      （及峰值版 g_inv_px_max 等），用来把"一帧刷了多少"量化 —— 这也是判定
+#      InvalidateOldNew / 遮挡剔除**值不值得做**的依据（结论：都不值得，见 §10）。
+#
+# 验收：tools/files_check.py 全 PASS（写卡后扫描条目 0→1、导入 rc=0 输出 12 288 B、
+#   笔记含中文往返失配 0）；tools/ribbon_check.py 四项全 PASS；
+#   满负载 10.87 ms / 92.0 FPS（基线 10.92 ms / 91.6 FPS，无回归）。
+# FLASH 1 796 476 B（85.66%），比第六版 +5 168 B。
+1633fdcad3cda8c8ecbe9aece13e3dfc9be88ed556278f591f1d45b1d5fb79e8  ymgui-h743.bin
+741fd3a3d3806cb12f11c48bb3bdd88a73fa2fdc2d6585d95a5ce32fa7b8e57d  ymgui-h743.elf

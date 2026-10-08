@@ -18,6 +18,11 @@
 #include "board_fault.h"
 #include <string.h>
 
+/* 前置声明：img_store_poll 的 mode 6（笔记往返自检）位于本文件较后处，
+ * 但 poll 在它前面 ⇒ 必须在这里先声明，否则编译器在 poll 里见不到。 */
+int BoardNote_Save(int i, const char* text);
+int BoardNote_Load(int i, char* out, int n);
+
 /* ---- 失败返回码（g_img_rc）---- */
 #define RC_FS_MOUNT    1u
 #define RC_OPEN        2u
@@ -681,6 +686,45 @@ void img_store_poll(void)
         run_qspi_diag();
         g_img_rc = 0u;
     }
+    else if (mode == 5u)
+    {
+        /* 建好 /YMGUI/PIC 与 /YMGUI/NOTE 并扫一次照片分类 —— 验收脚本
+         * （tools/files_check.py）用它准备卡上内容、并核对 g_scan_n。 */
+        (void)img_scan_mkdir(IMG_PIC_DIR);
+        (void)img_scan_mkdir(IMG_NOTE_DIR);
+        g_img_rc = (uint32_t)img_scan_dir(IMG_PIC_DIR, ".bmp", 1);
+    }
+    else if (mode == 6u)
+    {
+        /* 笔记往返自检：新建一条 → 读回 → 逐字节比对（含中文，验证 UTF-8 原样）。
+         * 判据：g_note_rc == 0、g_note_bytes == 期望长度、g_note_cmp == 0（失配数）。 */
+        static const char s[] = "note-selftest\n中文内容 ABC";
+        int idx = BoardNote_Save(-1, s);
+        g_note_cmp = 0xFFFFFFFFu;
+        if (idx < 0)
+        {
+            g_note_rc = -100 + idx;
+        }
+        else
+        {
+            int n = BoardNote_Load(idx, (char*)s_line, (int)LINE_MAX);
+            if (n < 0)
+            {
+                g_note_rc = -200 + n;
+            }
+            else
+            {
+                uint32_t want = (uint32_t)strlen(s);
+                uint32_t i;
+                g_note_cmp = 0u;
+                for (i = 0; i < want && i < (uint32_t)n; ++i)
+                    if (s_line[i] != (uint8_t)s[i]) g_note_cmp++;
+                if ((uint32_t)n != want) g_note_cmp++;
+                g_note_rc = (g_note_cmp == 0u) ? 0 : -300;
+            }
+        }
+        g_img_rc = 0u;
+    }
     else
     {
         g_img_rc = RC_PARAM;
@@ -697,8 +741,375 @@ void img_store_poll(void)
 }
 
 /* ===========================================================================
+ * 目录扫描（照片 / 笔记分类的真实文件列表）—— 说明见 img_store.h
+ * =========================================================================== */
+
+
+typedef struct
+{
+    char     name[IMG_SCAN_NAME_MAX];
+    uint32_t size;
+} ScanEntry;
+
+/* 放 SRAM1 的 .bss_img（与块缓冲同一段，非缓存区）。
+ * 24 × (48 + 4) = 1 248 B，与块缓冲合计仍在 SRAM1 的 128 KB 内。 */
+__attribute__((section(".bss_img")))
+static ScanEntry s_scan[IMG_SCAN_MAX];
+static int s_scan_n;
+
+volatile uint32_t g_scan_n      = 0;
+volatile uint32_t g_scan_cyc    = 0;
+volatile uint32_t g_scan_fs_rc  = 0xFFFFFFFFu;
+volatile uint32_t g_scan_kind   = 0;
+
+volatile int32_t  g_note_rc     = -1;
+volatile uint32_t g_note_bytes  = 0;
+volatile uint32_t g_note_fs_rc  = 0xFFFFFFFFu;
+volatile uint32_t g_note_cmp    = 0xFFFFFFFFu;
+
+/* 后缀匹配：ext 传小写（".bmp" / ".txt"），名字里的大小写不敏感。 */
+static int ext_match(const char* name, const char* ext)
+{
+    int nl = (int)strlen(name);
+    int el = (int)strlen(ext);
+    int i;
+    const char* p;
+
+    if (nl < el) return 0;
+    p = name + (nl - el);
+    for (i = 0; i < el; ++i)
+    {
+        char c = p[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c + ('a' - 'A'));
+        if (c != ext[i]) return 0;
+    }
+    return 1;
+}
+
+static void copy_str(char* dst, int n, const char* src)
+{
+    int i = 0;
+    if (n <= 0) return;
+    while (src[i] != 0 && i < n - 1) { dst[i] = src[i]; ++i; }
+    dst[i] = 0;
+}
+
+int img_scan_dir(const char* dir, const char* ext, int kind)
+{
+    DIR     d;
+    FILINFO fi;
+    FRESULT fr;
+    uint32_t c0 = DWT->CYCCNT;
+
+    s_scan_n = 0;
+    g_scan_kind = (uint32_t)kind;
+
+    /* ⚠ 必须先确保卷已挂载：直接 f_opendir 会拿 FR_NOT_ENABLED(12)
+     * —— 卷没有工作区，FatFs 根本不知道该问哪个盘（2026-10-09 实测）。 */
+    if (fatfs_ensure_mounted() != 0)
+    {
+        g_scan_fs_rc = 0xFFFFFFFEu;
+        g_scan_cyc   = DWT->CYCCNT - c0;
+        return -2;
+    }
+
+    memset(&d, 0, sizeof(d));
+    memset(&fi, 0, sizeof(fi));
+
+    fr = f_opendir(&d, dir);
+    g_scan_fs_rc = (uint32_t)fr;
+    if (fr != FR_OK)
+    {
+        g_scan_n   = 0;
+        g_scan_cyc = DWT->CYCCNT - c0;
+        return -1;
+    }
+
+    for (;;)
+    {
+        fr = f_readdir(&d, &fi);
+        g_scan_fs_rc = (uint32_t)fr;
+        if (fr != FR_OK) break;
+        if (fi.fname[0] == 0) break;                 /* 目录结束 */
+        if (fi.fattrib & AM_DIR) continue;           /* 跳过子目录 */
+        if (ext != NULL && ext[0] != 0 && !ext_match(fi.fname, ext)) continue;
+        if (s_scan_n >= (int)IMG_SCAN_MAX) break;    /* 表满：后面的不列 */
+
+        copy_str(s_scan[s_scan_n].name, (int)IMG_SCAN_NAME_MAX, fi.fname);
+        s_scan[s_scan_n].size = (uint32_t)fi.fsize;
+        s_scan_n++;
+    }
+
+    (void)f_closedir(&d);
+    g_scan_n   = (uint32_t)s_scan_n;
+    g_scan_cyc = DWT->CYCCNT - c0;
+    return s_scan_n;
+}
+
+int img_scan_count(void)
+{
+    return s_scan_n;
+}
+
+int img_scan_name(int i, char* out, int n)
+{
+    if (i < 0 || i >= s_scan_n || out == NULL || n <= 0) return -1;
+    copy_str(out, n, s_scan[i].name);
+    return 0;
+}
+
+int img_scan_size(int i, uint32_t* size)
+{
+    if (i < 0 || i >= s_scan_n || size == NULL) return -1;
+    *size = s_scan[i].size;
+    return 0;
+}
+
+int img_scan_path(int i, const char* dir, char* out, int n)
+{
+    int k = 0;
+    int j;
+
+    if (i < 0 || i >= s_scan_n || out == NULL || n <= 0) return -1;
+    if (dir != NULL)
+    {
+        while (dir[k] != 0 && k < n - 1) { out[k] = dir[k]; ++k; }
+        if (k > 0 && k < n - 1 && out[k - 1] != '/') { out[k++] = '/'; }
+    }
+    for (j = 0; s_scan[i].name[j] != 0 && k < n - 1; ++j)
+        out[k++] = s_scan[i].name[j];
+    out[k] = 0;
+    return 0;
+}
+
+int img_scan_mkdir(const char* dir)
+{
+    FRESULT fr;
+    char    parent[IMG_PATH_MAX];
+    int     k = 0;
+
+    if (dir == NULL) return -1;
+    if (fatfs_ensure_mounted() != 0) { g_scan_fs_rc = 0xFFFFFFFEu; return -2; }
+
+    /* ⚠ FatFs 的 f_mkdir **不会级联创建**：/YMGUI 还不存在时直接建 /YMGUI/PIC
+     * 会返回 FR_NO_PATH（2026-10-09 实测：第一次进照片分类就是这么失败的）。
+     * ⇒ 先保证父目录存在：把 dir 的最后一段去掉再建一次。 */
+    while (dir[k] != 0 && k < (int)sizeof(parent) - 1) { parent[k] = dir[k]; ++k; }
+    parent[k] = 0;
+    while (k > 0 && parent[k - 1] != '/') { --k; parent[k] = 0; }
+    while (k > 1 && parent[k - 1] == '/') { --k; parent[k] = 0; }
+    if (k > 1)
+    {
+        fr = f_mkdir(parent);
+        g_scan_fs_rc = (uint32_t)fr;
+        /* 父目录建不出来就别往下试了（FR_EXIST 是"已存在"，不算错） */
+        if (fr != FR_OK && fr != FR_EXIST) return -1;
+    }
+
+    fr = f_mkdir(dir);
+    g_scan_fs_rc = (uint32_t)fr;
+    /* 已存在不算失败（FatFs 对已存在的目录返回 FR_EXIST） */
+    return (fr == FR_OK || fr == FR_EXIST) ? 0 : -1;
+}
+
+int img_scan_import(int i, const char* dir)
+{
+    char full[IMG_PATH_MAX];
+
+    if (i < 0 || i >= s_scan_n) return -1;
+    /* 上一轮还没跑完就不要覆盖（g_img_test 非 0 = 还有活没做） */
+    if (g_img_test != 0u || g_img_busy != 0u) return -2;
+    if (img_scan_path(i, dir, full, (int)sizeof(full)) != 0) return -3;
+
+    copy_str(g_img_path, (int)IMG_PATH_MAX, full);
+    g_img_test = 1u;            /* 异步：由 img_store_poll 执行 import_bmp */
+    return 0;
+}
+
+/* ===========================================================================
  * board 层接口（phone_shell 的相册 app 用，见 phone_shell_board.h 的说明）
  * =========================================================================== */
+
+/* ---- 照片分类：卡上 /YMGUI/PIC 的真实 .bmp 列表 ----
+ * BoardPic_Scan() 只在**进入分类时**调一次（内部会 f_mkdir 保证目录存在），
+ * 之后 Count/Name/Size 都读缓存表，不再碰文件系统。 */
+int BoardPic_Scan(void)
+{
+    (void)img_scan_mkdir(IMG_PIC_DIR);
+    return img_scan_dir(IMG_PIC_DIR, ".bmp", 1);
+}
+
+int BoardPic_Count(void)
+{
+    return img_scan_count();
+}
+
+int BoardPic_Name(int i, char* out, int n)
+{
+    return img_scan_name(i, out, n);
+}
+
+int BoardPic_Size(int i, uint32_t* size)
+{
+    return img_scan_size(i, size);
+}
+
+/* 把第 i 张导入图库（异步：置 g_img_test，由 img_store_poll 跑）。
+ * 返回 0 = 已排队；UI 侧看 g_img_busy 归零后读 g_img_rc 判成功。 */
+int BoardPic_Import(int i)
+{
+    return img_scan_import(i, IMG_PIC_DIR);
+}
+
+int BoardPic_Busy(void)
+{
+    return (g_img_busy != 0u || g_img_test != 0u) ? 1 : 0;
+}
+
+int BoardPic_LastRc(void)
+{
+    return (int)g_img_rc;
+}
+
+/* ---- 笔记：/YMGUI/NOTE 下的 .txt ----
+ * 与照片共用同一张扫描表（同一时刻只服务一个分类，见 img_store.h 的说明）。
+ *
+ * ⚠ 文件名固定用 ASCII 的 note<N>.txt：卡是 FAT32 + FF_CODE_PAGE=936，
+ *   中文文件名要过 CP936 转码，写进去再读回来未必逐字节一致；
+ *   而笔记正文是 UTF-8 原样读写，不受影响 ⇒ 标题放正文第一行。 */
+int BoardNote_Scan(void)
+{
+    (void)img_scan_mkdir(IMG_NOTE_DIR);
+    return img_scan_dir(IMG_NOTE_DIR, ".txt", 2);
+}
+
+int BoardNote_Count(void)
+{
+    return img_scan_count();
+}
+
+int BoardNote_Name(int i, char* out, int n)
+{
+    return img_scan_name(i, out, n);
+}
+
+int BoardNote_Size(int i, uint32_t* size)
+{
+    return img_scan_size(i, size);
+}
+
+int BoardNote_Load(int i, char* out, int n)
+{
+    FIL     f;
+    FRESULT fr;
+    UINT    br = 0;
+    char    full[IMG_PATH_MAX];
+
+    g_note_rc     = -1;
+    g_note_bytes  = 0;
+
+    if (i < 0 || i >= img_scan_count() || out == NULL || n <= 1) { g_note_rc = -2; return -2; }
+    if (fatfs_ensure_mounted() != 0) { g_note_rc = -6; return -6; }
+    if (img_scan_path(i, IMG_NOTE_DIR, full, (int)sizeof(full)) != 0) { g_note_rc = -3; return -3; }
+
+    fr = f_open(&f, full, FA_READ);
+    g_note_fs_rc = (uint32_t)fr;
+    if (fr != FR_OK) { g_note_rc = -4; return -4; }
+
+    fr = f_read(&f, out, (UINT)(n - 1), &br);
+    (void)f_close(&f);
+    g_note_fs_rc = (uint32_t)fr;
+    if (fr != FR_OK) { g_note_rc = -5; return -5; }
+
+    out[br] = 0;
+    g_note_bytes = br;
+    g_note_rc    = 0;
+    return (int)br;
+}
+
+/* 挑一个没被占用的 note<N>.txt（N 从 0 往上找，最多 100 个）。 */
+static int pick_new_note(char* full, int n)
+{
+    FILINFO fi;
+    int     k;
+    int     j;
+
+    for (k = 0; k < 100; ++k)
+    {
+        int p = 0;
+        const char* dir = IMG_NOTE_DIR;
+        while (dir[p] != 0 && p < n - 1) { full[p] = dir[p]; ++p; }
+        if (p < n - 1) full[p++] = '/';
+        /* "note" */
+        { const char* tag = "note"; j = 0; while (tag[j] != 0 && p < n - 1) { full[p++] = tag[j]; ++j; } }
+        /* 十进制 N */
+        if (k >= 10 && p < n - 1) full[p++] = (char)('0' + (k / 10));
+        if (p < n - 1) full[p++] = (char)('0' + (k % 10));
+        { const char* ext = ".txt"; j = 0; while (ext[j] != 0 && p < n - 1) { full[p++] = ext[j]; ++j; } }
+        full[p] = 0;
+
+        if (f_stat(full, &fi) != FR_OK)
+            return 0;                       /* 不存在 ⇒ 可以用 */
+    }
+    return -1;
+}
+
+int BoardNote_Save(int i, const char* text)
+{
+    FIL     f;
+    FRESULT fr;
+    UINT    bw = 0;
+    char    full[IMG_PATH_MAX];
+    uint32_t len;
+
+    g_note_rc    = -1;
+    g_note_bytes = 0;
+
+    if (text == NULL) { g_note_rc = -2; return -2; }
+    if (fatfs_ensure_mounted() != 0) { g_note_rc = -8; return -8; }
+    len = (uint32_t)strlen(text);
+
+    if (i >= 0)
+    {
+        if (i >= img_scan_count()) { g_note_rc = -3; return -3; }
+        if (img_scan_path(i, IMG_NOTE_DIR, full, (int)sizeof(full)) != 0) { g_note_rc = -4; return -4; }
+    }
+    else
+    {
+        if (pick_new_note(full, (int)sizeof(full)) != 0) { g_note_rc = -5; return -5; }
+    }
+
+    fr = f_open(&f, full, (uint8_t)(FA_WRITE | FA_CREATE_ALWAYS));
+    g_note_fs_rc = (uint32_t)fr;
+    if (fr != FR_OK) { g_note_rc = -6; return -6; }
+
+    fr = f_write(&f, text, (UINT)len, &bw);
+    g_note_fs_rc = (uint32_t)fr;
+    (void)f_close(&f);
+
+    if (fr != FR_OK || bw != (UINT)len) { g_note_rc = -7; return -7; }
+
+    g_note_bytes = bw;
+    g_note_rc    = 0;
+
+    /* 重新扫一遍，让"新建"后的索引对得上（调用方可能要立刻列目录） */
+    (void)img_scan_dir(IMG_NOTE_DIR, ".txt", 2);
+    for (int k = 0; k < img_scan_count(); ++k)
+    {
+        char nm[IMG_SCAN_NAME_MAX];
+        if (img_scan_name(k, nm, (int)sizeof(nm)) == 0)
+        {
+            /* full 的末段文件名与 nm 相同 ⇒ 它就是刚写的那条 */
+            int a = 0, b = 0;
+            for (int t = 0; full[t] != 0; ++t)
+                if (full[t] == '/') a = t + 1;
+            while (full[a + b] != 0 && nm[b] != 0 && full[a + b] == nm[b]) ++b;
+            if (full[a + b] == 0 && nm[b] == 0)
+                return k;
+        }
+    }
+    return 0;
+}
 
 int BoardGallery_Count(void)
 {

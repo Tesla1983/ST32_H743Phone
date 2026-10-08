@@ -129,6 +129,50 @@ extern volatile uint32_t g_img_xip_fault;    /* 探针期间有没有新增故�
 /* 待导入的文件路径（SWD 写入，NUL 结尾） */
 extern char g_img_path[IMG_PATH_MAX];
 
+/* ---- 目录扫描（照片 / 笔记分类的真实文件列表，2026-10-09）----
+ *
+ * 【为什么不让 UI 直接调 f_readdir】
+ *   phone_shell 是 third_party 的演示代码，不该认识 FatFs（与 BoardGallery_*
+ *   同一套分层）；且 FILINFO 开了 LFN 后约 280 B，压进 UI 调用栈不划算。
+ *   ⇒ 这里扫完缓存成定长表，UI 只取"名字 + 大小"。
+ *
+ * 【开销与调用时机】一次扫描 = 若干次 f_readdir（每次可能读一个目录扇区），
+ *   实测在**毫秒级**，只在进入分类时扫一次，**不每帧扫**。g_scan_cyc 留证。
+ *
+ * 【⚠ 一张表串行复用】s_scan 只有一份，照片和笔记共用；切分类时重新扫。
+ *   UI 不得跨分类混用索引。 */
+#define IMG_SCAN_MAX      24u
+#define IMG_SCAN_NAME_MAX 48u
+
+#define IMG_PIC_DIR   "/YMGUI/PIC"
+#define IMG_NOTE_DIR  "/YMGUI/NOTE"
+
+extern volatile uint32_t g_scan_n;       /* 上次扫描到的条目数 */
+extern volatile uint32_t g_scan_cyc;     /* 上次扫描耗时的 DWT 周期数 */
+extern volatile uint32_t g_scan_fs_rc;   /* 最后一个 FRESULT */
+extern volatile uint32_t g_scan_kind;    /* 上次扫的是哪个分类：1=照片 2=笔记 */
+
+/* 笔记读写的诊断量（SWD 直读，判据用） */
+extern volatile int32_t  g_note_rc;      /* 0 = 成功；<0 见 img_store.c 的返回码 */
+extern volatile uint32_t g_note_bytes;   /* 上次读/写的字节数 */
+extern volatile uint32_t g_note_fs_rc;   /* 最后一个 FRESULT */
+extern volatile uint32_t g_note_cmp;     /* 自检（g_img_test=6）往返比对的失配字节数，0 = 完全一致 */
+
+/* 扫描 dir 下后缀为 ext（传小写，如 ".bmp"）的文件，返回条目数；<0 = 失败
+ * （目录不存在等，具体看 g_scan_fs_rc）。空目录返回 0。 */
+int  img_scan_dir(const char* dir, const char* ext, int kind);
+int  img_scan_count(void);
+/* 第 i 条的名字（不含目录前缀）与字节数；i 越界返回 -1 */
+int  img_scan_name(int i, char* out, int n);
+int  img_scan_size(int i, uint32_t* size);
+/* 拼出第 i 条的完整路径，给导入/打开用 */
+int  img_scan_path(int i, const char* dir, char* out, int n);
+/* 确保目录存在（已存在不算失败） */
+int  img_scan_mkdir(const char* dir);
+/* 触发异步导入第 i 条（置 g_img_test=1，由 img_store_poll 执行）。
+ * 返回 0 = 已排队；<0 = 索引越界 / 上一轮还没跑完。 */
+int  img_scan_import(int i, const char* dir);
+
 /* 主循环挂载点（写 g_img_test 触发，跑完自动清 0） */
 void img_store_poll(void);
 

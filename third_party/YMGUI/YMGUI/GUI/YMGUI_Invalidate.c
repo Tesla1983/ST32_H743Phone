@@ -211,9 +211,32 @@ static int diagObjSlot(GYOBJ obj, const GYrect* abs)
  */
 static void drawObjRec(GYOBJ obj, GYSURFACE s);   /* 前向声明:子对象递归要走计时外壳 */
 
+/* ---- 绘制遍历诊断（2026-10-09）----
+ * 用来回答"裁剪剔除到底剔掉了多少"以及"一帧画了多少像素"：
+ *   g_draw_visit  本帧访问到的对象次数（含被裁剪掉的）
+ *   g_draw_draw   本帧真正调用 draw_cb 的次数
+ *   ⇒ visit − draw = 被 band 裁剪挡掉的访问，是"子树/裁剪剔除"的直接度量。
+ *   g_inv_px      本帧脏区总面积（像素）；g_inv_cnt 是脏区块数
+ * 计数器用static（非 volatile）累加、每帧末拷进全局，尽量不干扰热点。 */
+uint32 g_draw_visit  = 0;
+uint32 g_draw_draw   = 0;
+uint32 g_inv_px      = 0;
+uint32 g_inv_cnt     = 0;
+uint32 g_inv_frames  = 0;
+/* 峰值版：写入 0 即清零，之后取到的是"这段时间里最糟糕的一帧"。
+ * ⚠ 为什么必须有它：g_inv_px 只保留**最近一次**有脏区那帧的值，而操作之后
+ *   等 1 s 再读，早就被时间刷新的小脏区覆盖了 —— 三个场景会读出同一个数
+ *   （2026-10-09 实测就是三个 1452，看起来像"没差异"，其实是采样点错了）。 */
+uint32 g_inv_px_max  = 0;
+uint32 g_visit_max   = 0;
+uint32 g_draw_max    = 0;
+static uint32 s_visit = 0;
+static uint32 s_draw  = 0;
+
 static void drawObjRecInner(GYOBJ obj, GYSURFACE s, int* slot_out)
 {
 	GYrect abs, hit;
+	s_visit++;
 	if (obj->state & GY_STATE_Hidden)
 		return;
 	YMGUI_Obj_GetAbsArea(obj, &abs);
@@ -226,6 +249,7 @@ static void drawObjRecInner(GYOBJ obj, GYSURFACE s, int* slot_out)
 	{
 		if (obj->draw_cb != NULL)
 		{
+			s_draw++;
 #if defined(YMGUI_DIAG_OBJTIME)
 			if (slot_out != NULL)      /* slot_out 非 NULL ⇔ 本次要计时 */
 			{
@@ -378,6 +402,19 @@ void YMGUI_Refresh(GYCTX ctx)
 	GYDISP disp = (GYDISP)ctx->disp;
 	gy_assert(disp && disp->buf1 && disp->flush_cb);
 
+	/* 诊断：本帧脏区规模 + 重置遍历计数（静止无脏区时保留上一帧的值，便于观察） */
+	{
+		uint32 px = 0u;
+		for (uint8 i = 0; i < ctx->inv_cnt; i++)
+			px += (uint32)ctx->inv_areas[i].w * (uint32)ctx->inv_areas[i].h;
+		g_inv_px     = px;
+		g_inv_cnt    = (uint32)ctx->inv_cnt;
+		g_inv_frames++;
+		if (px > g_inv_px_max) g_inv_px_max = px;
+	}
+	s_visit = 0u;
+	s_draw  = 0u;
+
 	//双缓冲:入口先排空上帧可能仍在途的 DMA(否则本帧首块会覆盖正在传的 buffer);
 	//游标从 buf1 起,穿过本帧所有脏矩形,让 ping-pong 重叠不在矩形边界断开
 	GYpx* cur = disp->buf1;
@@ -392,6 +429,11 @@ void YMGUI_Refresh(GYCTX ctx)
 		waitFlushIdle(disp);
 
 	YMGUI_Disp_FrameDone(disp);
+
+	g_draw_visit = s_visit;
+	g_draw_draw  = s_draw;
+	if (s_visit > g_visit_max) g_visit_max = s_visit;
+	if (s_draw  > g_draw_max)  g_draw_max  = s_draw;
 
 	ctx->inv_cnt = 0;//本帧脏区已处理
 }

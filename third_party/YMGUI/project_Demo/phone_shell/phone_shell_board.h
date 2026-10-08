@@ -60,6 +60,38 @@ int         BoardGallery_Info(int slot, unsigned int *off, unsigned int *len,
                               unsigned int *w, unsigned int *h);
 const void *BoardGallery_Pixels(int slot);                  /* NULL = 该槽位无图 */
 
+/* ---- 文件管理器：照片 / 笔记分类的真实文件（2026-10-09）----
+ * 同一套分层（不让 phone_shell 认识 FatFs）。
+ *
+ * ⚠ **调用顺序有约束**：BoardPic_Scan() 会真正去读 TF 卡目录（毫秒级），
+ *   所以**只在进入分类时调一次**；之后 Count / Name / Size 都读缓存表、不碰卡。
+ *   表只有一份、照片与笔记共用 —— 切分类必须重新 Scan，索引不能跨分类混用。
+ *
+ * 目录固定为 /YMGUI/PIC（.bmp）与 /YMGUI/NOTE（.txt），Scan 内部会 f_mkdir
+ * 保证目录存在，所以空卡第一次进分类也能得到 0 而不是失败。
+ * 诊断量 g_scan_n / g_scan_cyc / g_scan_fs_rc 可直接 SWD 读。 */
+int  BoardPic_Scan(void);                                   /* 扫一次，返回条目数；<0 = 目录打不开 */
+int  BoardPic_Count(void);                                  /* 上次扫描的条目数 */
+int  BoardPic_Name(int i, char* out, int n);                /* 文件名（不含目录），i 越界返回 -1 */
+int  BoardPic_Size(int i, uint32_t* size);                  /* 字节数 */
+int  BoardPic_Import(int i);                                /* 异步导入到图库：0=已排队，<0=没排上 */
+int  BoardPic_Busy(void);                                   /* 1 = 正在导入（导入中不要重复点） */
+int  BoardPic_LastRc(void);                                 /* 上一次导入的返回码（0 = 成功） */
+
+/* ---- 笔记分类：/YMGUI/NOTE 下的 .txt ----
+ * ⚠ **文件名一律用 ASCII**（note0.txt / note1.txt …），不拿标题当文件名：
+ *   卡是 FAT32 + FF_CODE_PAGE=936，中文文件名要过 CP936 转码，写进去再读回来
+ *   未必逐字节一致；而笔记正文是 UTF-8 原样读写，不受影响。
+ *   ⇒ 标题存正文第一行，文件名只当槽位 id。 */
+int  BoardNote_Scan(void);                                  /* 扫一次，返回条目数 */
+int  BoardNote_Count(void);
+int  BoardNote_Name(int i, char* out, int n);
+int  BoardNote_Size(int i, uint32_t* size);
+/* 读第 i 条正文到 out（NUL 结尾），返回读到的字节数；<0 = 失败 */
+int  BoardNote_Load(int i, char* out, int n);
+/* 写正文：i >= 0 覆盖第 i 条，i < 0 新建一个文件。返回写入后的索引；<0 = 失败 */
+int  BoardNote_Save(int i, const char* text);
+
 /* ---- ESP32 上行链路：NTP 时间 + 天气（2026-10-08）----
  * 声明实际在 src/uart_link.h（那里有完整的协议与踩坑说明），这里只是转一手，
  * 让 phone_shell 不用直接 include src 下的头。
