@@ -220,6 +220,32 @@ python tools/ime_probe.py zhongguo xianzai zhongguoren
   `I (2146494) uplink: → STM32  时间 2026-10-08 23:22:58 | $DT,1791472978,...,*2E`）。
   解析器取行内**最后一个 `$`** 再取它之后的第一个 `*`，所以照样能正确提取 —— 别改成"取第一个 `$`"。
 
+**设置页滚动容器 + 滚动条**（本工程新增，**上游 YMGUI 没有**）：
+
+- **上游只有"滚动语义"，没有滚动条**。引擎提供对象级 `scroll_x/scroll_y`
+  偏移（`YMGUI/OPOBJ/YMGUI_Obj.h:71`，子对象绝对坐标在 `YMGUI_Obj.c:290` 减去它）
+  与 `ClipChildren` 子裁剪，`tests/test_scroll.c` 是官方单测；但整个 `YMGUI/` 目录里
+  搜 `滚动条`/`scrollbar` **零命中** —— 会滚的 `List`/`EditView`/`TextView`/`Table`/`Grid`
+  五个控件**都不画条**。上游要"条"时是拿 `Slider` 冒充（`project_Demo/video_stidio` 的时间轴）。
+- **本工程做法**：`project_Demo/phone_shell/apps/settings.c` 自建滚动容器
+  （开 `ClipChildren` + 用引擎的 `scroll_y`）+ **自绘 3 px 圆角灰色滑块**，
+  滑块高度/位置由视口高与内容总高算出（见下方"几何"）。为什么不用现成的 `YMGUI_List`：
+  它只能加"文字条目"（内部 `malloc` 一个 `GYitem_data` 挂上自己的 `itemDrawCb`），
+  塞不进 `PhoneUI_panel` + 一堆子控件的卡片。
+- **几何**：视口 `320×356`（app 视图区高 412 − 头部 56），内容总高 **491** ⇒
+  `clamp` 上限 **135**；滑块高 = `356²/491 = 258 px`，可移动量 `98 px`。
+- **事件转发**：库的 `sendEvent` **不向父冒泡**、`event_cb == NULL` **静默丢弃**
+  ⇒ 必须**递归给子树每个对象**装 wrapper（卡片 `PhoneUI_panel` 没有 `event_cb`，
+  否则按在卡片空白处怎么拖都不动）。wrapper 还要用 `SLOP + moved` 吞掉滚动误触的 `Clicked`
+  （否则按住开关上拖会在松手时把开关翻掉）。
+- **软键盘**：弹起时**收缩视口高度**，而不是让 IME 去挪控件
+  （`PhoneIME_Show()` 的避让段混用绝对/局部坐标，在滚动容器里必然错位）。
+- **验收**：数据 `tools/ribbon_check.py` ③（拖动 → `scroll_y` 变 → 滚到底恰好停在 clamp 上限）；
+  视觉 `tools/scroll_shot.py`（在两态抓屏里量滑块几何，实测 `y=92..350` → `y=190..448`、
+  高 258、下移 98 ⇒ PASS）。
+- **完整参考**（几何算式、六个函数、六个坑、在新页面复用的步骤）：
+  **[`docs/SCROLL_VIEW.md`](docs/SCROLL_VIEW.md)**。
+
 ## 6. 内存布局与硬性约束
 
 ```text
@@ -273,14 +299,15 @@ LCD    0x6010_0000           FMC NE1 + A19 作 RS
 | `tools/img2rgb565.py` | 图片 → **RGB565 裸数据**（供 W25Q128 XIP 直读，`GYimg.data` 是 `const GYpx*` ⇒ 零 RAM 开销）。`--selftest` 跑纯色探针自检 |
 | `tools/img_check.py` | **图库全链路验收**：XIP 冲突探针 + 造测试 BMP 写卡 + 触发固件导入 + **XIP 读回与主机侧独立参考逐字节比对** |
 | `tools/gallery_shot.py` | 相册页**抓屏**验收：打开相册 → 抓屏 → 点「下一张」→ 再抓屏（附 caption 裁剪，看中文有没有被截断） |
+| `tools/scroll_shot.py` | **设置页滚动条**视觉验收：顶部态/底部态各抓一帧，在 `x=315` 列量滑块几何并与算式对账（数据侧在 `ribbon_check.py` ③） |
 | `tools/uart_check.py` | **ESP32 上行链路验收**：① 解析自检（喂三行实测样本，与线无关）② 线上等 N 秒看 `g_uart_rx_bytes` 涨不涨、`FE` 是否为 0 ③ 打印最后一帧原文 |
 | `tools/clock_shot.py` | **NTP 时间/天气上屏抓屏**：回首页 → 读链路状态 → 抓屏并裁出状态栏/大时间/日期/天气/图标五块放大。`--blink` 验冒号闪烁，`--icons` 逐个写 `g_net_code` 验图标分派 |
 
 ### 验收判据与当前基线
 
-| 编号 | 判据 | 实测（出货形态，2026-10-08） |
+| 编号 | 判据 | 实测（出货形态；各行取**最近一次**实测，日期见行内） |
 |---|---|---|
-| **A1** | 满负载整帧刷新 | **10.89 ms = 91.8 FPS**（60 帧整屏标脏，桌面场景，两次复现一致） |
+| **A1** | 满负载整帧刷新 | **10.92 ms = 91.6 FPS**（2026-10-09，复位后干净态；60 帧整屏标脏，桌面场景，两次复现一致） |
 | **A2** | 显示通路逐像素自检 | `g_ramp_mismatch = 0`、`g_gram_mismatch = 0` |
 | **A3** | 触摸识别 | `g_tp_pid = 0x31313538`（`"1158"`） |
 | **A4** | XIP 与 indirect 读一致 | 比对覆盖全部 16 MB，失配 0 |
@@ -291,6 +318,7 @@ LCD    0x6010_0000           FMC NE1 + A19 作 RS
 | **A9** | SDMMC1 **IDMA** 通路 | `tools/sd_dma_check.py`：IDMA 写→读 4096/4096 失配 0 + 哨兵残留 15−基线 15=0 + 原内容恢复 0，连跑 5 轮 PASS |
 | **A10** | 图库全链路（BMP → W25Q128 → XIP 显示） | `tools/img_check.py`：导入 `rc=0`、96×64 → 12 288 B、耗时 262 ms，**XIP 读回 vs 主机侧独立参考逐字节失配 0**，索引条目一致；`tools/gallery_shot.py` 抓屏确认测试图正确显示且 caption 由 "1 / 2" 切到 "2 / 2 张卡上图片" |
 | **A11** | ESP32 上行链路（USART6 收 NTP 时间 / 天气） | `tools/uart_check.py`：自检 3/3（$DT/$WD/$WF 各 +1、XOR 失败 0、样本值全对）；线上 14 s 内 `rx_bytes +312`、`$DT +2`、`FE=0`；`tools/clock_shot.py` 抓屏确认状态栏 **23:35**、大时间 **23:35** + 冒号闪烁、日期 **10月8日 星期四**、天气 **晴 / 20℃**、图标按 code=0 画成纯太阳 |
+| **A12** | 设置页滚动容器 + 滚动条（**本工程新增，上游无此控件**） | 数据 `tools/ribbon_check.py` ③：拖动 `scroll_y` 0 → 135 且滚到底**恰好停在 clamp 上限**、滚到底后关机按钮可点。视觉 `tools/scroll_shot.py`：滑块 `y=92..350`（顶部态）→ `y=190..448`（底部态），高 **258** px（= 356²/491）、下移 **98** px（= 356−258），与几何算式一致 ⇒ PASS |
 | — | 故障计数器 | `g_fault.magic = 0`（从未发生内核故障） |
 | — | 文本光标 | 16×2 下划线，周期 300 ms |
 
@@ -371,6 +399,7 @@ heap1 峰值  71 432 B / 204.0 KB  34 %   （复位后干净态；跑过导入/�
 | `docs/FONT_GLYPH_CLIPPING.md` | 字母 W 渲染残缺的根因、证据与上板结果 |
 | `docs/EXTERNAL_FLASH_OFFLOAD_FEASIBILITY.md` | 只读大资源外挂到 QSPI 的可行性论证与布局 |
 | `docs/MEMORY_ARCHIVE.md` | 内存布局、历史结论与已归档论证 |
+| **[`docs/SCROLL_VIEW.md`](docs/SCROLL_VIEW.md)** | **滚动容器与滚动条实现参考**：上游 YMGUI 只有滚动语义、**没有滚动条控件**；本工程设置页的自建容器 + 自绘条（几何算式、六个坑、验收、复用步骤） |
 | **[`docs/TF_CARD_CACHE_ROADMAP.md`](docs/TF_CARD_CACHE_ROADMAP.md)** | TF 卡接入与缓存一致性的路线图（L1–L4）；**L1–L3 与 L2-1~L2-4 全部已完成** |
 | `docs/BOOT_HANG_VOSRDY_LESSONS.md` | 上电卡死的定位过程与教训 |
 | `docs/PREVIEW_BRIGHTNESS_ACCEPTANCE.md` | 亮度/预览的验收标准与目视结论 |

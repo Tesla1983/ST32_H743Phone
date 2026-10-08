@@ -39,6 +39,7 @@
 | `YMGUI/GUI/YMGUI_Invalidate.c/.h` | 脏区计算 |
 | `YMGUI/GUI/YMGUI_Event.c` | 事件分发（注意：`sendEvent` **不冒泡**、`event_cb == NULL` **静默丢弃**） |
 | `YMGUI/WIDGET/YMGUI_EditView.c` / `TextInput.c` | 输入法相关的编辑控件 |
+| `project_Demo/phone_shell/apps/settings.c` | **自建滚动容器 + 自绘滚动条** —— 上游 YMGUI **没有滚动条控件**（引擎只有对象级 `scroll_y` 与 `ClipChildren`；`List`/`EditView`/`TextView`/`Table`/`Grid` 都能滚但都不画条）。本页把七项卡片改可滚动并补了一根 3 px 灰条。上游若新增同类控件，这里最可能冲突；用法与几何算式见 `docs/SCROLL_VIEW.md` |
 | `project_Demo/phone_shell/*` | 电话外壳本身：桌面、最近任务、IME、壁纸 ribbon、设置页 |
 
 ## 未入库的部分（`.gitignore` 排除）

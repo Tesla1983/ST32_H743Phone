@@ -633,6 +633,15 @@ wrapper（`PhoneUI_panel` 无 `event_cb` ⇒ 空白处怎么拖都不动）。`G
 **滑杆回调在 `Pressed` 与每次 `Pressing` 都触发**。
 
 ## 设置页布局（滚动版）
+⚠ **上游 YMGUI 有"滚动语义"但没有"滚动条"**（2026-10-09 复核）：引擎级 `scroll_x/scroll_y`
+（`YMGUI/OPOBJ/YMGUI_Obj.h:71`）+ `ClipChildren` + `tests/test_scroll.c` 官方单测都在，
+但整个 `YMGUI/` 里搜 `滚动条`/`scrollbar`/`ScrollBar` **零命中**，`WIDGET/` 54 个文件里
+也没有 `*ScrollBar*`；会滚的 `List`/`EditView`/`TextView`/`Table`/`Grid` **都不画条**，
+上游要条时是拿 `Slider` 冒充（`video_stidio` 的时间轴）。
+⇒ 设置页那根 3 px 灰条是**本工程自绘**（`apps/settings.c` 的 `scroll_bar_draw`），
+   条色 `RGB(120,132,150)`（不透明 ⇒ RGB565 精确 = `0x7C32`，脚本按这个值识别）。
+⇒ 完整参考（几何算式、六个坑、验收、复用步骤）：**`docs/SCROLL_VIEW.md`**。
+
 `SCROLL_VIEW_H=412-56`，`content_h=491` ⇒ clamp 上限 135。**视口必须从 `y=56` 起**（不透明+ClipChildren，
 会盖兄弟对象）。卡片内容 y=65/133/201/269/329/407/451 ⇒ 底部初始在屏外，先滚到底。`SCROLL_WRAP_MAX=48`，
 装满是**静默 return**（表现为"后面几个控件滚不动"）。
