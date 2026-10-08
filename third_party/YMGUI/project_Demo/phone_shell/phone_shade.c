@@ -4,8 +4,16 @@
 #include "YMGUI_Image.h"
 #include "phone_quick.h"
 #include "phone_quick_builtin.h"
+#include "phone_shell_board.h"   /* BoardNet_*：控制中心顶部的日期/时间也走上行链路 */
 
 static GYCTX ctx;
+/* 控制中心顶部的日期与时间。原来是硬编码的 "09:41" / "9月29日 星期二"，
+ * 而 sheet 只在 PhoneShade_Init 里建一次 ⇒ 不改就是**永远停在初始值**。
+ * 句柄存下来，由 PhoneShade_Update 每 500 ms 刷。 */
+static GYOBJ shade_clock, shade_date;
+static char s_shade_hm[8], s_shade_date[40];
+static char s_shade_hm_prev[8], s_shade_date_prev[40];
+static uint32 s_shade_acc;
 static GYOBJ trigger, overlay, sheet, tiles[PHONE_QUICK_CAPACITY], bright, cards[2], empty, preview, preview_image;
 static int enabled, visible, closing, start_y, drag_origin, dragging;
 static int notices[2] = {1, 1}, quick_page;
@@ -328,6 +336,32 @@ void PhoneShade_Update(int allow)
 				YMGUI_Obj_Invalidate(tiles[i]);
 			}
 		}
+
+	/* 顶部时间/日期：每 500 ms 刷一次（这里没有 elapsed 参数，用固定步长累加即可 ——
+	 * 本函数由 PhoneShell_BoardTick 每拍调用一帧的量级约 16 ms，误差不影响显示）。
+	 * ⚠ 只在**可见**时刷：控制中心收起时刷它只会白白置脏。 */
+	if (!visible)
+		return;
+	s_shade_acc += 16;
+	if (s_shade_acc < 500u)
+		return;
+	s_shade_acc = 0;
+
+	BoardNet_ClockHM(s_shade_hm, (int)sizeof(s_shade_hm));
+	if (shade_clock && strcmp(s_shade_hm, s_shade_hm_prev) != 0)
+	{
+		strcpy(s_shade_hm_prev, s_shade_hm);
+		PhoneUI_text_set(shade_clock, s_shade_hm);
+	}
+	if (BoardNet_HasTime())
+	{
+		BoardNet_DateText(s_shade_date, (int)sizeof(s_shade_date));
+		if (shade_date && strcmp(s_shade_date, s_shade_date_prev) != 0)
+		{
+			strcpy(s_shade_date_prev, s_shade_date);
+			PhoneUI_text_set(shade_date, s_shade_date);
+		}
+	}
 }
 void PhoneShade_SetWifi(int on)
 {
@@ -361,9 +395,16 @@ void PhoneShade_Init(GYCTX context)
 	YMGUI_Obj_SetBgColor(sheet, RGB(20, 28, 44));
 	sheet->event_cb = drag_event;
 	PhoneUI_left_label(sheet, 18, 4, 180, "Yaomi", RGB(162, 174, 198), 2);
-	PhoneUI_left_label(sheet, 18, 27, 165, "09:41", WHITE, 3);
+	/* 时间/日期取 ESP32 上行链路（NTP）。没同步到时 board 层给占位串，
+	 * 由 PhoneShade_Update 每 500 ms 刷一次。 */
+	BoardNet_ClockHM(s_shade_hm, (int)sizeof(s_shade_hm));
+	shade_clock = PhoneUI_left_label(sheet, 18, 27, 165, s_shade_hm, WHITE, 3);
 	PhoneUI_left_label(sheet, 196, 33, 110, "控制中心", WHITE, 0);
-	PhoneUI_left_label(sheet, 18, 65, 176, "9月29日 星期二", RGB(162, 174, 198), 2);
+	if (BoardNet_HasTime())
+		BoardNet_DateText(s_shade_date, (int)sizeof(s_shade_date));
+	else
+		snprintf(s_shade_date, sizeof(s_shade_date), "%s", "9月29日 星期二");
+	shade_date = PhoneUI_left_label(sheet, 18, 65, 176, s_shade_date, RGB(162, 174, 198), 2);
 	if (PhoneQuick_Count() > 8)
 	{
 		page_label = PhoneUI_label_ex(sheet, 174, 64, 56, "", MUTED, 2);

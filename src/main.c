@@ -53,6 +53,10 @@
 #include "phone_lang.h"
 #include "phone_shell_board.h"
 #include "dma_bench.h"
+#include "sd_card.h"
+#include "fatfs_port.h"
+#include "img_store.h"
+#include "uart_link.h"
 #include "app_config.h"
 
 /* ---- 供 SWD 直接读的指示量（地址用 arm-none-eabi-nm 查）----
@@ -708,13 +712,33 @@ int main(void)
 
     /* ---- DWT 周期计数器：给 YMGUI_Inject_Tick 提供真实经过的毫秒数 ----
      * ⚠ 顺序不能颠倒：global trace 未使能时 CYCCNTENA 写入可能被忽略
-     * （参照工程 stm32-tetris 实测过：只调 CYCCNTENA 时 CYCCNT 恒为 0）。 */
+     * （早期 Rust 参照工程实测过：只调 CYCCNTENA 时 CYCCNT 恒为 0）。 */
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
     DWT->CYCCNT = 0;
     DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
     g_dwt_hz = 400000000u;        /* = sys_ck，见 sys_stm32_clock_init(160,5,2,4) */
 
+    /* ---- TF 卡（SDMMC1，路线图 L2-1）----
+     * 放在 DWT 之后：自检要用 DWT 计时（DWT 不开则 CYCCNT 恒 0，读到的周期数没意义）。
+     * ⚠ 没插卡 / 卡不识别**不影响任何其他功能**：sd_card_init 只把自己的失败
+     *   记进 g_sd_init_rc 就返回，LCD / 触摸 / UI 全部照常。
+     * 自检本身**不在开机时跑** —— 它会写卡（虽然选在卡尾且带备份恢复），
+     * 必须由人显式触发：SWD 写 g_sd_test = 1，或 python tools/sd_check.py。 */
+    (void)sd_card_init();
+
+    /* ---- ESP32 上行链路（USART6 / PC6-TX / PC7-RX，115200）----
+     * 对端每 10 s 发一帧 $DT（NTP 时间）、每 30 min 一帧 $WD（天气）。
+     * ⚠ 没接对端 / 波特率不对**不影响任何其他功能**：uart_link_init 只把失败
+     *   记进 g_uart_rc 就返回，UI 上时间显示"--:--"、天气显示"等待天气"。
+     * 判据看 g_uart_rx_bytes 有没有在涨、g_uart_err_fe 是不是 0。 */
+    (void)uart_link_init(115200u);
+
     uint32_t last_cyc = DWT->CYCCNT;
+
+    /* 开机以来的累计毫秒（给 uart_link 做时基）。
+     * ⚠ 不能用 DWT->CYCCNT 直接换算：32 位 @400 MHz 约 10.7 秒就回绕一次，
+     *   拿它当绝对时基会让"当前时间"每 10 秒跳一次。 */
+    uint32_t uptime_ms = 0;
 
     /* 帧节拍目标：**60 Hz**（16 ms）。取 16 而不是 16.67 是为了让 DWT 整数换算不丢进位；
      * 差出来的 0.67 ms/帧在空转等待里，不产生任何收益差异。 */
@@ -747,7 +771,18 @@ int main(void)
         g_loop_count++;
 
         /* 触摸：扫描厂商驱动并把坐标注入 YMGUI（拉取式，无中断） */
-        touch_port_poll();
+        /* 图库导入期间（g_img_busy=1）连触摸也不处理：输入路径会查中文输入法，
+         * 而 IME 词典就放在 XIP 上，退出映射时读它会拿到未知数据。
+         * ⚠ 当前 img_store_poll 是**阻塞式**一次性跑完（几秒），主循环卡在里面，
+         *   下面这两个判断在同一拍里其实轮不到；留着是为两件事：
+         *   ① 将来把导入改成"分帧推进"（每帧写一个块、让出主循环）时，
+         *      这道门闩就是必须的了，先按正确结构摆好；
+         *   ② 防御任何中断/回调路径在导入期间碰 UI。
+         *   别把它当成"现在就有用"的装饰 —— 它的价值在分帧化之后。 */
+        if (g_img_busy == 0u)
+        {
+            touch_port_poll();
+        }
         g_mark_poll = g_loop_count;
 
         /* 恢复出厂设置（SWD 写 1 触发，跑完自动清 0）。
@@ -765,7 +800,21 @@ int main(void)
          *   非灌库构建里这个函数是空的（g_prov_enabled = 0）。 */
         qspi_provision_poll();
 
-        if (g_ctx_rc == 1)
+        /* 图库导入 / XIP 探针（写 g_img_test 触发，跑完自动清 0）。
+         * 位置理由同上：它会擦写 W25Q128 的扇区（每个约 45 ms），期间 XIP 不可读，
+         * 必须保证同一拍里不往屏上推内容。见 src/img_store.h 顶部。 */
+        img_store_poll();
+
+        /* 写文件夹具：把 PC 侧的测试图分片送进 TF 卡（见 img_store.h 的 g_img_mk）。
+         * 它不碰 QSPI，所以不必放在渲染之前 —— 但挨着放便于一眼看清顺序。 */
+        img_store_mk_poll();
+
+        /* ESP32 上行链路：把 ISR 收进环形缓冲的字节抽出来组帧、校验、解析。
+         * 不碰 QSPI、不碰屏幕，放哪都行；挨着放只是为了让顺序一眼看清。 */
+        uptime_ms += ms;
+        uart_link_poll(uptime_ms);
+
+        if (g_ctx_rc == 1 && g_img_busy == 0u)
         {
             uint32_t c0 = DWT->CYCCNT;
             if (g_shell_rc == 0)
@@ -887,6 +936,16 @@ int main(void)
 
         /* 渲染原语微基准（见变量处注释）：写 g_micro_test 触发，跑完自动清 0 */
         run_render_micro();
+
+        /* 文件系统自检（路线图 L2-3）：写 g_fs_test=1 触发，跑完自动清 0。
+         * 在卡上建 /YMGUI 目录 → 写 1 KB 文件 → 读回逐字节比对 → 删掉该文件。
+         * 只在被触发时跑（阻塞几百毫秒），不影响正常 UI 帧率。见 src/fatfs_port.h。 */
+        fatfs_bench_poll();
+
+        /* TF 卡自检（路线图 L2-2）：写 g_sd_test=1 触发，跑完自动清 0。
+         * 会阻塞几百毫秒（轮询读写 4 KB + 备份恢复），所以只在被触发时跑，
+         * 不影响正常 UI 帧率。见 src/sd_card.h 顶部。 */
+        sd_bench_poll();
 
         /* DMA 缓存一致性双向台架：写 g_dma_test=1 触发，跑完自动清 0。
          * 用真实 DMA（DMA1 MEM2MEM）验证"CPU→DMA 通、DMA→CPU 需 invalidate"，

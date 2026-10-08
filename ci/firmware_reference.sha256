@@ -22,5 +22,113 @@
 #   上板实测被裁 0/95、W 右竖恢复；出货形态 FLASH 1 579 052 B（+1 520 B），
 #   heap1 峰值 71 064 B 不变，A2 ramp/gram = 0，IME 3/3，光标正常。
 # 板上核验：烧录后 flash_and_verify.py 全部 PASS（语言三层 + A2 + IME + caret）。
-371532c63523d1d18f61c3fe6ae64ddf0b8892baff10a97d304c25e402c1b390  ymgui-h743.bin
-1d15a6d60fea5fcf9a395344cfbe2db3ba4aefe8025ffb5563fb7c47c4841e73  ymgui-h743.elf
+# ---------------------------------------------------------------- 新基准（2026-10-08）
+# a 类更新（有意为之的功能改动）：**TF 卡 SDMMC1 通路 + FatFs 文件系统**（路线图 L2-1/2/3）。
+#   新增 src/sd_card.c（SDMMC1 4-bit 轮询驱动 + 写读比对自检）、
+#   src/fatfs_port.c（diskio 适配 + 文件系统自检）、third_party/FatFs/source（ff.c + ffunicode.c）；
+#   HAL 侧补编 stm32h7xx_hal_sd.c 与 stm32h7xx_ll_sdmmc.c；链接脚本加 .bss_sd 段（SRAM1）。
+#   FLASH 1 579 052 B → 1 775 580 B（75.30% → 84.67%）；DTCM 24 216 → 28 640 B；SRAM1 +12 KB。
+#   上板实测：卡识别 SDHC/SDXC 29.12 GB；扇区级 512 B 与 8×512 B 写→读失配 0（连跑 15 轮）；
+#   FatFs 挂载 FAT32、建目录/写 1024 B/重开读回逐字节失配 0/删除；A2 ramp/gram = 0、
+#   g_fault 全 0、IME 2/2、heap0 61% / heap1 41%。
+# 上一基准（W 字模修复后的出货形态）：
+# 371532c63523d1d18f61c3fe6ae64ddf0b8892baff10a97d304c25e402c1b390  ymgui-h743.bin
+# 1d15a6d60fea5fcf9a395344cfbe2db3ba4aefe8025ffb5563fb7c47c4841e73  ymgui-h743.elf
+# ---------------------------------------------------------------- 新基准（2026-10-08，同日第二版）
+# a 类更新：**L3 —— MPU 把 SRAM1 配成非缓存 DMA 区**（region 编号重排）。
+#   改动全在 third_party/BSP/MPU/mpu.c：region0 = SRAM1(0x30000000,128KB)
+#   TEX=001/C=0/B=0 非缓存+XN+可写；原 region3「SRAM1~SRAM3 512KB 可缓存」拆成
+#   SRAM2(region3) + SRAM3(region4)；QSPI 由 region0 挪到 region6、SRAM4 由 region4 挪到 region7
+#   （回收本板没有的 SDRAM/NAND 两个编号）。理由：ARMv7-M 编号小者优先级高。
+#   判据：`tools/dma_check.py` 用例②（DMA 写 → CPU 读不做维护）失配 **64 → 0**。
+#   回归：A2 ramp/gram=0、g_fault 全 0、IME 2/2、TF 卡扇区自检 3/3、FatFs 写读失配 0。
+# 上一基准（同日早些时候，TF 卡 L2 那版）：
+# 92927c3dda0cfb65889e094c7d7a9cca8f3e7e14c9d07b324d5a73ffa924dd22  ymgui-h743.bin
+# 170418b38caf5a47a3a455064cc246d74d0cf042065f67b4961c83cb527b1b38  ymgui-h743.elf
+# ---------------------------------------------------------------- 新基准（2026-10-08，同日第三版）
+# a 类更新：**L2-4 —— SDMMC1 IDMA 通路打通**。
+#   1. startup_gcc.s：150 个外部中断原来全是 Default_Handler，为 IRQ49 单开槽位
+#      指向 SDMMC1_IRQHandler（IDMA 完成必须靠中断回调 HAL_SD_IRQHandler 收尾）；
+#   2. src/sd_card.c：新增 sd_op_dma / sd_op_dma_retry / run_dma_bench、SDMMC1_IRQHandler
+#      与三个 HAL 回调；g_sd_test 新增模式 4（IDMA @25MHz）与 5（IDMA @50MHz）；
+#   3. ★缓冲位置：IDMA 缓冲由 SRAM1 搬到 **AXI SRAM 尾部 8 KB（0x2407E000）**，
+#      因为 SDMMC1 的 IDMA 只能访问 D1 域内存（ST AN5200），SRAM1/2/3 它到不了 ——
+#      放 SRAM1 时实测一个字节都搬不动（TX_UNDERRUN / RX_OVERRUN，DCOUNT 只走 28/4096）；
+#   4. mpu.c：AXI 尾部 8 KB 配成非缓存，编号取 **7（最大）** —— ARMv7-M 是
+#      「编号越大优先级越高」（DDI0403），此前注释里"编号小优先级高"是错的，已更正；
+#      DTCM 回到 region1，SRAM4 那条 region 删除；
+#   5. 链接脚本新增 .bss_sd_dma 段，heap1 212 KB → 204 KB（实测峰值 89 000 B = 43%）。
+#   判据（tools/sd_dma_check.py）：IDMA 写→读 4096/4096 字节失配 0；哨兵残留 15 − 基线 15 = 0
+#   （基线 = 随机图案里本来就有的 0x5A 字节数）；原内容恢复失配 0；连跑 5 轮全 PASS。
+#   回归：dma_check 用例② 仍 0（L3 未破）、A2 ramp/gram=0、g_fault 全 0、IME 2/2、
+#   FatFs 挂载+写读+删除全 OK、heap0 62% / heap1 43%。
+# 上一基准（同日第二版，L3 那版）：
+# 7b3d533b6bbf7f8deb19bcc07f3114ba4d8241a5742fb65ee0a9c406a93cce06  ymgui-h743.bin
+# 5ca0f3de65d03793f4f1b118f2291587425cb72001fcaa8665c3ffc114742f0a  ymgui-h743.elf
+# 52bebb92fa1f99d124c180d4bb83b7df0205607161a51fdb15d92d67dc49cd4f  ymgui-h743.bin
+# 648541af15a07d7aa6e02bf30783100e1d37c71e1be099c715ed46eb86c26b40  ymgui-h743.elf
+# ---------------------------------------------------------------- 新基准（2026-10-08，同日第四版）
+# a 类更新：**固件内 "TF 卡 BMP → RGB565 → 灌 W25Q128 → XIP 直读显示" 整条链路**（相册接真图）。
+#   1. 新增 src/img_store.c/.h：BMP 解码（24/32bpp、bottom-up/top-down 都认）+ 流式分块
+#      （读卡一行 → 转 565 → 攒满 4 KB 一扇区 → qspi_write → 丢弃），峰值 RAM 仅 6 KB，
+#      **与图片尺寸无关** ⇒ 绕开 heap1 余量限制；
+#   2. 链接脚本新增 .bss_img 段（SRAM1，6144 B = 一个 4 KB 块 + 一行源像素 2 KB）；
+#   3. 图库索引单扇区 16 B/槽 × 256 槽（magic 0x4947），槽位分配时把整个索引块
+#      memcpy 到 RAM 再扫，把 256 次 XIP 读降成 1 次；
+#   4. third_party/YMGUI/.../phone_shell_board.h 新增 BoardGallery_Count/Info/Pixels 三个
+#      board 层接口（phone_shell 不直接依赖 src/）；app 侧 gallery.c 重写，有图就用
+#      draw_cb 从 XIP 取像素画（data 是 const GYpx* ⇒ 整幅不进 RAM），无图退回原三维色块；
+#   5. src/main.c 把 img_store_poll / img_store_mk_poll 挂在渲染之前；触摸在 g_img_busy=1 时跳过。
+#   ★最深的坑（写进 img_store.h 顶部了）：qspi_write 只退映射不恢复 ⇒ 在 indirect 模式下读
+#     XIP 窗口会触发**精确 BusFault 升级 HardFault**（实测 g_fault.kind=1、CFSR=0x8200、
+#     BFAR=0x90010000），主循环卡死。单次读不挂是假阴性（连读上百次才现）。现在写循环结束
+#     与 img_store_poll 末尾各补一次 qspi_enter_mmap() 兜底。（当时误判成 QSPI 通信超时，
+#     靠 run_qspi_diag 的 A/B 对照才排除"退出前读了大量 XIP"这个假说。）
+#   FLASH：.text 1 779 116 + .isr_vector 664 + .ARM 8 + .data 4 136 = **1 783 924 B（85.06%）**
+#     （上一基准 1 779 380 B ⇒ +4 544 B）；DTCM 30 256 B；SRAM1 10 752 B（含新 .bss_img 6 KB）；
+#     SRAM2 62 000 B；SRAM3 20 KB；AXI 512 KB（.bss_sd_dma 段，heap1 在其中）。
+#   判据一（数据）：`python tools/img_check.py` 全 PASS ——
+#     ① XIP 冲突探针：退出映射后读仍返回旧值、探针期间新增故障 0；
+#     ② BMP 写卡 18 486 B / 5 片 OK；③ 导入 rc=0、步骤 7、96×64 = 12 288 B、耗时 262 ms；
+#     ④ **XIP 读回 vs 主机侧独立参考逐字节失配 0**，索引条目（off/len/w/h）与导入结果一致。
+#   判据二（视觉）：`python tools/gallery_shot.py` 抓屏 —— 相册显示测试图（左上红块 / 右下蓝块 /
+#     纵向渐变 / 横向条纹，行序或列序错必被发现），caption "1 / 2 张卡上图片"，
+#     点「下一张」（绝对坐标 160,426 = 内容 y373 + app_views 的 +36）后变 "2 / 2" 且画面切换。
+#   回归（全部 PASS）：dma_check 用例② 仍 0（SRAM1 非缓存未被破坏）；fs_check 写读失配 0；
+#     sd_check 扇区 512/4096 B 失配 0；sd_dma_check IDMA 4096/4096 失配 0 + 哨兵不超基线；
+#     heap0 peak 32 688 B（63%）/ heap1 peak 71 064 B（34%）；A2 ramp/gram = 0；g_fault 全 0；
+#     IME 2/2；满负载整帧 10.91 ms / 91.6 FPS（复位后干净态，与上一基准 10.89 ms 持平）。
+#     ⚠ 测帧率前要 reset：跑过 img_check/fs_check 之后同一份固件会读到 ~12.5 ms，
+#       那是运行态（堆布局/D-Cache 内容）差异，不是帧时间回归。
+# 再上一基准（同日第三版，L2-4 那版）：
+# 52bebb92fa1f99d124c180d4bb83b7df0205607161a51fdb15d92d67dc49cd4f  ymgui-h743.bin
+# 648541af15a07d7aa6e02bf30783100e1d37c71e1be099c715ed46eb86c26b40  ymgui-h743.elf
+
+# c71ae5feb7544df1497b67e59f7ffee0742f86e78629909920114741da491052  ymgui-h743.bin   # 第四版（图库/BMP→W25Q128）
+# 6a670125fc506417746d2d02eb82a9e8cb9d255a4225e7996fb275888ef4c258  ymgui-h743.elf   # 第四版
+
+# ============================================================================
+# 第五版（2026-10-08）：ESP32 上行链路（USART6 收 NTP 时间 + 天气 → 界面）
+#   新增：src/uart_link.c/.h（USART6 PC6/PC7 115200，自己写 ISR 不走 HAL 回调）、
+#         tools/uart_check.py（链路验收）、tools/clock_shot.py（上屏抓屏验收）；
+#         启动文件向量表第二次开槽：150 拆成 49+1+21+1+78（IRQ71 = USART6）。
+#   界面：状态栏/桌面大时间改 HH:MM（大时间冒号每秒闪、秒位去掉，拆三个 label）、
+#         日期 10月8日 星期四、天气 晴 / 20℃、天气图标按 code 分派、
+#         控制中心顶部时间/日期同链路。硬编码的 "9:41"/"09:41"/"多云 / 22 C" 全部退役。
+#   判据一（数据）：`python tools/uart_check.py` —— 自检 $DT/$WD/$WF 各 +1、XOR 失败 0、
+#     样本值全对（22:26:40 / 2026-10-08 / wday 4 / 200 / code 0 / "晴"）；
+#     线上 14 s 内 rx_bytes +312、$DT +2、g_uart_err_fe = 0（波特率对）。
+#   判据二（视觉）：`python tools/clock_shot.py` 抓屏 —— 状态栏 23:35、大时间 23:57（无秒）、
+#     日期 10月8日 星期四、天气 晴 / 20℃、图标 code=0 ⇒ 纯太阳；`--blink` 连抓 4 帧
+#     冒号格 3 种画面（确实在闪）；`--icons` 逐个写 code：0/3/9/16 图形各自正确。
+#   ★ 踩过的坑：大时间拆三格时小时格给了 60 px，而 display 字体数字步进 33 px
+#     ⇒ "23" 要 66 px，第 2 位右边被裁。已按实测步进表（display 数字 33/冒号 18、
+#     regular 9/5、title 17/9）改成 70 px，并写进 docs/MEMORY_ARCHIVE.md。
+#   回归（全部 PASS）：dma_check 用例② 仍 0；fs_check 失配 0；sd_check 512/4096 B 失配 0；
+#     sd_dma_check IDMA 4096/4096 失配 0 + 哨兵不超基线；heap0 peak 32 832 B（66%）/
+#     heap1 peak 71 432 B（34%）；A2 ramp/gram = 0；g_fault 全 0；IME 2/2；光标 16×2/300 ms；
+#     满负载整帧 10.92 ms / 91.6 FPS（复位后干净态，与上一基准 10.91 ms 持平）。
+#     ⚠ 测帧率前必须 reset —— 跑过 img_check/fs_check 后同一份固件会读到 ~12.5 ms。
+# FLASH 1 789 476 B（85.32%），比第四版 +5 552 B。
+895f86526941344cf27eb2650d47d72efea5c20f4878a71f97b121cf14c924cb  ymgui-h743.bin
+870daf163a00f1be7d9b15fa3e8b3a7a5c54a4460d3d0991ed7a6d4bd0ffd102  ymgui-h743.elf

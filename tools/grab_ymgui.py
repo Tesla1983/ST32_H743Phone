@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """从目标板的全帧镜像缓冲读出 YMGUI 渲染结果，还原成 PNG。
 
-与 stm32-tetris 的 grab_screen.py 同一思路，但这里是 YMGUI 移植工程：
+与早期 Rust 参照工程的抓屏脚本同一思路，但这里是 YMGUI 移植工程：
 flush_cb 每推一条 band 就把它累积进 AXI SRAM 起始的 320x480 全帧缓冲
 （链接脚本里的 _frame_buf），所以读这一块即可得到"YMGUI 画出来的整屏"。
 

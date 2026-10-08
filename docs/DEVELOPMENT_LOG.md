@@ -7,8 +7,8 @@
 >
 > 拆分前的完整原文仍可在 git 历史里找到：
 > `git show d0a37b1:README.md`（最后一次同时含介绍与过程的提交）。
-> 阶段 0 的原始移植计划与 Rust 参照工程实测见 `E:\stm32-tetris\docs\YMGUI_PORT_PLAN.md`
-> 与 `E:\stm32-tetris\docs\FMC_WRITE_TIMING_SCAN.md`（已归档，不作待办/配置依据）。
+> 阶段 0 的原始移植计划见 `docs/YMGUI_PORT_PLAN.md`；同期的 FMC 写时序扫描是早期 Rust
+> 参照工程做的（那部分不在本仓库）。两者均已归档，**不作当前待办/配置依据**。
 
 ---
 
@@ -16,7 +16,7 @@
 
 | 阶段    | 内容                                       | 状态                                                          |
 | ----- | ---------------------------------------- | ----------------------------------------------------------- |
-| **0** | FMC 写时序收紧（在参照工程 `stm32-tetris` 内做）       | ✅ 完成，固化 `5/5 = 25ns`，整屏 8.45ms ≈ 118 FPS                    |
+| **0** | FMC 写时序收紧（在早期 Rust 参照工程内做）       | ✅ 完成，固化 `5/5 = 25ns`，整屏 8.45ms ≈ 118 FPS                    |
 | **1** | 新建独立 C 工程（CMake + GCC + 链接脚本 + MPU + 时钟） | ✅ 完成                                                        |
 | **2** | 显示 `flush_cb` + ST7796 初始化               | ✅ 完成，面板 GRAM 回读 153600 px **0 失配**                          |
 | **3** | 触摸 GT9xxx + Tick 注入                      | ✅ 完成：`0x8140`→`"1158"`；事件注入端到端打通（合成点击可触发按钮回调）               |
@@ -498,7 +498,7 @@ DMA 台架的额外成本：FLASH 74.50% → **74.74%**，SRAM1 新增 **512 B**
 本节完成的是 **L1（策略固化）+ 一致性台架**。后续两项**均未开始**，
 执行依据（引脚、MPU region 重排方案、判据、12 条硬约束）已单独立项：
 
-> **📄 `E:/stm32-tetris/docs/TF_CARD_CACHE_ROADMAP.md`**
+> **📄 `docs/TF_CARD_CACHE_ROADMAP.md`**
 
 | 项 | 内容 | 状态 | 触发条件 |
 | --- | --- | --- | --- |
@@ -935,7 +935,7 @@ MPU 新增 XIP 只读区（`third_party/BSP/MPU/mpu.c` 的 region 0）。
 
 **厂商 `lcd_set_window()` 只发 `0x2A`/`0x2B` 设窗口范围，不发 `0x2C`（写 GRAM）。**
 
-参照工程 `stm32-tetris` 的 `set_window` 末尾是发 `0x2C` 的，所以移植时极易漏掉这一步。漏掉的后果很迷惑人：
+早期 Rust 参照工程的 `set_window` 末尾是发 `0x2C` 的，所以移植时极易漏掉这一步。漏掉的后果很迷惑人：
 
 - **写不进去** → GRAM 里还是旧内容；
 - 但 `flush_cb` 累积的**全帧镜像缓冲在 RAM 里，完全正常** → 抓屏图看起来完美；
@@ -1088,9 +1088,9 @@ A2 ramp/gram 失配 0、`g_fault` 0、IME 2/2、`caret_check.py` 形状 16×2 / 
 
 ## 关键设计决定
 
-- **不塞进 `stm32-tetris`**：那是 Rust `#![no_std]` 无 allocator 的工程，而 YMGUI 需要  
+- **不并入早期 Rust 参照工程**：那是 `#![no_std]` 无 allocator 的工程，而 YMGUI 需要  
   `GY_malloc0/1`。混编会让工具链与内存模型分叉（计划书 §3.1）。独立固件，原工程只作参照。
-- **MPU 的 FMC 区保持强序**（`TEX=0/C=0/B=0`）：与 `stm32-tetris` 逐位一致，  
+- **MPU 的 FMC 区保持强序**（`TEX=0/C=0/B=0`）：与早期 Rust 参照工程逐位一致，  
   这是本项目历史上的花屏修复点，**任何情况下不得改成 Device/Normal**（计划书红线 1）。
 - **双档堆的落点**：`heap0` = DTCM 剩余（快，放对象头/样式/事件/脏矩形表），  
   `heap1` = AXI SRAM 整块（大，放 draw buffer/图片/字形位图），对应 YMGUI 的  
@@ -1187,3 +1187,439 @@ A2 ramp/gram 失配 0、`g_fault` 0、IME 2/2、`caret_check.py` 形状 16×2 / 
 
 ⚠ 这三项的价值要看清：`FRAME_TARGET_MS = 16` 已把稳态收益封顶，做完 7a 后满负载
 **15.98 ms 刚好落进预算**。剩余优化的意义在**最坏帧**（笔记页曾实测 23.17 ms）与交互响应上。
+
+---
+
+## 2026-10-08 · TF 卡接入（路线图 L2-1 / L2-2 / L2-3）
+
+实体卡到位：**32 GB，FAT32**。按 `docs/TF_CARD_CACHE_ROADMAP.md` 执行 P0 三项。
+
+### 先查权威来源，再动手（与记忆里的硬件规矩一致）
+
+- 原理图 PDF 提文本确认板上有 **Micro SD（TF CARD）** 卡槽，`SDIO_D0..D3 / SDIO_CLK / SDIO_CMD` 网络存在；
+- 引脚取自厂商资料包「**实验26 SD卡实验**」的 `Drivers/BSP/SDMMC/sdmmc_sdcard.h`：
+  **D0–D3 = PC8–PC11、CLK = PC12、CMD = PD2，AF12，上拉**；
+- 卡槽**没有**卡检测脚接到 MCU ⇒ 有没有卡只能靠 `HAL_SD_Init` 的返回值判断；
+- 时钟：`sys_stm32_clock_init(160,5,2,4)` ⇒ PLL1_Q = 800/4 = **200 MHz**，
+  `RCC->D1CCIPR.SDMMCSEL` 复位值 0 ⇒ `sdmmc_ker_ck = pll1_q_ck`；
+  库里 `SDMMC_INIT_CLK_DIV = 0xFA(250)` ⇒ 初始化 400 kHz ✅ 合规；传输取 `ClockDiv=4` ⇒ 25 MHz。
+
+### 为什么坚持"轮询优先"
+
+核对 `stm32h7xx_hal_sd.c` 确认：**IDMA 只出现在 `HAL_SD_ReadBlocks_DMA`（:1281）与
+`HAL_SD_WriteBlocks_DMA`（:1380）**，轮询版 `:671 / :856` 是 CPU 搬 FIFO、完全不碰 IDMA。
+于是本阶段**结构上不存在 D-Cache 一致性问题**，可以把"数据通路对不对"与"缓存一致性"解耦验证。
+
+### L2-2 结果：四项判据全过，但**第二轮翻车**
+
+```
+第 1 轮：卡 29.12 GB、512 B 失配 0、8×512 B 失配 0、恢复失配 0   ⇒ PASS
+第 2 轮：512 B 失配 0，但 8×512 B 读 rc≠0（失配 4084）、恢复 rc≠0（失配 4047）⇒ FAIL
+```
+
+⚠ 严重性：恢复失败意味着**卡尾部那 8 个扇区被写成测试图案、没还原**。
+
+**处置顺序（先救数据，再查原因）**：
+
+1. 立刻把 SRAM1 的 `.bss_sd` 整段读到主机
+   （`probe-rs read ... b8 0x30000200 12288 -o build/sd_bss_sd.bin -f binary`）——
+   复位就没了；
+2. 主机侧比对三块 4 KB：与 8 扇区图案 4096/4096 匹配的是 `s_wr`、全 0 的是 `s_rd`、
+   剩下那块（FAT 数据样貌）就是 **s_bak = 卡上原始内容**；
+3. 改固件加"主机回填 → 写回扇区"模式（`g_sd_test = 3`），烧录用
+   `tools/sd_restore.py` 把原内容写回 ⇒ **读回比对失配 0，卡无损**。
+
+**根因侧的处置**（证据不足，按"缓解 + 观测"处理，不装作已解决）：
+
+- 启用 **SDMMC 硬件流控**（`SDMMC_HARDWARE_FLOW_CONTROL_ENABLE`）：轮询模式 CPU 搬 FIFO 期间
+  还会被 SysTick 打断，关流控时容易 RXOVER / TXUNDERR。厂商例程是 DISABLE（它关中断跑），
+  本工程不关中断，必须打开；
+- 每次操作前先等卡回 `TRANSFER`；失败则**重新初始化再重试一次**；
+- 导出 `g_sd_hal_rc` / `g_sd_errcode` / `g_sd_sta` / `g_sd_step` / `g_sd_retry`，
+  下次再失败就能直接看到是 RXOVER 还是 DCRCFAIL/DTIMEOUT。
+- 结果：**连跑 15 轮（5 + 10）全过**，`g_sd_sta = 0`、零重试、吞吐写 ≈1.7 MB/s 读 ≈4.1 MB/s。
+- ⚠ **根因未坐实**：失败那次的 STA 没抓到（诊断是之后才加的）。15 轮全过只能说明"概率很低"，
+  不能说明"已修复"。再见到失败时的第一手段是降 `ClockDiv`（25 → 12.5 MHz）。
+
+### L2-3：FatFs 打通
+
+- 源码用厂商「实验27 FATFS实验」那份（ST 分发版），拷到 `third_party/FatFs/source`，**只改 ffconf.h**，
+  diskio 自己写（厂商那份绑定他们自己的 SD 驱动）。
+- 配置改动：`FF_USE_LFN` 3→1（静态缓冲，不碰 newlib malloc —— 我们 `_sbrk` 池只有 16 KB）、
+  `FF_FS_NORTC` 0→1（本工程没接 RTC）、`FF_USE_MKFS` 1→0（**固件里不保留格式化能力**）、
+  `FF_VOLUMES` 2→1；保留 `FF_CODE_PAGE=936`（中文文件名）与 `FF_FS_EXFAT=1`。
+- 厂商 `ffsystem.c` **故意不编**：它 include 厂商自己的 `./MALLOC/malloc.h`，而它提供的
+  `get_fattime`（NORTC=1 不调用）与 `ff_memalloc/free`（LFN≠3 不调用）本配置下都不会被引用。
+- 自检结果：**FAT32**、剩余 29.11 GB、建目录 → 写 1024 B → 关 → **重开读回失配 0** → 删除，
+  整轮 **194 ms**。
+  ⚠ 必须"关掉再重开"才真从卡的簇链里读回来；不关直接读，读到的是写缓冲里的内存副本。
+
+### 编译期踩的两个小坑
+
+1. `fatfs_port.h` 注释里写 `**/YMGUI**` —— **里面的 `*/` 提前闭合了块注释**，
+   编译器随后把中文当代码，报的是 `unknown type name 'YMGUI'` / `stray '\343'` 这种
+   完全看不出原因的错。注释里写目录名别用星号夹。
+2. `fatfs_port.c` 用 `DWT` 计时要引 `stm32h7xx_hal.h`（它带进 `core_cm7.h`），
+   只引 `ff.h`/`diskio.h`/`sd_card.h` 会报 `'DWT' undeclared`。
+
+### 资源与回归
+
+- FLASH **1 579 052 → 1 775 580 B（75.30% → 84.67%）**：FatFs + CP936 转码表约 +183 KB。
+  DTCM 24 216 → 28 640 B；SRAM1 512 B → 12 800 B（三块 4 KB 缓冲）。
+- 回归全绿：A2 ramp/gram = 0、`g_fault[0..8]` 全 0、IME 2/2、heap0 61% / heap1 41%。
+- CI：参考哈希按 a 类规则更新（旧行注释、新行生效），本地 `check_firmware_hash.py` 2/2 PASS。
+
+### L3：SRAM1 非缓存 DMA 区（同日接着做完）
+
+按 roadmap §3.4 重排 MPU region（只改 `third_party/BSP/MPU/mpu.c`）：
+
+| region | 改后 | 改动原因 |
+| --- | --- | --- |
+| **0** | SRAM1 `0x30000000` 128KB，**非缓存**、XN、可写、SHAREABLE | 编号最小 ⇒ 优先级最高，压得住原来的 region3 |
+| 1 | DTCM（不变） | — |
+| 2 | AXI（不变） | — |
+| 3 | SRAM2 `0x30020000` 128KB 可缓存 | 原 region3 是 SRAM1~SRAM3 共 512KB 整块可缓存，拆开 |
+| 4 | SRAM3 `0x30040000` 32KB 可缓存 | 同上（第二块 band buffer 在这里） |
+| 5 | FMC（不变） | — |
+| 6 | **QSPI**（由 region0 挪来，属性一字未改） | 腾出 region0；回收本板没有的 SDRAM 编号 |
+| 7 | **SRAM4**（由 region4 挪来） | 回收本板没有的 NAND 编号 |
+
+两个实现细节：
+
+- 属性取 **TEX=001 / C=0 / B=0 = Normal 非缓存**，而不是厂商公共函数 `mpu_set_protection()`
+  里写死的 TEX=000（那是 Strongly-ordered，最严也最慢）。因为那个函数不暴露 TEX 参数，
+  这条 region 直接在 `mpu_memory_protection()` 里调 `HAL_MPU_ConfigRegion`，不动公共函数签名。
+- ⚠ **编号优先级是硬约束**（2026-10-08 晚更正）：ARMv7-M 是 **编号越大优先级越高**
+  —— ARMv7-M ARM（DDI0403）原文 "Where there is an overlap between two regions, the
+  register with the **highest region number** takes priority."；Cortex-M7 TRM 更直白
+  "7 Highest priority, when 8 regions are implemented"。
+  **本条此前写反了**（写成"编号小者优先"），之所以没被 L3 的结果抓出来，是因为 SRAM1
+  恰好**不与任何其它 region 重叠**：原 region3 是 0x30000000 起 512KB（含 SRAM1），
+  已缩成 SRAM2 单独的 128KB（0x30020000 起），于是 region0 无论优先级如何都生效。
+  **真正被它坑到的是 L2-4**：AXI 尾部 8 KB 的 IDMA 非缓存区要压住 region2（AXI 512KB
+  可缓存），按"编号小者优先"放进 region1 ⇒ 实测哨兵残留 3438/4096 字节（压不住）；
+  改到 region7 后残留归零。见 §L2-4 一节。
+
+**判据实测：`dma_check.py` 用例② 失配 64 → 0**（DMA 写 → CPU 读不做任何维护），
+①③ 仍是 0，缓冲仍在 `0x30000000 / 0x30000100`。
+回归：A2 ramp/gram = 0、`g_fault` 全 0、IME 2/2、TF 卡扇区自检 3/3、FatFs 失配 0。
+
+⚠ 用例② 现在是 **0 而不是 64**，这**不是台架失效**：那正是"非缓存区生效"的预期。
+`dma_check.py` 已把两种状态都判成 PASS 并分别打印说明，免得以后误读成"没复现出风险"。
+
+---
+
+## L2-4：SDMMC1 IDMA 通路（2026-10-08，同日第三轮）
+
+### 1. 中断链路：150 个 IRQ 全是 Default_Handler
+
+`startup_gcc.s` 里外部中断是 `.rept 150 / .word Default_Handler`，所有外设中断都落进死循环。
+SDMMC1 = IRQ49，改成 **49 + `SDMMC1_IRQHandler` + 100**（顺序不能错，位置由 CMSIS 的 IRQn 决定），
+并加 `.weak` + `.thumb_set` 兜底别名（万一 `sd_card.c` 没编进来也不会链接失败）。
+`SDMMC1_IRQHandler` 强定义放在 `src/sd_card.c`（它持有 `g_sd_handle`），
+`HAL_SD_MspInit` 里补 `HAL_NVIC_SetPriority(SDMMC1_IRQn, 5, 0)` + `EnableIRQ`。
+
+**为什么必须有中断**：`HAL_SD_*Blocks_DMA` 只发起传输，收尾（清 IDMA、发 CMD12、
+把 `hsd->State` 拉回 READY）全在 `HAL_SD_IRQHandler` 里；不进中断就永远停在 BUSY。
+
+### 2. 第一次跑：刚发起就报错（写只花 17 µs）
+
+加寄存器快照后定位到两类原因，都已修：
+
+1. **残留标志**：上一次操作留下的 `DATAEND/DCRCFAIL` 让 `HAL_SD_IRQHandler` 一进来就走错误分支。
+   ⇒ 启动 IDMA 前先 `__HAL_SD_CLEAR_FLAG(&g_sd_handle, SDMMC_STATIC_FLAGS)`。
+2. **`ErrorCode` 读晚了**：`HAL_SD_IRQHandler` 收尾时会清标志、Abort，等操作返回再读只剩 0。
+   ⇒ 在 `HAL_SD_ErrorCallback` **当场**抓 `ErrorCode` 与 `STA`，抓完清零。
+
+### 3. 第二次跑：搬不动 —— SDMMC1 的 IDMA 访问不到 SRAM1
+
+清完标志后写真的开始了（8.68 ms），但仍然失败：
+
+```text
+写用例 ErrorCode=0x00000010  TX_UNDERRUN
+读用例 ErrorCode=0x00000020  RX_OVERRUN
+post: DCOUNT=4068 / DLEN=4096  ⇒ 只走了 28 字节
+      IDMACTRL=1  IDMABASE0=0x30001200（地址正确）
+```
+
+IDMA 使能、地址正确、却几乎一个字节都没搬 —— 指向"它根本读不到那块内存"。
+根因（ST **AN5200**；NuttX `stm32_sdmmc.c` 注释引用同一条）：
+
+> **SDMMC1 在 D1 域，其 IDMA 只能访问 D1 域内存 = AXI SRAM；
+> SRAM1/2/3（D2 域）与 SRAM4（D3 域）都访问不到。SDMMC2（D2 域）才支持 SRAM1/2/3。**
+
+本板卡座硬件锁死在 SDMMC1 引脚（PC8~11 / PC12 / PD2），换不到 SDMMC2 ⇒ 只能把缓冲搬到 AXI。
+
+**对策**：链接脚本新增 `.bss_sd_dma` 段，钉在 **AXI 尾部 8 KB = 0x2407E000**
+（`s_rd=0x2407E000`、`s_wr=0x2407F000`），`_heap1_end` 下移 8 KB（212 → 204 KB，实测峰值 43%）。
+只走轮询的 `s_bak` 仍留在 SRAM1，省 4 KB。搬过去后立刻正常：`DCOUNT` 归零、Tx/Rx 完成回调各 1。
+
+> 顺带记一个手算错误：MPU 基址第一版写成 `0x2407C000`（以为尾部 8 KB 在那儿），
+> 实际 `0x24080000 − 0x2000 = 0x2407E000`。差 8 KB ⇒ MPU 盖的是 heap1，IDMA 缓冲反而是可缓存的。
+
+### 4. 第三次跑：IDMA 通了，但哨兵残留 3438 —— MPU 编号方向搞反了
+
+失配已经归零，哨兵却残留 3438/4096。查 ARM 文档：
+
+> DDI0403："Where there is an overlap between two regions, the register with the
+> **highest region number** takes priority."；Cortex-M7 TRM："7 Highest priority."
+
+即 **编号越大优先级越高** —— 而本项目 L3 那段注释写的是"编号小者优先"，**写反了**。
+SRAM1 之所以没暴露这个问题，是因为它不与任何其它 region 重叠（region3 已缩成 SRAM2 单独 128KB）；
+而 AXI 尾部 8 KB **被 region2（AXI 512KB 可缓存）包住**，放进 region1 压不住。
+⇒ 挪到 **region7（最大编号）** 后残留归零。DTCM 回到 region1，SRAM4 那条 region 删除（8 条已用满）。
+
+### 5. 第四次跑：残留 15 —— 判据本身有缺陷
+
+随机图案 4096 B 里**本来就含 ≈4096/256 = 16 个字节等于哨兵 0x5A**（实测 15）。
+判据必须改成 **`stale − base == 0`**，其中 base = 图案里 0x5A 的个数（固件里现算并导出
+`g_sd_dma_stale_base`）。改完后 15 − 15 = 0。
+
+> 教训：这类"哨兵/染色"判据一定要先问一句"正常数据里会不会天然出现这个值"。
+
+### 6. 实测吞吐（8 扇区 = 4096 B）
+
+| 方式 | 写 | 读 |
+| --- | --- | --- |
+| 轮询 @25 MHz | 1.5~4.8 ms（波动大，**卡内编程主导**） | 0.90~1.15 ms |
+| IDMA @25 MHz | 1.4~2.5 ms | 0.91~1.06 ms |
+| IDMA @50 MHz | 2.1~2.3 ms | **0.75~0.96 ms（≈5.5 MB/s）** |
+
+⇒ **IDMA 对 KB 级小传输的写没有收益**（瓶颈在卡内编程，不在 FIFO 搬运）；
+读在 50 MHz 下有 1.2~1.5×。所以 **FatFs 日常继续走轮询**：简单、不依赖中断。
+
+### 7. 判据与回归
+
+`python tools/sd_dma_check.py [--hs] [--repeat 5]` —— 连跑 5 轮全 PASS：
+
+- IDMA 写→读 **4096/4096 字节失配 0**；
+- 哨兵残留 15 − 基线 15 = **0**（证明 IDMA 缓冲确实是非缓存区，CPU 无需 invalidate）；
+- 原内容恢复失配 **0**（卡上数据无损）；
+- 中断链路：IRQ 2 次、TxCplt 1、RxCplt 1、ErrorCb 0。
+
+回归：`dma_check` 用例② 仍 0（L3 未破）、A2 ramp/gram = 0、`g_fault` 全 0、IME 2/2、
+FatFs 挂载/写读/删除全 OK、heap0 62% / heap1 89 000 B（43%）。
+FLASH 1 779 380 B（84.85%）；CI 参考哈希按 a 类更新（同日第三版），本地 2/2 PASS。
+
+### 下一步（未做）
+
+1. 把 16 个 APP 里的笔记/短信/文件管理器接到真实文件（现在仍是演示态）；
+2. FLASH 已到 84.85%：`ffunicode.c` 的两张 GBK 表占 174 KB，必要时把 `FF_CODE_PAGE`
+   从 936 改成 437 可省 ~170 KB（代价：中文文件名变乱码）。
+
+## 图库：TF 卡 BMP → RGB565 → 灌 W25Q128 → XIP 直读显示（2026-10-08，同日第四轮）
+
+### 1. 为什么走这条路
+
+可行性调研（`docs/TF_CARD_APP_INTEGRATION_FEASIBILITY.md`）里算过一笔账：相册面板
+284×230 全尺寸 RGB565 = **130 640 B**，而 heap1 余量只有 115 KB ⇒ "读卡 → 解码到 RAM →
+显示"这条路**根本走不通**，除非降采样。但板上**没有外部 RAM**（原理图 SDCKE/SDCLK/SDNE
+等 SDRAM 专用脚零命中），解码输出只能落片内。
+
+突破口在 YMGUI 的类型定义：`YMGUI_DrawImg.h:12` 里 `GYimg.data` 是 **`const GYpx*`**
+（只读指针）⇒ 像素可以指向 QSPI 的 XIP 窗口 `0x9000_0000 + offset` ⇒ **整幅图留在 flash 里，
+显示时不进 RAM**。于是问题变成："怎么把图**流式**地灌进 W25Q128"，而不是"怎么把图装进 RAM"。
+
+### 2. 实现要点
+
+- **流式分块**：`f_read` 一行源像素 → 转 RGB565 → 攒满 4 KB（一个扇区）→ `qspi_write` → 丢弃。
+  峰值 RAM = `s_blk[4096]` + `s_line[2048]` = **6 KB**，**与图片尺寸无关**。
+- **行序处理**：BMP 绝大多数是 bottom-up（文件第 0 行 = 图像最底行），而 GYimg 要 top-down。
+  做法不是"读一行存一行再倒着写"，而是**输出块从后往前填**（`blk_first = nblk-1; bdir = -1`），
+  块内行也递减 ⇒ 源文件行区间**单调递增** ⇒ **全程顺序读，零回退 lseek**。
+- **索引**：单扇区、16 B/槽 × 256 槽。槽位分配时把整块索引 `memcpy` 到 RAM 再扫
+  （`__DSB(); __ISB();`）⇒ 把 256 次 XIP 读降成 1 次。
+- **布局**：图片区 `0x100000` 起 2 MB（这张表早就预留了），索引在 `0x100000`、
+  数据从 `0x101000` 起。字模在 `0x000000`、IME 词典在 `0x300000`，互不干扰。
+- **接口分层**：`phone_shell_board.h` 新增 `BoardGallery_Count/Info/Pixels` 三个函数，
+  让 `phone_shell` 不直接 include `src/`（保持 third_party 与板级代码的边界）。
+
+### 3. ★ 最深的一个坑：indirect 模式下读 XIP 会 BusFault
+
+现象分两段，中间隔了一次误判：
+
+1. 导入一开始返回 **`RC_QSPI(10)`、QSPI=1（通信超时）**。第一反应是"退出映射前做过大量
+   XIP 读，把 QSPI 搞挂了"，于是加了 `run_qspi_diag()` 做 A/B 对照（A 组无 XIP 读、
+   B 组先读 256 次 XIP 再写）。**结果两组都成功** ⇒ 假说被证伪。
+2. 随后内核直接卡死。读故障快照：`g_fault.kind = 1`（HardFault）、`CFSR = 0x8200`
+   （PRECISERR + BFARVALID）、`BFAR = 0x9001_0000` —— **地址明明白白指向 XIP 窗口**。
+
+根因：`qspi_write` 内部是"退映射 → indirect 写 → **不回映射**"（只有 `qspi_erase_sector`
+会回），而退出映射后 `0x9000_0000` 窗口**不可访问** ⇒ 任何后续 XIP 读都是精确总线错误，
+升级成 HardFault。
+
+> ⚠ **单次读不挂是假阴性**。`img_check.py` 的探针只读一次、读到的是"还好"的结果，
+> 一度让人以为"退出映射后读 XIP 没事"。真正跑导入时会连续读上百次，必然踩中。
+
+修法两条（都做了）：
+
+- 写循环结束补一次 `qspi_enter_mmap()`；`img_store_poll()` 末尾再补一次兜底；
+- `g_img_busy = 1` 期间主循环**跳过渲染与触摸**（输入路径会查中文输入法，而 IME 词典
+  就在 XIP 上）。
+
+这条规矩现在写在 `src/img_store.h` 顶部，改 QSPI 相关代码前必看。
+
+### 4. 相册 app 改造与两个小坑
+
+`apps/gallery.c` 原来只有 3 个纯色块 + 一幅矢量日落画。现在有真图就用 `draw_cb` 从 XIP
+取像素（`GYimg img = {px, w, h, 0, 0}` + `YMGUI_Draw_ImgScaled` 拉伸铺满面板），没有就
+退回原来的色块 —— 卡没插、图库为空都不会变成空白页。
+
+- **坑 1：多字节字符常量被截断。** caption 用 `*p++ = '卡';` 拼字符串，UTF-8 的"卡"是
+  `E5 8D A1`，赋给 `char` 只留最低字节 `0xA1` ⇒ 截断成非法序列，界面上只有 "1 / 2"，
+  "张卡上图片"四个字整段消失。改成 `static const char suffix[] = " 张卡上图片";
+  memcpy(p, suffix, sizeof(suffix));`。
+- **坑 2：按钮点不到（脚本侧）。** 抓屏脚本按"设置页 abs y = 92 + 内容 y"的印象点了
+  `(160, 390)`，但那其实落在**纯 label**上（无 `event_cb`），两张抓屏 md5 完全一致，
+  差点误判成"切换逻辑坏了"。真实坐标要加 `app_views` 的偏移：`(0, 36)` 建在
+  `phone_shell.c:1483` ⇒ 按钮中心 = `(18 + 142, 36 + 373 + 17) = (160, 426)`。
+
+### 5. 判据
+
+工具 `tools/img_check.py`（数据）与 `tools/gallery_shot.py`（视觉）互补 —— 数据失配 0
+不代表画面对，行序/缩放/中文截断只有看图能抓。
+
+| 项 | 实测 |
+| --- | --- |
+| XIP 冲突探针 | 退出映射后读仍返回旧值、探针期间新增故障 **0** |
+| BMP 写卡 | 18 486 字节 / **5 片**全写入 |
+| 导入 | `rc=0`、步骤 7、96×64 → **12 288 B**、耗时 **262 ms** |
+| 内容比对 | XIP 读回 vs **主机侧独立参考**逐字节失配 **0** |
+| 索引 | slot 2：magic `0x4947`、off 24 576、len 12 288、96×64 —— 与导入结果一致 |
+| 视觉 | 测试图（左上红块 / 右下蓝块 / 纵向渐变 / 横向条纹）正确显示；caption "1 / 2 张卡上图片" → 点「下一张」→ "2 / 2" 且画面切换 |
+
+回归全 PASS：`dma_check` 用例② 仍 0、`fs_check` 失配 0、`sd_check` 失配 0、
+`sd_dma_check` 4096/4096 失配 0 + 哨兵不超基线、heap0 peak 32 688 B（63%）/
+heap1 peak 71 064 B（34%）、A2 ramp/gram = 0、`g_fault` 全 0、IME 2/2。
+
+FLASH 1 783 924 B（85.06%，比上一版 **+4 544 B**）；CI 参考哈希按 a 类更新（同日第四版），
+`verify_board_image.py` 全量比对 1 783 932 字节 **完全一致**。
+
+> ⚠ **测帧率前要 reset。** 复位后干净态是 **10.91 ms / 91.6 FPS**（与上一版 10.89 ms 持平）；
+> 但跑过 `img_check`/`fs_check` 之后同一份固件会读到 **~12.5 ms** —— 那是运行态
+> （堆布局 / D-Cache 内容）差异，不是帧时间回归。
+
+### 6. 下一步（未做）
+
+1. **JPEG 路径**：H743 自带硬件 JPEG + DMA2D，但**硬件不做缩放**（`JPEG_CONFR*` 没有
+   SCALE 位），且输出缓冲照样占内存 ⇒ 要么把卡上 JPEG 预缩到 ≤240×180，要么自己写降采样。
+2. 文件管理器四个卡片（笔记 / 下载 / 录音清单）接真实文件。
+3. 把 16 个 APP 里的笔记/短信接到真实文件（现在仍是演示态）。
+
+## ESP32 上行链路：USART6 收 NTP 时间 + 天气 → 界面（2026-10-08，同日第五轮）
+
+### 1. 需求与对端
+
+用户已用杜邦线接好：`PC6(USART6_TX) → ESP32 GPIO16(UART2_RX)`、
+`PC7(USART6_RX) ← GPIO17(UART2_TX)`、共地。要求 H7 侧写接收测试，并把 NTP 时间与天气
+显示到 UI 上原本写死时间/天气的位置。
+
+对端在本机另一个工程 `E:\workbuddy\esp32-com8`（ESP-IDF v6.0.3），**先读它的文档再动手**
+（`docs/UPLINK-NTP-WEATHER.md`）—— 协议、波特率、字段含义、天气码表全都有，
+省掉了"猜协议"这一步。协议：
+
+```
+$<TYPE>,<字段...>*<HH>\r\n          HH = 对 "<TYPE>,<字段...>"（不含 $ 与 *）逐字节 XOR
+$DT,<unix_ts>,<YYYY-MM-DD>,<HH:MM:SS>,<wday>      时间，10 s 一帧
+$WD,<temp_x10>,<rh>,<pm25>,<aqi>,<code>,<text>    天气，30 min 一帧
+$WF,<up>,<ip>,<rssi>                              WiFi，变化时发
+```
+115200 8N1。**日期与时间已按 CST-8 换算过**，板上直接显示，不再加时区。
+
+### 2. ★ 三个绕开厂商代码的决定（`src/uart_link.h` 顶部有完整说明）
+
+1. **不能用 `HAL_UART_Receive_IT()`**。厂商 `third_party/SYSTEM/usart/usart.c` 强定义了
+   `HAL_UART_RxCpltCallback()` 与 `HAL_UART_MspInit()` —— 这俩是**全局唯一符号**
+   （不是 per-instance 的）。前者只认 `USART_UX`(=USART1) ⇒ 给 USART6 调 `HAL_UART_Init`
+   时**时钟和 GPIO 一个都不会配**；后者同样只认 USART1 ⇒ 开 IT 接收的话收完一字节没人
+   重启下一轮，链路收一帧就死。
+   ⇒ 自己配 GPIO/时钟/波特率（不走 MspInit），**自己写 ISR 直接读 `RDR`**。
+2. USART6 在 **APB2**（PCLK2 = 100 MHz），HAL 的 `UART_GETCLOCKSOURCE` 认得 USART6
+   （`stm32h7xx_hal_uart_ex.h:340`）⇒ 115200 的 BRR 算得对。
+3. **中断向量手工开槽**：启动文件原来是 `.rept 150` 全落 `Default_Handler`（死循环）。
+   `USART6_IRQn = 71` ⇒ 把 150 拆成 `49 + 1 + 21 + 1 + 78`（第一次拆是给 SDMMC1/IRQ49）。
+
+接收结构：ISR 只做"读 RDR → 塞 512 B 环形缓冲"（几十个周期），行重组与解析全在主循环。
+错误标志（ORE/NE/FE/PE）显式清 `ICR`，且 ISR 有 1024 次迭代上限 —— 万一标志清不掉，
+宁可退出中断也不要让 CPU 锁死在 ISR 里（那会表现成整个 UI 冻住，极难定位）。
+
+### 3. 时间为什么要"板载自己走秒"
+
+时间帧 10 s 才来一次，直接用 `HH:MM:SS` 显示会 10 秒才跳一次。做法：记住最近一帧的
+`HH:MM:SS` 与当时的毫秒时基，之后由 `current_clock()` 用板载 tick 递推。
+⚠ 时基**不能**直接用 `DWT->CYCCNT`：32 位 @400 MHz 约 **10.7 s** 就回绕，
+`main.c` 另累了一个 `uptime_ms` 传给 `uart_link_poll()`。
+
+### 4. 界面落点
+
+| 位置 | 原来（硬编码） | 现在 |
+| --- | --- | --- |
+| 状态栏（首页 + app 页各一处） | `"9:41"` | `HH:MM`（`BoardNet_ClockHM`） |
+| 桌面大时间 | `"09:41"` | `HH:MM` + **冒号每秒闪一次** |
+| 桌面日期 | `T("9月29日  星期二")` | `10月8日 星期四`（由 YYYY-MM-DD + wday 拼） |
+| 桌面天气 | `T("多云 / 22 C")` | `晴 / 20℃`（由 code + temp_x10 拼） |
+| 天气图标 | 永远同一朵云 | 按 **code** 分派（晴/多云/阴/雨/雷/雪/雾霾…） |
+| 控制中心顶部 | `"09:41"` / `"9月29日 星期二"` | 同上链路 |
+
+**冒号闪烁的做法**：大时间拆成 小时 / 冒号 / 分钟 **三个绝对定位 label**。
+为什么不放在一个 label 里切 `":"` ↔ `" "`：位图字体里冒号与空格不等宽，切一下
+分钟数字就左右跳位。拆开后冒号那格写空串对两侧毫无影响。
+闪烁节奏取**秒的奇偶**（`BoardNet_ColonBlink`）⇒ 严格 1 s 周期；刷新节流从 500 ms 收到
+**250 ms**，否则采样间隔太接近半周期会看出抖动。
+
+**没同步到时**（还没收到第一帧）显示占位：`--:--` / 沿用原翻译文案，而不是全零 ——
+界面上要能一眼区分"没数据"和"真的是 0 点"。
+
+### 5. ⚠ 踩到的坑：label 宽度必须按**字体真实步进**给
+
+大时间拆成三格时，小时格我给了 **60 px**。抓屏一看，**第 2 位数字右边被裁掉**
+（用户肉眼发现："第 2 位和第 4 位数字右边被裁剪"）。
+
+量法（不用猜，字体的 ASCII 步进表就在 elf 里）：
+```bash
+A=$(arm-none-eabi-nm build/ymgui-h743.elf | grep " T phone_font_display_advance" | cut -d' ' -f1)
+probe-rs read --probe 0416:5021:0123456789AB --chip STM32H743VITx b8 0x$A 96
+```
+结果（下标 0 = ASCII 0x20）：
+- **display**（大时间）：数字 **33 px** / 冒号 18 px ⇒ "23" 要 **66 px**，给 60 就切了 ⇒ 改 **70 px**
+- **regular**（状态栏）：数字 9 px / 冒号 5 px ⇒ "23:35" = 41 px，54 px 宽绰绰有余
+- **title**（控制中心）：数字 17 px / 冒号 9 px ⇒ "09:41" = 77 px < 165 px
+
+这条已写进 `docs/MEMORY_ARCHIVE.md`，以后给固定宽 label 先按表算一遍。
+
+### 6. 对端会把日志和帧混在同一行发
+
+`uart_check.py` 读回的"最后一帧原文"是：
+```
+I (2146494) uplink: → STM32  时间 2026-10-08 23:22:58 | $DT,1791472978,2026-10-08,23:22:58,4*2E
+```
+也就是 ESP32 的日志前缀和 `$DT` 帧在同一行（它的日志也走 UART2）。解析器取行内
+**最后一个 `$`**、再取它之后的第一个 `*` ⇒ 照样正确提取。别改成"取第一个 `$`"。
+
+### 7. 验收
+
+工具 `tools/uart_check.py`（链路/解析）与 `tools/clock_shot.py`（视觉）互补 ——
+`g_net_dt_pkts` 在涨只说明帧解析对了，不代表屏幕上长得对（时间算错 8 小时、
+中文被多字节截断、句柄没留住导致永远停在硬编码值，这三种都是"数据全绿、屏幕全错"）。
+
+| 项 | 实测 |
+| --- | --- |
+| 初始化 | `g_uart_rc = 0`、baud = 115200 |
+| 解析自检 | `$DT/$WD/$WF` 各 +1、XOR 失败 **0**、样本值全对（22:26:40 / 2026-10-08 / wday 4 / 200 / code 0 / "晴"） |
+| 线上接收 | 14 s 内 `rx_bytes 1142 → 1454`（+312）、`frames +3`、`$DT 8 → 10`、**FE = 0** |
+| 首帧原文 | 见 §6（日志前缀 + `$DT` 同行） |
+| 视觉 | 状态栏 **23:35**；大时间 **23:57**（无秒）；日期 **10月8日 星期四**；天气 **晴 / 20℃**；图标 code=0 ⇒ **纯太阳**（原来恒为太阳+云） |
+| 冒号闪烁 | 连抓 4 帧，冒号格出现 3 种画面 ⇒ 确实在闪（一亮一灭，见 `build/clock_blink_*.png`） |
+| 图标分派 | 逐个写 `g_net_code`：0 纯太阳 / 3 云+2 雨滴 / 9 云+闪电 / 16 三条横线，均正确 |
+
+> ⚠ 天气帧 **30 min** 一帧，复位 STM32 不会让 ESP32 重发。`clock_shot.py` 在
+> `g_net_wd_pkts = 0` 时会注入一帧自检样本把显示链路走完，**并在输出里明确标注
+> "这是自检样本、不是真实天气"**。本轮实测中途真实 $WD 到了（`$WD 帧 1`），
+> 所以最终抓屏是真实数据。
+
+回归全 PASS：`dma_check` 用例② 仍 0、`fs_check` 失配 0、`sd_check` 512/512 与 4096/4096 失配 0、
+`sd_dma_check` 4096/4096 失配 0 + 哨兵不超基线 + 恢复 0、A2 ramp/gram = 0、`g_fault` 全 0、
+IME 2/2、heap0 peak **32 832 B(66%)**、heap1 peak **71 432 B(34%)**（复位后干净态）、
+满负载 **10.92 ms / 91.6 FPS**（与上版 10.91 持平，无回归）。
+
+FLASH **1 785 300 B（85.13%）**，比上一版 +1 376 B。CI 参考哈希按 a 类更新（同日第五版）。

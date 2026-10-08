@@ -19,6 +19,8 @@ extern uint32_t _sime_bss; /* IME 大静态池段（.bss_ime → SRAM2）起始 
 extern uint32_t _eime_bss; /* 同上，结束 */
 extern uint32_t _sdma_bss; /* DMA 台架缓冲区段（.bss_dma → SRAM1）起始 */
 extern uint32_t _edma_bss; /* 同上，结束 */
+extern uint32_t _ssd_bss;  /* TF 卡数据缓冲段（.bss_sd → SRAM1）起始 */
+extern uint32_t _esd_bss;  /* 同上，结束 */
 
 void board_init_memory(void)
 {
@@ -47,6 +49,15 @@ void board_init_memory(void)
      * ⚠ 类型上它是 uint32_t[]（4 字节），与这里按 uint32_t 步进的清零方式一致；
      *   若以后往该段放非 4 字节对齐的类型，这里的循环要跟着改。 */
     for (dst = &_sdma_bss; dst < &_edma_bss;)
+    {
+        *dst++ = 0u;
+    }
+
+    /* 5) 清 TF 卡数据缓冲段（NOLOAD → SRAM1）。
+     * 逻辑上缓冲每次都会被代码填满（备份扇区也是先读后比），清零并非必需；
+     * 这里做是为了让"没跑过自检时读到的内容"是确定的全 0，而不是上电随机值，
+     * 免得把随机内容误读成"卡里读出的数据"。 */
+    for (dst = &_ssd_bss; dst < &_esd_bss;)
     {
         *dst++ = 0u;
     }

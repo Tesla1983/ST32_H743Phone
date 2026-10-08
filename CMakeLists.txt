@@ -205,6 +205,7 @@ include_directories(
 	${YMGUI_ROOT}/HAL
 	${YMGUI_REPO}/project_Demo/phone_shell   # phone_shell 的应用层头（phone_locale.h 等）
 	${YMGUI_REPO}/project_Demo/chinese_ime   # ime_symbols.h（phone_ime.c 用）
+	${TP}/FatFs/source                       # FatFs（ff.h / diskio.h / ffconf.h）
 )
 
 # ---- 应用层（我们自己写的板级代码）----
@@ -225,6 +226,19 @@ set(APP_SRC
 	# "总线主设备绕过 D-Cache"这条风险量成板上实测证据。只需要 HAL DMA（已编入），
 	# 不需要 SD 卡、不占引脚、不用中断。
 	src/dma_bench.c
+	# FatFs 移植层（L2-3）：diskio 接 sd_card.c；自检 = 建目录/写文件/读回比对/删除。
+	src/fatfs_port.c
+	# TF 卡（路线图 L2-1/L2-2）：SDMMC1 4-bit 轮询通路 + 写读逐字节比对自检。
+	# 轮询模式（非 IDMA）⇒ 无 D-Cache 一致性风险，可独立验证数据通路。
+	# 引脚 PC8~PC12 / PD2（AF12）来自厂商「实验26 SD卡实验」，与 V1.2 原理图一致。
+	src/sd_card.c
+	# ESP32 上行链路（2026-10-08）：USART6（PC6/PC7）收 NTP 时间与天气帧，供 UI 显示。
+	# ⚠ 不能走 HAL 的 IT 接收 —— 厂商 usart.c 占着 HAL_UART_RxCpltCallback 与
+	#   HAL_UART_MspInit 两个全局符号，详见 src/uart_link.h 顶部。
+	src/uart_link.c
+	# 图库（2026-10-08）：TF 卡上的 BMP → RGB565 → 灌 W25Q128 → XIP 直读显示。
+	# 流式处理，峰值 RAM 只有 6 KB，与图片尺寸无关（详见 src/img_store.h 顶部）。
+	src/img_store.c
 	# QSPI 分块灌库（方案 B 配套）：源文件始终编入，但是**空壳** —— 真正的逻辑
 	# 由 option(YMGUI_QSPI_PROVISION) 里的宏决定编不编。这样 g_prov_enabled 这个
 	# 符号永远存在，tools/qspi_provision.py 能明确区分"没编进来" vs "编了但失败"。
@@ -326,6 +340,22 @@ set(VENDOR_SRC
 	${TP}/BSP/TOUCH/gt9xxx.c
 )
 
+# ---- FatFs 本体（L2-3）----
+# 来源：厂商资料包「实验27 FATFS实验」的 Middlewares/FATFS/source（ST 分发版）。
+# 只改了 ffconf.h（LFN 改静态缓冲 / 关 MKFS / 关 RTC 依赖），ff.c 等本体未改。
+# ffunicode.c 是各代码页的转码表——文件 1.9 MB 是**源码**体积，
+# 编进去的只有 FF_CODE_PAGE=936 那一份表（由 #if 决定），不是 1.9 MB。
+# ⚠ 厂商那份 ffsystem.c **故意不编**：它 include 他们自己的 "./MALLOC/malloc.h"，
+#   提供的两样东西我们都不需要 ——
+#     · get_fattime()  仅当 FF_FS_NORTC == 0 才被调用（本工程没接 RTC，已设为 1）；
+#     · ff_memalloc/free 仅当 FF_USE_LFN == 3（LFN 缓冲放堆）才被调用，
+#       本工程已把 LFN 改成 1（静态缓冲，不碰 malloc）。
+#   若将来改这两项配置，就要把它编回来（或自己实现同名函数）。
+set(FATFS_SRC
+	${TP}/FatFs/source/ff.c
+	${TP}/FatFs/source/ffunicode.c
+)
+
 # ---- HAL 驱动（只取本工程用得到的模块）----
 set(HAL_SRC
 	${TP}/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal.c
@@ -342,6 +372,10 @@ set(HAL_SRC
 	${TP}/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_flash.c
 	${TP}/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_flash_ex.c
 	${TP}/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_exti.c
+	# TF 卡（L2）：HAL_SD 依赖 LL_SDMMC（寄存器层），两者必须一起编入，
+	# 缺 ll_sdmmc 会 undefined reference。IDMA 高速模式要等 L3 非缓存 DMA 区做完。
+	${TP}/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_sd.c
+	${TP}/STM32H7xx_HAL_Driver/Src/stm32h7xx_ll_sdmmc.c
 	# HAL 的 FMC 封装在 LL 层：HAL_SRAM_Init 会调 FMC_NORSRAM_Init /
 	# FMC_NORSRAM_Timing_Init / FMC_NORSRAM_Extended_Timing_Init，缺了会 undefined reference
 	${TP}/STM32H7xx_HAL_Driver/Src/stm32h7xx_ll_fmc.c
@@ -368,7 +402,7 @@ endif()
 list(LENGTH YMGUI_SRC YMGUI_SRC_N)
 message(STATUS "YMGUI 源文件数: ${YMGUI_SRC_N}")
 
-add_executable(ymgui-h743.elf ${APP_SRC} ${VENDOR_SRC} ${HAL_SRC} ${YMGUI_SRC} ${FONT_OBJ} ${IME_OBJ})
+add_executable(ymgui-h743.elf ${APP_SRC} ${VENDOR_SRC} ${HAL_SRC} ${YMGUI_SRC} ${FATFS_SRC} ${FONT_OBJ} ${IME_OBJ})
 
 # YMGUI 头文件里可能用到 -Wno-... 之类，先只做基本告警抑制
 target_compile_options(ymgui-h743.elf PRIVATE

@@ -90,7 +90,7 @@ extern volatile unsigned g_lcd_dma_enable;
  *   g_gram_first_bad = 第一个失配的像素下标
  *
  * 为什么用**整屏连续读**而不是单点读：本板的 LCD 读通路对单点读不稳定
- * （厂商 lcd_read_point 返回 0xFFFF），而 stm32-tetris 的整屏 ramp 自检证明
+ * （厂商 lcd_read_point 返回 0xFFFF），而本工程自己的整屏 ramp 自检证明
  * 连续读是可用的。单点读的哑读/指针推进语义与连续读不同，容易误判。 */
 extern volatile uint32_t g_gram_mismatch;
 extern volatile uint32_t g_gram_first_bad;

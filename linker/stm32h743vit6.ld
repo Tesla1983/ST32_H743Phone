@@ -143,6 +143,79 @@ SECTIONS
     _eprov_bss = .;
   } > SRAM1
 
+  /* ---- TF 卡数据缓冲（2026-10-08，路线图 L2）----
+   * 只放 **原内容备份 s_bak**（4 KB），留在 D2 域 SRAM1，与 .bss_dma / .bss_prov 同区。
+   * 备份这一步走**轮询**读写（不走 IDMA），所以放 SRAM1 没问题；
+   * SRAM1 共 128 KB，已用 .bss_dma 512 B + .bss_prov 16 KB，余量充足。
+   *
+   * ⚠ 写图案 / 读回两块缓冲**不在这里** —— 它们要交给 SDMMC1 的 IDMA，
+   *   而 IDMA **访问不到 D2 域的 SRAM1/2/3**（只能访问 D1 域 AXI SRAM），
+   *   详见下面 .bss_sd_dma 段的说明。
+   * ⚠ 两条位置陷阱同前：必须在 `.bss` 输出段**之前**（否则被 `*(.bss*)` 通配
+   *   静静吃掉），且本段 NOLOAD（不占 bin 体积）—— 内容由代码填，无需清零。 */
+  .bss_sd (NOLOAD) :
+  {
+    . = ALIGN(32);
+    _ssd_bss = .;
+    *(.bss_sd)
+    *(.bss_sd.*)
+    . = ALIGN(32);
+    _esd_bss = .;
+  } > SRAM1
+
+  /* ---- 图库导入缓冲（2026-10-08）----
+   * src/img_store.c 把 TF 卡上的 BMP 转 RGB565 灌进 W25Q128 时的两块缓冲：
+   *   s_blk  4 KB  = 一个 W25Q128 扇区（qspi_write 的粒度，攒满再写）
+   *   s_line 2 KB  = 一行源像素（24bpp ⇒ 支持宽 ≤ 682，屏才 320）
+   * 放 SRAM1（D2 域，已被 MPU region0 配成非缓存）。
+   * QSPI 当前是 **CPU 轮询 FIFO**（没用 MDMA），所以严格说放哪都行；
+   * 但按工程的统一规矩 —— **给外设当缓冲的内存一律放非缓存区** —— 放这里，
+   * 免得将来改成 MDMA 搬运时静默踩 cache 一致性的坑。
+   * ⚠ 位置陷阱同前：必须在 `.bss` 输出段**之前**（否则被 `*(.bss*)` 通配吃掉），
+   *   且 NOLOAD（不占 bin 体积）。 */
+  .bss_img (NOLOAD) :
+  {
+    . = ALIGN(32);
+    _simg_bss = .;
+    *(.bss_img)
+    *(.bss_img.*)
+    . = ALIGN(32);
+    _eimg_bss = .;
+  } > SRAM1
+
+  /* ---- TF 卡 **IDMA** 缓冲（2026-10-08，路线图 L2-4）----
+   * 【为什么必须放 AXI SRAM（0x2400_0000）而不是 SRAM1】
+   * 上板实测：缓冲放 SRAM1 时 IDMA 一个字节都搬不动 ——
+   *   写用例 ErrorCode=0x10(TX_UNDERRUN)、读用例 0x20(RX_OVERRUN)，
+   *   IDMACTRL=1、IDMABASE0=0x30001200 地址正确、DCOUNT 却只走了 28/4096 字节。
+   * 根因（权威来源 ST AN5200，NuttX stm32_sdmmc.c 亦引用同一条）：
+   *   **SDMMC1 的 IDMA 只能访问 D1 域内存，即 AXI SRAM；SRAM1/2/3（D2 域）与
+   *     SRAM4（D3 域）都访问不到。SDMMC2（在 D2 域）才支持 SRAM1/2/3。**
+   * 本板 TF 卡座硬件接死在 SDMMC1 的 PC8~11/PC12/PD2 上，换不到 SDMMC2，
+   * 所以只能把缓冲搬到 AXI。
+   *
+   * 【为什么放在 AXI 的**尾部**】
+   * AXI 512 KB 的布局是：前 300 KB 整帧镜像缓冲 + 其余 heap1。
+   * heap1 自 0x2404_B000 向上长，实测峰值约 87 KB（远没到顶），
+   * 把 IDMA 缓冲钉在最顶端 8 KB，就不会与堆的生长方向相撞。
+   * 相应地 _heap1_end 下移 8 KB（212 KB → 204 KB）。
+   *
+   * ⚠ 三条位置陷阱：
+   *   1. 必须在 `.bss` 输出段**之前**（否则被 `*(.bss*)` 通配静静吃掉）；
+   *   2. NOLOAD（8 KB 不占 bin 体积）；
+   *   3. MPU 必须把这 8 KB 配成**非缓存**（region1，编号小于覆盖整块 AXI 的 region2
+   *      才会生效）—— 否则 IDMA 写进来、CPU 读到的还是 D-Cache 里的旧行。 */
+  .bss_sd_dma (NOLOAD) :
+  {
+    . = ORIGIN(AXI) + LENGTH(AXI) - 0x2000;   /* AXI 尾部 8 KB */
+    . = ALIGN(32);
+    _ssddma_bss = .;
+    *(.bss_sd_dma)
+    *(.bss_sd_dma.*)
+    . = ALIGN(32);
+    _esddma_bss = .;
+  } > AXI
+
   /* ---- 第二块 band buffer（2026-10-04，第 7a 项：flush 与渲染重叠）----
    * 放 **D2 域 SRAM3（0x3004_0000，32 KB）**，此前完全空闲。理由：
    *   1. 与 DMA1 同属 D2 域，DMA 读它不必跨域；且**不占 heap1（AXI）** ——
@@ -226,7 +299,9 @@ SECTIONS
   _frame_buf     = ORIGIN(AXI);
   _frame_buf_end = ORIGIN(AXI) + 0x4B000;
   _heap1_start   = ORIGIN(AXI) + 0x4B000;
-  _heap1_end     = ORIGIN(AXI) + LENGTH(AXI);
+  /* ★L2-4（2026-10-08）★ 尾部 8 KB 让给 SDMMC1 的 IDMA 缓冲（见 .bss_sd_dma 段说明）：
+   * 212 KB → 204 KB。当前 heap1 实测峰值约 87 KB（<43%），余量仍充足。 */
+  _heap1_end     = ORIGIN(AXI) + LENGTH(AXI) - 0x2000;
 
   /DISCARD/ :
   {

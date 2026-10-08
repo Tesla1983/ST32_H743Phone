@@ -2,28 +2,28 @@
 
 这二十个示例演示的是 **YMGUI 控件树和交互的动效**，不是 YMANIM 的矢量动画集锦。十九个只用标准 YMGUI 对象/控件与 `YMGUI_Anim_*`；仅播放头示例使用 Canvas 像素缓冲。它们均可独立运行，命令行参数是最多运行的帧数，适合无头截图。
 
-| 程序 | 交互 | 重点 |
-| --- | --- | --- |
-| `demo_anim_drawer` | Menu、Overview/Activity、Close | 容器连同子控件一起滑入滑出 |
-| `demo_anim_dialog` | Configure、Cancel/Apply | top layer 模态遮罩与弹窗入场/退场 |
-| `demo_anim_cards` | Stagger、Reorder | 延迟错峰入场、卡片重排和颜色补间 |
-| `demo_anim_progress` | Start、Reset | 整数补间驱动 Bar、百分比和阶段反馈 |
-| `demo_anim_canvas` | Replay、Pause | 唯一的 Canvas：播放头和进度条同步 |
-| `demo_anim_tabs` | Overview/Activity/Settings | 页签指示条与三个真实页面同步横移 |
-| `demo_anim_accordion` | 点击三个分区标题 | 面板尺寸变化与后续行位置联动 |
-| `demo_anim_toast` | Notify、Clear | 三条通知错峰入场、反向退场 |
-| `demo_anim_scroll` | Top、Next、条目 Open | 带子控件和裁剪的容器平滑滚动 |
-| `demo_anim_theme` | Ocean、Sunset | 根背景、面板和色块协同变色 |
-| `demo_anim_focus` | 点击输入框、按 Tab | 焦点框跟随真实 TextInput 焦点移动 |
-| `demo_anim_validation` | 编辑邮箱、Validate、Fix sample | 无效输入回弹并变色，修正后显示通过 |
-| `demo_anim_batch` | 勾选条目、Clear、Archive | 选中态驱动底部批量操作栏入退场 |
-| `demo_anim_list_ops` | Add、Remove、Reorder | 真实对象增删、相邻行让位/合拢及重排 |
-| `demo_anim_drag_snap` | 拖动卡片、Next | 指针捕获跟手，松开后吸附最近位置 |
-| `demo_anim_submit` | Submit / retry | 按钮尺寸和颜色、Bar 进度与完成态串联 |
-| `demo_anim_loading` | Load、Reset | 占位块收起，内容卡片错峰进入 |
-| `demo_anim_detail` | 选择条目、Close | 列表收窄，侧边详情滑入或退出 |
-| `demo_anim_pull_refresh` | 下拉列表、Refresh | 跟手拖拽、阈值触发、保持、更新与回弹 |
-| `demo_anim_carousel` | 左右滑动、Previous / Next | 手势切页，卡片吸附到最近页 |
+| 程序                       | 交互                           | 重点                     |
+| ------------------------ | ---------------------------- | ---------------------- |
+| `demo_anim_drawer`       | Menu、Overview/Activity、Close | 容器连同子控件一起滑入滑出          |
+| `demo_anim_dialog`       | Configure、Cancel/Apply       | top layer 模态遮罩与弹窗入场/退场 |
+| `demo_anim_cards`        | Stagger、Reorder              | 延迟错峰入场、卡片重排和颜色补间       |
+| `demo_anim_progress`     | Start、Reset                  | 整数补间驱动 Bar、百分比和阶段反馈    |
+| `demo_anim_canvas`       | Replay、Pause                 | 唯一的 Canvas：播放头和进度条同步   |
+| `demo_anim_tabs`         | Overview/Activity/Settings   | 页签指示条与三个真实页面同步横移       |
+| `demo_anim_accordion`    | 点击三个分区标题                     | 面板尺寸变化与后续行位置联动         |
+| `demo_anim_toast`        | Notify、Clear                 | 三条通知错峰入场、反向退场          |
+| `demo_anim_scroll`       | Top、Next、条目 Open             | 带子控件和裁剪的容器平滑滚动         |
+| `demo_anim_theme`        | Ocean、Sunset                 | 根背景、面板和色块协同变色          |
+| `demo_anim_focus`        | 点击输入框、按 Tab                  | 焦点框跟随真实 TextInput 焦点移动 |
+| `demo_anim_validation`   | 编辑邮箱、Validate、Fix sample     | 无效输入回弹并变色，修正后显示通过      |
+| `demo_anim_batch`        | 勾选条目、Clear、Archive           | 选中态驱动底部批量操作栏入退场        |
+| `demo_anim_list_ops`     | Add、Remove、Reorder           | 真实对象增删、相邻行让位/合拢及重排     |
+| `demo_anim_drag_snap`    | 拖动卡片、Next                    | 指针捕获跟手，松开后吸附最近位置       |
+| `demo_anim_submit`       | Submit / retry               | 按钮尺寸和颜色、Bar 进度与完成态串联   |
+| `demo_anim_loading`      | Load、Reset                   | 占位块收起，内容卡片错峰进入         |
+| `demo_anim_detail`       | 选择条目、Close                   | 列表收窄，侧边详情滑入或退出         |
+| `demo_anim_pull_refresh` | 下拉列表、Refresh                 | 跟手拖拽、阈值触发、保持、更新与回弹     |
+| `demo_anim_carousel`     | 左右滑动、Previous / Next         | 手势切页，卡片吸附到最近页          |
 
 ```bash
 cmake -S . -B build/rgb565/Demo -DYMGUI_COLOR_DEPTH=16

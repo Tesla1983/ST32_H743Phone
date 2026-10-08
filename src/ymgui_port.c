@@ -572,7 +572,7 @@ void ymgui_port_gram_verify(void)
 
     /* 整屏设窗口 → 发 0x2E 进读模式 → **哑读 1 拍** → 连续读 n 个像素。
      * 哑读这一拍不能省：RGB565 + 16 位并口时控制器第一个字无效
-     * （这个坑在 stm32-tetris 上踩过，见 docs/FMC_WRITE_TIMING_SCAN.md §2）。 */
+     * （这个坑在早期 Rust 参照工程上踩过；本工程把它固化成哑读一拍）。 */
     lcd_set_window(0, 0, (uint16_t)YMGUI_PORT_W, (uint16_t)YMGUI_PORT_H);
     lcd_wr_regno(0x2E);
     (void)LCD->LCD_RAM;

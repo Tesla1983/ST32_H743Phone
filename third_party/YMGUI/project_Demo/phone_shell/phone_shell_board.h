@@ -47,6 +47,31 @@ void PhoneShell_SetBrightnessPersistCallback(void (*cb)(uint8_t brightness));
  * ⚠ 允许在 ctx 还没建立时调用 —— 内部有 NULL 守卫，此时只记值不重绘。 */
 void PhoneHost_SetBrightness(int brightness);
 
+/* ---- 图库（2026-10-08）：相册 app 经这一组接口取 W25Q128 上的图片 ----
+ * 为什么要绕一层 board 接口，而不是让 gallery.c 直接 include src/img_store.h：
+ *   phone_shell 是 third_party 里的官方 Demo，**不能依赖本工程的 src/**；
+ *   已有的亮度/壁纸持久化也是同样的做法（回调 + board 层）。
+ * 返回的数据指针指向 **QSPI 的 XIP 窗口**（0x9000_0000 起），是只读的，
+ * 对应 YMGUI_DrawImg.h 里 `const GYpx* data` —— 图像不占任何 RAM。
+ * ⚠ 退出 memory-mapped 期间（图库导入中）这些**都不能调用**，
+ *   见 src/img_store.h 顶部关于 XIP 冲突的说明。 */
+int         BoardGallery_Count(void);                       /* 有效图片数 */
+int         BoardGallery_Info(int slot, unsigned int *off, unsigned int *len,
+                              unsigned int *w, unsigned int *h);
+const void *BoardGallery_Pixels(int slot);                  /* NULL = 该槽位无图 */
+
+/* ---- ESP32 上行链路：NTP 时间 + 天气（2026-10-08）----
+ * 声明实际在 src/uart_link.h（那里有完整的协议与踩坑说明），这里只是转一手，
+ * 让 phone_shell 不用直接 include src 下的头。
+ * 与图库同一套分层：UI 只拿"能直接画的字符串"，温度×10 → "20℃"、wday → "星期四"
+ * 这类换算全部在 src/uart_link.c 里。
+ *
+ * ⚠ 只在板级构建里引：uart_link.h 在 src/ 下，宿主（SDL 桌面）构建**没有**这个头，
+ *   无条件 include 会直接编不过。与 phone_ime.c 里那处同款条件编译。 */
+#if defined(PHONE_SHELL_BOARD)
+#include "uart_link.h"
+#endif
+
 /* 读回当前亮度（0..100）。本来就存在于 phone_host.h，但本工程的 board 侧
  * （src/main.c）只包含本头，而 main 需要**每拍**读它去换算背光 PWM 占空比
  * （拖动滑杆时走的是 Preview 路径、不触发落盘回调，所以不能靠回调拿值）。

@@ -39,8 +39,22 @@ __Vectors:
     .word  0
     .word  PendSV_Handler
     .word  SysTick_Handler
-    /* ---- 外部中断：STM32H743 有 150 个 IRQ（IRQ0..IRQ149）---- */
-    .rept  150
+    /* ---- 外部中断：STM32H743 有 150 个 IRQ（IRQ0..IRQ149）----
+     * 原来是 `.rept 150 / .word Default_Handler`，所有外设中断都落进死循环。
+     * 2026-10-08（L2-4）为 SDMMC1 单独开槽：IDMA 传输完成必须靠中断回调
+     * HAL_SD_IRQHandler，否则 HAL 的状态机不会收尾（hsd->State 永远停在 BUSY）。
+     * 2026-10-08（第二次）为 USART6 开槽：ESP32 上行链路（NTP/天气）靠 RXNE 中断
+     * 收字节，落 Default_Handler 会直接死循环。USART6_IRQn = 71。
+     * 拆成 49 + 1 + 21 + 1 + 78 = 150，顺序不能错：位置由 CMSIS 的 IRQn 决定。 */
+    .rept  49                           /* IRQ0..IRQ48 */
+    .word  Default_Handler
+    .endr
+    .word  SDMMC1_IRQHandler            /* IRQ49 = SDMMC1（见 sd_card.c） */
+    .rept  21                           /* IRQ50..IRQ70 */
+    .word  Default_Handler
+    .endr
+    .word  USART6_IRQHandler            /* IRQ71 = USART6（见 uart_link.c） */
+    .rept  78                           /* IRQ72..IRQ149 */
     .word  Default_Handler
     .endr
 .size __Vectors, . - __Vectors
@@ -104,3 +118,12 @@ Default_Handler:
 .thumb_set PendSV_Handler, Default_Handler
 .weak SysTick_Handler
 .thumb_set SysTick_Handler, Default_Handler
+
+/* SDMMC1（IRQ49）：强定义在 src/sd_card.c，这里给弱别名做兜底
+ * —— 万一 sd_card.c 没编进来，也不会链接失败，只会落回死循环（行为同其他未用 IRQ）。 */
+.weak SDMMC1_IRQHandler
+.thumb_set SDMMC1_IRQHandler, Default_Handler
+
+/* USART6（IRQ71）：强定义在 src/uart_link.c，同样给弱别名兜底。 */
+.weak USART6_IRQHandler
+.thumb_set USART6_IRQHandler, Default_Handler

@@ -1,4 +1,5 @@
 #include "phone_ui.h"
+#include "phone_shell_board.h"   /* BoardNet_WeatherCode()（只有板级构建才有） */
 
 static const GYfont* fonts[] = {&phone_font_regular, &phone_font_display, &phone_font_small, &phone_font_title};
 static const uint8* font_advances[] = {phone_font_regular_advance, phone_font_display_advance,
@@ -528,6 +529,121 @@ GYOBJ PhoneUI_panel(GYOBJ parent, int x, int y, int w, int h, GYcolor color)
 	return obj;
 }
 
+/* 天气图标（52×52）。原来**永远是同一朵云**（示例数据写死的），
+ * 现在按 ESP32 给的**天气数字码**换图形 —— 用数字码而不是比对中文文本：
+ * 文本是第三方接口原样透传的，哪天换个说法就匹配不上了（见 src/uart_link.h）。
+ *
+ * ⚠ 宿主（SDL 桌面）构建没有 uart_link.h，所以整段按 PHONE_SHELL_BOARD 条件编译：
+ *    板上按真实码画，桌面退回原来的固定云朵。 */
+#if defined(PHONE_SHELL_BOARD)
+
+static void wx_cloud(GYSURFACE s, int x, int y, GYcolor c)
+{
+	YMGUI_Draw_CircleFill(s, x, y, 10, c);
+	YMGUI_Draw_CircleFill(s, x + 11, y + 3, 8, c);
+	GYrect r = {x - 10, y + 3, 22, 9};
+	PhoneUI_rounded(s, &r, c, 4, GY_OPA_COVER);
+}
+
+/* 雨滴：n 滴，从云的下方垂下来 */
+static void wx_rain(GYSURFACE s, int x, int y, int n)
+{
+	for (int i = 0; i < n; ++i)
+	{
+		GYrect d = {x - 7 + i * 7, y + 13, 2, 7};
+		YMGUI_Draw_Fill(s, &d, RGB(150, 200, 255), GY_OPA_COVER);
+	}
+}
+
+/* 雪花：三个小方块错开，比画六角省事且在小尺寸下更易认 */
+static void wx_snow(GYSURFACE s, int x, int y, int n)
+{
+	for (int i = 0; i < n; ++i)
+	{
+		GYrect d = {x - 6 + i * 7, y + 14 + (i % 2) * 3, 3, 3};
+		YMGUI_Draw_Fill(s, &d, WHITE, GY_OPA_COVER);
+	}
+}
+
+/* 霾/雾/沙尘：几条横线，条数表示"糊"的程度 */
+static void wx_haze(GYSURFACE s, int x, int y, int n, GYcolor c)
+{
+	for (int i = 0; i < n; ++i)
+	{
+		GYrect d = {x - 11, y + 4 + i * 6, 24 - i * 3, 2};
+		YMGUI_Draw_Fill(s, &d, c, GY_OPA_COVER);
+	}
+}
+
+void PhoneUI_weather_draw(GYOBJ obj, GYSURFACE s, const GYrect* a)
+{
+	(void)obj;
+	int cx = a->x + 26, cy = a->y + 24;
+	int code = BoardNet_WeatherCode();
+
+	switch (code)
+	{
+	case 0:     /* 晴 */
+		YMGUI_Draw_CircleFill(s, cx, cy, 13, RGB(255, 214, 137));
+		break;
+	case 1:     /* 多云：太阳 + 云 */
+		YMGUI_Draw_CircleFill(s, cx - 8, cy - 8, 8, RGB(255, 214, 137));
+		wx_cloud(s, cx + 3, cy + 6, WHITE);
+		break;
+	case 2:     /* 阴 */
+		wx_cloud(s, cx - 2, cy, RGB(206, 210, 226));
+		wx_cloud(s, cx + 9, cy + 6, RGB(176, 180, 200));
+		break;
+	case 3:  case 10:   /* 小雨 / 阵雨 */
+		wx_cloud(s, cx - 2, cy - 4, WHITE);
+		wx_rain(s, cx - 2, cy - 4, 2);
+		break;
+	case 4:  case 5:    /* 中雨 / 大雨 */
+		wx_cloud(s, cx - 2, cy - 4, RGB(220, 224, 236));
+		wx_rain(s, cx - 2, cy - 4, 3);
+		break;
+	case 6:  case 7:  case 8:   /* 暴雨 / 大暴雨 / 特大暴雨 */
+		wx_cloud(s, cx - 2, cy - 5, RGB(196, 200, 216));
+		wx_rain(s, cx - 2, cy - 5, 4);
+		break;
+	case 9:     /* 雷阵雨：云 + 一道闪电（两段矩形拼 z 形） */
+		wx_cloud(s, cx - 2, cy - 6, RGB(210, 214, 230));
+		{
+			GYrect b1 = {cx + 1, cy + 10, 6, 2};
+			GYrect b2 = {cx - 1, cy + 12, 6, 2};
+			GYrect b3 = {cx + 1, cy + 14, 6, 2};
+			YMGUI_Draw_Fill(s, &b1, RGB(255, 226, 120), GY_OPA_COVER);
+			YMGUI_Draw_Fill(s, &b2, RGB(255, 226, 120), GY_OPA_COVER);
+			YMGUI_Draw_Fill(s, &b3, RGB(255, 226, 120), GY_OPA_COVER);
+		}
+		break;
+	case 11: case 12: case 13: case 14: case 15:   /* 雨夹雪 / 小雪~暴雪 */
+		wx_cloud(s, cx - 2, cy - 4, WHITE);
+		wx_snow(s, cx - 2, cy - 4, 3);
+		break;
+	case 16:    /* 雾 */
+		wx_haze(s, cx, cy - 4, 3, RGB(214, 218, 230));
+		break;
+	case 17:    /* 霾 */
+		wx_haze(s, cx, cy - 4, 3, RGB(206, 186, 150));
+		break;
+	case 18: case 19: case 20:   /* 浮尘 / 扬沙 / 沙尘暴 */
+		wx_haze(s, cx, cy - 4, 4, RGB(214, 186, 128));
+		break;
+	default:    /* 没收到（-1）或未识别（99）：退回原来的固定云朵，不要画成空白 */
+		YMGUI_Draw_CircleFill(s, cx, cy, 13, RGB(255, 214, 137));
+		YMGUI_Draw_CircleFill(s, cx + 11, cy + 11, 10, WHITE);
+		YMGUI_Draw_CircleFill(s, cx - 1, cy + 15, 8, WHITE);
+		{
+			GYrect cloud = {cx - 1, cy + 12, 21, 10};
+			PhoneUI_rounded(s, &cloud, WHITE, 5, GY_OPA_COVER);
+		}
+		break;
+	}
+}
+
+#else  /* 宿主构建：没有上行链路，保持原来的固定图形 */
+
 void PhoneUI_weather_draw(GYOBJ obj, GYSURFACE s, const GYrect* a)
 {
 	(void)obj;
@@ -538,6 +654,8 @@ void PhoneUI_weather_draw(GYOBJ obj, GYSURFACE s, const GYrect* a)
 	GYrect cloud = {x - 1, y + 12, 21, 10};
 	PhoneUI_rounded(s, &cloud, WHITE, 5, GY_OPA_COVER);
 }
+
+#endif /* PHONE_SHELL_BOARD */
 
 void PhoneUI_app_header(GYOBJ view, const char* title, const char* subtitle)
 {

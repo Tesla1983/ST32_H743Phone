@@ -335,7 +335,18 @@ flash：magic=0x59434F4E brightness=82 crc=0x09A9505D（算得一致）
 
 - **QSPI 引脚 IO2=PE2、IO3=PD13** —— 厂商资料包写反过，已更正。
 - `font_provision.c:167` 是与 `app_config.c` 同样的"写完必须 `qspi_enter_mmap()`"处理，可作参照。
+- ★★ **在 indirect 模式下读 XIP 窗口 = 精确 BusFault，升级 HardFault**（2026-10-08，
+  图库 BMP 灌库时实测）。`qspi_write` 内部是"退映射 → indirect 写 → **不回映射**"
+  （只有 `qspi_erase_sector` 会回），所以写完立刻去读 `0x9000_0000` 就崩：
+  `g_fault.kind = 1`、`CFSR = 0x8200`（PRECISERR + BFARVALID）、`BFAR = 0x9001_0000`，
+  主循环卡死。
+  ⚠ **单次读不挂是假阴性**：探针只读一次时看起来"没事"，而导入时连读上百次必然踩中
+  —— 曾据此得出"退出映射后读 XIP 也没事"的错误结论，多绕了一轮。
+  规矩：`qspi_write` 之后、**下一次 XIP 读之前**必须 `qspi_enter_mmap()`；周期性任务末尾再兜一次。
+  落地位置：`src/img_store.c` 的写循环末尾 + `img_store_poll()` 末尾。
 - 字库末尾 `0xEFC00` 之后、擦写回环 `0xFE000` 之前的空隙可放配置扇区（不撞 `QSPI_HOUSEKEEP_ADDR`）。
+- **图库区 `0x100000` 起 2 MB**（索引在 `0x100000`、数据从 `0x101000` 起）—— 这张布局表
+  早就预留了"图片/壁纸常量区"，且实测**没有任何代码在使用它**，图库直接用上了。
 
 ---
 
@@ -597,3 +608,121 @@ A/B 必须**同一页、背靠背**跑。同场景（桌面页）三次连跑：
 - 最终验收：A2 ramp=0 / **gram=0**、`g_fault=0`、IME 2/2、caret ✓、`lang_check` 三层 ✓；
   `g_lcd_dma_reenable=0`、`g_lcd_dma_timeout=0`。
 - 用户明确不做：把 `s_band2` 从 SRAM3 挪到 AXI SRAM（复测收益，放弃）。
+
+---
+
+# 迁回的关键约定（2026-10-08 归位）
+
+> 这一批条目原先寄存在另一个工程的记忆文件里，现已归位到本项目。
+> 内容按原样保留，只去掉了对其他工程的引用。改对应代码前先看这里。
+
+## 诊断量纪律（本项目踩坑最多）
+**坐标/状态一律固件每帧现算；脚本只读诊断量、绝不按算式推。** 根因：`app_page` 建在 `y=480`，
+靠 `open_app` 的 330 ms 动画归位，`on_recent()` 又把它推回下方 ⇒ "进页时算一次"的坐标会凭空多 480。
+- 绝不在"状态变化处"增量同步（`-O2` 内联后写入被合并 ⇒ 画面与诊断量长期不一致）。
+- `Settings_UpdateDiag()` 必须定义在 `static AppState state;` **之后**；wrapper(450 行) 不能比
+  `state.bright_slider`，只记指针由 UpdateDiag 比对。
+- **bdtap 注入异步** ⇒ 断言前必须 `settle()`。**`wait_diag()` 必须在 `open_settings()` 之后**。
+- 抓屏静止时脏区为空 ⇒ 两张 PNG 逐字节相同是**正确**的；要强制重绘写 `g_force_redraw=1`。
+- SWD 传负数要转补码（`bench.wr` 已做）。
+
+## 引擎行为（YMGUI）
+命中取最深对象；`sendEvent` **不冒泡**、`event_cb==NULL` **静默丢弃** ⇒ 必须递归给子树每个对象装
+wrapper（`PhoneUI_panel` 无 `event_cb` ⇒ 空白处怎么拖都不动）。`GYsw_data` 是 Switch.c 私有类型 ⇒
+用 `SetOn/GetOn`。`GY_STATE_Hidden=0x04`。**`YMGUI_Slider_SetValue/SetRange` 不触发 changed、只写值**。
+**滑杆回调在 `Pressed` 与每次 `Pressing` 都触发**。
+
+## 设置页布局（滚动版）
+`SCROLL_VIEW_H=412-56`，`content_h=491` ⇒ clamp 上限 135。**视口必须从 `y=56` 起**（不透明+ClipChildren，
+会盖兄弟对象）。卡片内容 y=65/133/201/269/329/407/451 ⇒ 底部初始在屏外，先滚到底。`SCROLL_WRAP_MAX=48`，
+装满是**静默 return**（表现为"后面几个控件滚不动"）。
+- ⚠⚠ `settings_sync_controls(int reset_scroll)`：`app_show` 传 1、`app_command("sync")` 传 0。
+  `PhoneApps_Command(...,"sync")` 会调到 `app_show()` 把 `scroll_y` 复位 ⇒ 拖动中发它 = 页面弹回顶部、
+  滑杆 y 从 330 跳 465、手指还在 330 ⇒ **"拖不动"**。
+- 拖动会误触输入框（引擎 `Pressed` 给可聚焦对象置焦点）⇒ `scroll_drag()` 首次判定为滚动时
+  `YMGUI_SetFocus(c,NULL)`；脚本拖动起点用 `DRAG_XY=(6,380)`（用 (160,380) 会命中设备名输入框）。
+- **scene**：`BOOT0 HOME1 APP2 RECENTS3 SHUTDOWN4 OFF5`（**4 是 SHUTDOWN 不是 OFF**）。
+  点"关机…"只开面板、scene 不变 ⇒ 读 `g_diag_power_dialog`。
+- 软键盘占 y=226..448，收起键 **(287,267)**；**别用 home (160,464)**（会退出到桌面），用返回 (64,464)。
+- 已验收关机/开机闭环坐标：取消 (94,404)、关机 (226,404)、电源键 (160,428)、重新开机 (160,359)。
+
+## 配置持久化（语言 / 半透明 / 亮度）
+写 **W25Q128 扇区 240 = `0x000F0000`**，magic `"YCON"` + CRC32 双校验，损坏回退默认。
+三份同构桥：`phone_shell` 是库侧代码、不许 include 应用层 `app_config.h` ⇒ main.c 里
+`app_lang_persist`/`app_ribbon_persist`/`app_brightness_persist` + shell 侧 `Phone*_Set*PersistCallback`。
+- ⚠⚠ 写/擦完**必须 `qspi_enter_mmap()`**（`qspi_*` 内部先退出映射，中文字模从 `0x9000_0000` 读 ⇒
+  忘了重进**整屏中文消失**）。**XIP 窗口只读**，主机侧写报 `DRW` 错 ⇒ 恢复出厂走固件
+  `AppConfig_FactoryReset()` + 写 `g_cfg_factory_reset=1`。
+- ⚠ **钳制 `s_cur` 内容后必须重算 `crc`，且钳制放在 `s_flashed` 快照之前** ⇒ 否则 Save 出的 blob
+  CRC 自相矛盾，重启后整套设置全丢。
+- 同名 static 在 ELF 里有多个符号（`active` 3 个）⇒ 诊断量必须固件显式导出 `volatile` 全局。
+- **亮度三层一致**：blob / `display_brightness`（初值 50）/ 滑杆 range **1..100**（出厂 50）；
+  屏侧叠 `alpha=(100-v)*160/100` 黑罩（**非线性，系数 160 不是 255；下限取 1 不是 0**，0 = 全屏死黑
+  与屏坏无法区分）。
+- 语言 `T("中文原文")`：中文模式直接返回原文。**文案两类**——绘制期取值（每帧读
+  `PhoneApps_Get(id)->title`）包 `T()` 自动跟随；**创建期设定**（Label/Button 是创建时拷进对象的副本）
+  **必须显式重设**（`PhoneHost_RefreshLanguage()` + `PhoneDesktop_Retranslate()`，各 APP 靠 `show()` 惰性刷新）。
+
+### ⚠⚠ 滑杆类控件必须两段式落盘（闪存磨损）
+一次拖动经过 5 个**不同**中间值 ⇒ 板级实测**擦 6 次扇区**（标称 10 万次/扇区），"值相同不写"挡不住。
+做法：拖动中走 `PhoneHost_SetBrightnessPreview()`（只改内存+重绘，**不碰持久化回调、不发 sync**），
+松手（`Released` **和** `ReleasedOff`，后者是拖出界外松手）才调 `PhoneHost_SetBrightness()` 落盘一次；
+由 `scroll_wrap_event` 在转发前调 `brightness_commit()`。
+**⚠ 隐蔽坑**：Preview 已把值推到最终值 ⇒ 松手时 `SetBrightness(GetBrightness())` 传同一值 ⇒
+命中"值相同直接 return" ⇒ **落盘回调永不被调用**（现象：press/change/commit 全 +1 而亮度不变）
+⇒ 加 `s_bright_dirty` 粘滞标志，**只在 Preview 置位**（开机那次同值同步仍被挡住，不会每次开机擦扇区）。
+三段判读（`g_diag_sld_press/_change/_commit`）：`press=0` 没命中；`press>0 change=0` wrapper 转了但
+Slider 没回调；`change>0 commit=0` 值变了没落盘。
+
+## Cache / DMA（接 TF 卡前必读）
+D-Cache 常开 + **FORCEWT 恒 1**（`g_cache_wb`/`g_cache_clean` 已删）。FORCEWT 只覆盖"写"方向 ⇒
+CPU 写必达内存（**DMA 读方向无需任何 cache 维护**）；**DMA 写 → CPU 读**管不了，实测 **64/64 全部静默读到陈旧值**。
+未完成：**L2** SDMMC 通路（TF 卡到货）；**L3** SRAM1 整块 128 KB 设 `NOT_CACHEABLE`（上 IDMA 前，不依赖卡）。
+L3 判据闭环：重跑 `dma_check.py`，"DMA 写→CPU 读"应 64/64 → 0/64。
+四约束：① DMA1/2 **访问不到 DTCM** ⇒ 缓冲不得来自 `board_alloc0`；② DMA1/2 属 D2 域，**访问不到 D3 域
+SRAM4**；③ 缓冲必须 **32 B 对齐**；④ **MPU 8 region 已全满**且 ARMv7-M **编号大者优先**（DDI0403：highest region number
+takes priority；2026-10-08 更正，此前写成"编号小者优先"是错的）⇒ 给被大 region 覆盖
+的小区域改属性时必须取**更大**的编号 ⇒ 常常得重排编号
+（region6=SDRAM / region7=NAND 本板无器件可回收）。region 长度须 2 的幂；**`SubRegionDisable` 不能配
+"子区非缓存"**（语义是"不吃本 region 配置"⇒ 落默认 Cacheable，方向相反）。新 NOLOAD 段
+（`.bss_dma`/`.bss_ime`）**必须放 `.bss` 之前** + 在 `board_startup.c` 手动清零。DMA1 MEM2MEM 实测 ≈160 MB/s。
+
+## 已知遗留（用户已叫停排查，别再动）
+- **IME 视口顶溢出**：键盘弹起时视口顶 y=80..88 有 79~82 个灰字像素。已排除 IME 挪控件、引擎裁剪两个
+  假设；下一步在 `YMGUI_Invalidate.c:250` 的 `GY_Rect_Intersect` 打点。
+- 板级 `selftest()`/`select_preview()` 是 SDL 桌面版入口，板上无触发路径。
+
+## 性能与构建的两个坑（本项目实测）
+**四个"看着该优化、实测没用"的先例（无收益即回退）**：XIP 改可缓存 · 圆角每行 Fill 合并(≈0%) ·
+`GY_MixPx` 三次 `/255`（gcc 自动强度削减）· 关 FORCEWT 走写回(1.0–1.1×)。
+**两个构建坑**：① 工程曾是 `-O0`（`CMAKE_BUILD_TYPE` 从没设过），现用 `add_compile_options(-O2)` 固化
+—— **从厂商例程搬代码时构建配置也是契约的一部分**；② **`-O2` 不跨编译单元内联**，热点里的
+`lcd_wr_data()` 必须在本文件自写内联 store。
+渲染优化累计 2.88×，瓶颈是**逐像素光栅化单价**（不透明 1.04 · 半透明 17.34 · blit 11.74 · 文字 17.26 cy/px），
+不是 overdraw(2.27 层) 也不是树遍历(≈3%)。⚠ in-context 成本 ≈2× 微基准，外推收益打对折。
+
+## UI 文本布局：宽度按**字体真实步进**给，不要拍脑袋（2026-10-08 实测）
+`PhoneUI_left_label(obj, x, y, **w**, text, color, size)` 的 `w` 是**硬裁剪宽**，
+文本超出部分直接切掉（不是换行、不是省略号）。字号 → 字体表的对应：
+`size 0=regular(24px 高) · 1=display(66px) · 2=small(18px) · 3=title(36px)`。
+
+各字体的 ASCII 步进表是**普通数组**，可直接从 elf 里量出来（不用猜、不用试）：
+```bash
+A=$(arm-none-eabi-nm build/ymgui-h743.elf | grep " T phone_font_display_advance" | cut -d' ' -f1)
+probe-rs read --probe 0416:5021:0123456789AB --chip STM32H743VITx b8 0x$A 96
+# 数组下标 0 = ASCII 0x20(空格)，所以 '0'(0x30) 在下标 16、':'(0x3A) 在下标 26
+```
+实测（单位 px，步进 = 字形宽 + 右侧留白，连排时就是这个值）：
+
+| 字体 | 数字 '0'..'9' | 冒号 ':' | 说明 |
+| --- | --- | --- | --- |
+| regular（size 0/2 用的是 regular） | **9** | 5 | "23:35" = 9+9+5+9+9 = **41** ⇒ 54px 宽足够 |
+| display（size 1，桌面大时间） | **33** | **18** | "23" 要 **66px** |
+| title（size 3，控制中心） | **17** | 9 | "09:41" = 17+17+9+17+17 = **77** ⇒ 165px 宽足够 |
+
+⚠ **踩过的坑**：桌面大时间拆成 小时/冒号/分钟 三个 label 做"冒号闪烁"时，
+小时格给了 60px —— 而两个 display 数字要 66px ⇒ **第 2 位数字右边被切掉**
+（用户肉眼发现："第 2 位和第 4 位数字右边被裁剪"）。改成 70px 正常。
+⇒ 规矩：**凡是给固定宽度的 label，先按上表算一遍**（或现场量），
+别用"看上去差不多"的整数。
+

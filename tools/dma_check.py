@@ -5,11 +5,21 @@
 它回答三个问题（都在真机上、都是整数结论，不靠肉眼）：
 
   ① 方向①：CPU 写 → DMA 读          预期失配 0      （FORCEWT=1 ⇒ CPU 写直达内存）
-  ② 方向②：DMA 写 → CPU 读（不维护） 预期失配 = 字数 （D-Cache 里是旧副本 ⇒ 静默读到陈旧值）
-  ③ 方向②：DMA 写 → CPU 读（invalidate）预期失配 0   （证明补救办法有效）
+  ② 方向②：DMA 写 → CPU 读（不维护） **判据随 MPU 配置而变，见下**
+  ③ 方向②：DMA 写 → CPU 读（invalidate）预期失配 0  （证明补救办法有效）
 
-②③ 必须成对看：只有「②失败 + ③通过」才能同时证明
-  「风险真实存在」且「invalidate 确实能补救」。
+★ 用例② 有两种"正确"，含义完全不同（2026-10-08 完成 L3 后新增）：
+    · **L3 之前**（SRAM1 由 region3 配成 CACHEABLE）：预期失配 = 字数（64）。
+      它证明"DMA 写后 CPU 读到陈旧值"这个风险**真实存在**。
+    · **L3 之后**（SRAM1 由 region0 配成 NOT_CACHEABLE）：预期失配 = **0**。
+      DMA 的写对 CPU 立即可见 ⇒ 代码里一行 clean/invalidate 都不需要写，
+      一致性由 **MPU 保证**而不是靠调用方记性 —— 这才是 L3 的目的。
+      若 L3 做完后 ② 仍是 64 ⇒ region 优先级没排对，或缓冲没落在 SRAM1，
+      要回去查 MPU 配置，不能当作通过。
+      ⚠ 优先级方向（2026-10-08 更正）：ARMv7-M 是**编号越大优先级越高**
+      （DDI0403 "highest region number takes priority"），不是"编号小优先"。
+      SRAM1 用 region0 也生效，是因为它不与其它 region 重叠；
+      真要"压住"某个大 region，编号必须比它大（L2-4 的 AXI 8 KB 用的就是 region7）。
 
 用法
 ----
@@ -17,8 +27,8 @@
 
 判定与退出码
 ------------
-    0  三个用例全部符合预期
-    2  ② 没复现出不一致（需要复查，见输出的提示）
+    0  三个用例符合当前 MPU 配置下的预期（会明确打印是哪一种）
+    2  ② 既不是 0 也不是全部失配（半对半 ⇒ 需要复查，见输出的提示）
     3  ③ 失败（补救无效 —— 严重，架构结论要改写）
     4  ① 失败（方向① 出乎意料，说明对 FORCEWT 的假设有误）
     1  前置条件不满足（内核没在跑 / D-Cache 没开 / DMA 初始化失败 / 符号重名）
@@ -194,13 +204,18 @@ def main():
         print("       架构结论必须改写（不能靠手工 cache 维护，只能划非缓存 DMA 区）。")
         return 3
 
+    print("[PASS] 方向①、③ 都符合预期（0 失配）。")
+    print("")
+
     if b_mis == 0:
-        print("[!] 方向② 没复现出不一致（失配 0）。可能原因：")
-        print("    · prime 读被优化掉了（检查 count 逻辑是否真发 load）；")
-        print("    · D-Cache 实际未命中所属区域（查 MPU region3 是否仍为 CACHEABLE）；")
-        print("    · 缓冲区在两次访问之间被换出了 cache。")
-        print("    在排除这三点之前，不能据此认为「DMA→CPU 无需 cache 维护」。")
-        return 2
+        print("[PASS] ★ L3 已生效 ★ 方向② 失配 0 —— DMA 缓冲所在的 SRAM1 已经是**非缓存**区：")
+        print("   · DMA 写完，CPU 不需任何 invalidate 就能读到新值；")
+        print("   · 一致性由 **MPU 保证**（region0：SRAM1 非缓存），不是靠调用方记得做；")
+        print("   · 这是接 SDMMC **IDMA 高速模式**（L2-4）的前置条件，现在可以做了。")
+        print("")
+        print("   若你预期看到的是「失配 64」（即想复现缓存不一致）：")
+        print("   说明 MPU 已按 L3 重排过，属于**正常且是目标状态**，不是台架失效。")
+        return 0
 
     print("[PASS] 结论成立，三条同时为真：")
     print("   · FORCEWT=1 ⇒ CPU 写必达内存，DMA 读方向**不需要**任何 cache 维护；")
@@ -214,8 +229,10 @@ def main():
         print("     而且它与 cache line 粒度绑定（所以 DMA 缓冲区必须按 32 B 对齐）。")
     print("   · invalidate 能完整补救（失配 0）⇒ 但代价是「调用方必须记得做」。")
     print("")
-    print("⇒ 工程决策：接 SDMMC/IDMA 之前，应划**专用非缓存 DMA 区**，")
-    print("   而不是依赖每个调用点手工 invalidate（本工程已有「以为在防、实际漏了」的先例）。")
+    print("⇒ 当前仍是**非缓存 DMA 区未生效**的状态（SRAM1 可缓存 ⇒ 风险真实存在）。")
+    print("   L3 的做法：MPU 用 **region0**（编号最小=优先级最高）把 SRAM1 配成非缓存 ——")
+    print("   注意不能拿编号大的 region 去覆盖，压不住原来覆盖 SRAM1~3 的那条。")
+    print("   做完后重跑本脚本，② 应由 %d 变成 0。" % EXPECT_B)
     return 0
 
 

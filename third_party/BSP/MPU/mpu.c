@@ -68,7 +68,58 @@ uint8_t mpu_set_protection(uint32_t baseaddr, uint32_t size, uint32_t rnum, uint
  */
 void mpu_memory_protection(void)
 {
-    /* 保护整个DTCM,共128K字节 */
+    /* ★移植改动（2026-10-08，路线图 L3）★ SRAM1 = **专用非缓存 DMA 区** —— region0
+     *
+     * 【⚠ 2026-10-09 更正：下面这段"编号小的优先级高"是**错的**，已按 ARM 文档改正】
+     *   ARMv7-M ARM（DDI0403）原文："Where there is an overlap between two regions,
+     *   the register with the **highest region number** takes priority."；
+     *   Cortex-M7 TRM 更直白："7 Highest priority, when 8 regions are implemented."
+     *   即 **编号越大优先级越高**（与 Linux/RTOS 里"编号小优先级高"的直觉相反）。
+     *   当初这么写没被抓出来，是因为 SRAM1 恰好**不与任何其它 region 重叠**
+     *   —— 原来的 region3 是 0x30000000 起 512KB（覆盖 SRAM1），现已缩成
+     *   SRAM2 单独的 128KB（0x30020000 起），不再与 SRAM1 相交，
+     *   于是 region0 无论优先级高低都照样生效，`dma_check.py` 也就照样 64→0。
+     *   **结论的后果**：如果哪天要给某个"被大 region 覆盖"的小区域改属性，
+     *   必须给它**更大的编号**，不是更小的（L2-4 的 AXI 尾部 8 KB 就是这么踩的）。
+     *
+     * 【为什么是"非缓存"而不是"记得手工 invalidate"】
+     * `tools/dma_check.py` 已实测：DMA 写内存后 CPU 读，**64/64 个字全部读到陈旧值**，
+     * 且不报错、不 HardFault —— 漏一次 invalidate 就是静默数据损坏。
+     * 把 DMA 缓冲所在的整块 SRAM1 配成非缓存，等于让一致性由 **MPU 保证**，
+     * 而不是靠每个调用方"记得做"。这是接 SDMMC IDMA（L2-4）之前必须完成的前置。
+     *
+     * 【属性为什么不走公共的 mpu_set_protection()】
+     * 那个函数把 TypeExtField 固定成 MPU_TEX_LEVEL0，而 TEX=000/C=0/B=0 是
+     * **Strongly-ordered**（最严、也最慢）。DMA 缓冲要的是
+     * "Normal memory, Non-cacheable" ⇒ **TEX=001, C=0, B=0**，故这里直接调
+     * HAL_MPU_ConfigRegion 配，不动公共函数签名以免影响其它调用点。
+     *
+     *   XN=1（DisableExec） 不从 DMA 区取指
+     *   FULL_ACCESS         DMA 区必须能写（不能设 RO）
+     *   SHAREABLE           CPU 与 DMA 是两套总线主设备，语义上就是共享
+     */
+    {
+        MPU_Region_InitTypeDef r;
+
+        r.Enable           = MPU_REGION_ENABLE;
+        r.Number           = MPU_REGION_NUMBER0;
+        r.BaseAddress      = 0x30000000u;             /* SRAM1（D2 域，128KB） */
+        r.Size             = MPU_REGION_SIZE_128KB;
+        r.SubRegionDisable = 0x00u;
+        r.TypeExtField     = MPU_TEX_LEVEL1;          /* TEX=001 + C=0/B=0 ⇒ Normal 非缓存 */
+        r.AccessPermission = MPU_REGION_FULL_ACCESS;
+        r.DisableExec      = MPU_INSTRUCTION_ACCESS_DISABLE;
+        r.IsShareable      = MPU_ACCESS_SHAREABLE;
+        r.IsCacheable      = MPU_ACCESS_NOT_CACHEABLE;
+        r.IsBufferable     = MPU_ACCESS_NOT_BUFFERABLE;
+
+        HAL_MPU_Disable();
+        HAL_MPU_ConfigRegion(&r);
+        HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
+    }
+
+    /* 保护整个DTCM,共128K字节（编号回到厂商原始的 region1：DTCM 不与任何其它
+     * region 重叠，编号取哪个都不影响它生效） */
     mpu_set_protection( 0x20000000,                 /* 基地址 */
                         MPU_REGION_SIZE_128KB,      /* 长度 */
                         MPU_REGION_NUMBER1, 0,      /* NUMER1,允许指令访问 */
@@ -86,18 +137,21 @@ void mpu_memory_protection(void)
                         MPU_ACCESS_CACHEABLE,       /* 允许cache */
                         MPU_ACCESS_BUFFERABLE);     /* 允许缓冲 */
     
-    /* 保护整个SRAM1~SRAM3,共512K字节 */
-    mpu_set_protection( 0x30000000,                 /* 基地址 */
-                        MPU_REGION_SIZE_512KB,      /* 长度 */
+    /* ★移植改动（L3 重排）★ 原来的 region3 是"SRAM1~SRAM3 共 512KB 可缓存"，
+     * 现在 SRAM1 已单独由 region0 配成非缓存（见本函数开头），这里只覆盖
+     * **SRAM2（0x30020000，128KB）**，长度按 2 的幂且基址按长度对齐（硬件要求）。 */
+    mpu_set_protection( 0x30020000,                 /* 基地址（SRAM2） */
+                        MPU_REGION_SIZE_128KB,      /* 长度 */
                         MPU_REGION_NUMBER3, 0,      /* NUMER3,允许指令访问 */
                         MPU_REGION_FULL_ACCESS,     /* 全访问 */
                         MPU_ACCESS_NOT_SHAREABLE,   /* 禁止共用 */
                         MPU_ACCESS_CACHEABLE,       /* 允许cache */
                         MPU_ACCESS_BUFFERABLE);     /* 允许缓冲 */
-                        
-    /* 保护整个SRAM4,共64K字节 */
-    mpu_set_protection( 0x38000000,                 /* 基地址 */
-                        MPU_REGION_SIZE_64KB,       /* 长度 */
+
+    /* ★移植改动（L3 重排）★ SRAM3（0x30040000，32KB）—— 第二块 band buffer 在这里。
+     * 编号从"SRAM4 的 4"改成 4 给 SRAM3，SRAM4 挪去 region7。 */
+    mpu_set_protection( 0x30040000,                 /* 基地址（SRAM3） */
+                        MPU_REGION_SIZE_32KB,       /* 长度 */
                         MPU_REGION_NUMBER4, 0,      /* NUMER4,允许指令访问 */
                         MPU_REGION_FULL_ACCESS,     /* 全访问 */
                         MPU_ACCESS_NOT_SHAREABLE,   /* 禁止共用 */
@@ -115,26 +169,15 @@ void mpu_memory_protection(void)
                         MPU_ACCESS_NOT_CACHEABLE,   /* 禁止cache */
                         MPU_ACCESS_NOT_BUFFERABLE); /* 禁止缓冲 */
                         
-    /* 保护SDRAM区域,共32M字节 */
-    mpu_set_protection( 0xC0000000,                 /* 基地址 */
-                        MPU_REGION_SIZE_32MB,       /* 长度 */
-                        MPU_REGION_NUMBER6, 0,      /* NUMER6,允许指令访问 */
-                        MPU_REGION_FULL_ACCESS,     /* 全访问 */
-                        MPU_ACCESS_NOT_SHAREABLE,   /* 禁止共用 */
-                        MPU_ACCESS_CACHEABLE,       /* 允许cache */
-                        MPU_ACCESS_BUFFERABLE);     /* 允许缓冲 */
+    /* ★移植改动（L3 重排）★ 原 region6 是 **SDRAM（0xC0000000）**，本板**没有**这个器件，
+     * 编号回收给下面的 QSPI（原在 region0）。不访问这片地址，落到默认图也无所谓。 */
 
-                        
-    /* 保护整个NAND FLASH区域,共256M字节 */
-    mpu_set_protection( 0x80000000,                 /* 基地址 */
-                        MPU_REGION_SIZE_256MB,      /* 长度 */
-                        MPU_REGION_NUMBER7, 1,      /* NUMER7,禁止指令访问 */
-                        MPU_REGION_FULL_ACCESS,     /* 全访问 */
-                        MPU_ACCESS_NOT_SHAREABLE,   /* 禁止共用 */
-                        MPU_ACCESS_NOT_CACHEABLE,   /* 禁止cache */
-                        MPU_ACCESS_NOT_BUFFERABLE); /* 禁止缓冲 */
+    /* ★移植改动（L3 重排）★ 原 region7 是 **NAND（0x80000000）**，本板同样没有，
+     * 编号回收给 SRAM4（原在 region4）—— 见本函数末尾。 */
 
     /* ★移植新增（阶段 4）★ QUADSPI memory-mapped 只读常量区
+     * ★L3 重排：编号由 region0 改为 **region6**（region0 让给 SRAM1 非缓存 DMA 区）。
+     *   属性一字未改：仍然 NOT_CACHEABLE + 只读 + XN，理由见下面那段 2026-10-03 的记录。
      *   0x9000_0000~0x9FFF_FFFF = QUADSPI bank1 的 256MB 窗口
      *   （本板 DCR.FSIZE=23 只映射 16MB，MPU 区域按整个窗口设，反正不会越界访问）。
      *
@@ -158,11 +201,56 @@ void mpu_memory_protection(void)
      *   保留这段记录，避免以后重复踩同一条思路。 */
     mpu_set_protection( 0x90000000,                 /* QUADSPI bank1 窗口 */
                         MPU_REGION_SIZE_256MB,      /* 长度 */
-                        MPU_REGION_NUMBER0, 1,      /* NUMER0,禁止指令访问(XN=1) */
+                        MPU_REGION_NUMBER6, 1,      /* NUMER6,禁止指令访问(XN=1) */
                         MPU_REGION_PRIV_RO,         /* 只读 */
                         MPU_ACCESS_NOT_SHAREABLE,   /* 禁止共用 */
                         MPU_ACCESS_NOT_CACHEABLE,   /* 禁止cache */
                         MPU_ACCESS_NOT_BUFFERABLE); /* 禁止缓冲 */
+
+    /* ★移植改动（2026-10-08，路线图 L2-4）★ AXI SRAM **尾部 8 KB** = SDMMC1 的
+     * IDMA 专用缓冲（链接脚本 .bss_sd_dma，见 linker/stm32h743vit6.ld），
+     * 配成 **Normal 非缓存** —— 与 region0（SRAM1）同样的理由与同样的属性：
+     *   · IDMA 是独立于 CPU 的总线主设备，它写进来的数据 CPU 的 D-Cache **看不见**，
+     *     缓存着就是静默读到旧值（`tools/dma_check.py` 已实测 64/64 字全陈旧）；
+     *   · 让 MPU 保证一致性，而不是靠每个调用方"记得 invalidate"。
+     *
+     * 【为什么必须占编号 7（最大）】
+     * 整块 AXI（512KB，0x24000000 起）由 region2 配成 CACHEABLE，这 8 KB 在它里面。
+     * ARMv7-M 的规则是 **编号越大优先级越高**（见本函数顶部那段更正），
+     * 所以要压住 region2，只能取比 2 大的编号 —— 取最大的 7 最稳
+     * （第一版按"编号小优先级高"的错误理解放在 region1，**压不住**，
+     *   实测哨兵残留 3438/4096 字节，IDMA 写完 CPU 仍读到 cache 里的旧副本）。
+     * SRAM4 那条 region 因此被删除（本工程从不访问 SRAM4，落默认图无影响）。
+     *
+     * 【为什么是 0x2407E000 / 8 KB】
+     *   0x24000000 + 512KB = 0x24080000（AXI 末端），减 8 KB ⇒ **0x2407E000**。
+     *   链接脚本里 .bss_sd_dma 就钉在这里（nm 实测 s_rd=0x2407E000、
+     *   s_wr=0x2407F000），两边必须一致 —— 手算第一版写成 0x2407C000（差 8 KB），
+     *   那样 MPU 盖的是 heap1 里的区域，IDMA 缓冲反而是可缓存的。
+     * MPU 区域要求"基址按长度对齐、长度是 2 的幂"：0x7E000 = 63 × 8 KB ⇒ 对齐，成立。 */
+    {
+        MPU_Region_InitTypeDef r;
+
+        r.Enable           = MPU_REGION_ENABLE;
+        r.Number           = MPU_REGION_NUMBER7;     /* 最大编号 ⇒ 压得住 region2 的 AXI 512KB */
+        r.BaseAddress      = 0x2407E000u;            /* AXI 尾部 8 KB（与链接脚本 .bss_sd_dma 一致） */
+        r.Size             = MPU_REGION_SIZE_8KB;
+        r.SubRegionDisable = 0x00u;
+        r.TypeExtField     = MPU_TEX_LEVEL1;          /* TEX=001 + C=0/B=0 ⇒ Normal 非缓存 */
+        r.AccessPermission = MPU_REGION_FULL_ACCESS;
+        r.DisableExec      = MPU_INSTRUCTION_ACCESS_DISABLE;
+        r.IsShareable      = MPU_ACCESS_SHAREABLE;
+        r.IsCacheable      = MPU_ACCESS_NOT_CACHEABLE;
+        r.IsBufferable     = MPU_ACCESS_NOT_BUFFERABLE;
+
+        HAL_MPU_Disable();
+        HAL_MPU_ConfigRegion(&r);
+        HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
+    }
+
+    /* SRAM4（0x38000000，64KB）的 region 已删除：8 条 region 用满，
+     * 而本工程从不访问 SRAM4（落 PRIVDEFENA 的默认图即可）。
+     * 若将来要用，必须先把某条不重叠的 region 腾出来再补回。 */
 }
 
 

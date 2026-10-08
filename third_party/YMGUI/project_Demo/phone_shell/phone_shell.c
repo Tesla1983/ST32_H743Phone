@@ -74,6 +74,18 @@ static GYOBJ mini_music_button, home_music_status;
  * 不重设就一直是旧语言 —— 见 PhoneHost_RefreshLanguage）。 */
 static GYOBJ home_date, home_widget_title, home_music_title;   /* 桌面小组件 */
 static GYOBJ recent_title, recent_clear_button;                /* 最近任务页 */
+
+/* ---- ESP32 上行链路（NTP 时间 + 天气）在界面上的落点 ----
+ * 原来这几处全是硬编码（"9:41" / "09:41" / "9月29日  星期二" / "多云 / 22 C"），
+ * 现在由 net_refresh() 每 500 ms 从 board 层拉真实数据刷进去。
+ * ⚠ 句柄必须存下来：PhoneUI_text_set 要 obj，光有字符串改不了界面。
+ * status_clock[] 存两个是因为 status_bar() 在**首页与 app 页各调一次**。 */
+static GYOBJ status_clock[2];
+static int   status_clock_n;
+/* 桌面大时间拆成三个 label —— 小时 / 冒号 / 分钟。
+ * 为什么要拆：冒号要每秒闪一次（"冒号 ↔ 空"），单独拼在一个 label 里会因
+ * ':' 与空格不等宽而让分钟数字左右跳位（见 src/uart_link.c 的 BoardNet_ClockHH）。 */
+static GYOBJ home_clock_h, home_clock_c, home_clock_m;
 /* dim_buffer 的定义挪到 dim_buffer_ensure() 旁边（那里有它为什么按需分配的长注释） */
 static GYpx* capture_target;
 static int capture_shift;   /* 抓屏降采样倍数：0=原尺寸(320×480)，2=1/4(80×120) */
@@ -125,10 +137,148 @@ static void status_draw(GYOBJ obj, GYSURFACE surface, const GYrect* area)
 
 
 
+/* ---- ESP32 上行链路（NTP 时间 + 天气）的文本取用与刷新 ----
+ *
+ * 三个 net_xxx() 返回**静态缓冲**，给创建控件时用；周期性刷新的逻辑在 net_refresh()。
+ * 为什么不直接在两处各调一次 BoardNet_*：创建和刷新必须共用同一套
+ * "没数据时显示什么"的策略，收在一处才不会出现"创建时占位、刷新时真值"
+ * 这种前后不一致。
+ *
+ * ⚠ 静态缓冲的代价：不能同时持有两次返回值（phone_shell 里不会这么用）。
+ *
+ * net_date()/net_weather() 在**没同步到**时仍返回原翻译文案（T(...)），
+ * 于是切语言照常生效、界面也不会突然冒出"等待天气"这种半成品字样。 */
+
+static char s_net_hms[12], s_net_date[40], s_net_wx[40];
+static char s_net_hh[4], s_net_mm[4];
+
+static const char* net_hms(void)
+{
+	BoardNet_ClockHMS(s_net_hms, (int)sizeof(s_net_hms));
+	return s_net_hms;
+}
+static const char* net_hh(void)
+{
+	BoardNet_ClockHH(s_net_hh, (int)sizeof(s_net_hh));
+	return s_net_hh;
+}
+static const char* net_mm(void)
+{
+	BoardNet_ClockMM(s_net_mm, (int)sizeof(s_net_mm));
+	return s_net_mm;
+}
+
+static const char* net_date(void)
+{
+	if (BoardNet_HasTime())
+	{
+		BoardNet_DateText(s_net_date, (int)sizeof(s_net_date));
+		return s_net_date;
+	}
+	return T("9月29日  星期二");
+}
+
+static const char* net_weather(void)
+{
+	if (BoardNet_HasWeather())
+	{
+		BoardNet_WeatherText(s_net_wx, (int)sizeof(s_net_wx));
+		return s_net_wx;
+	}
+	return T("多云 / 22 C");
+}
+
+/* 每 250 ms 把上行链路的数据刷进界面。
+ *
+ * 为什么 250 ms（原为 500）：大时间的冒号按**秒的奇偶**闪（1 s 一个周期），
+ * 采样间隔必须明显小于半个周期才看不出抖动；250 ms 下最坏相位误差 250 ms，
+ * 肉眼看上去就是均匀的 500 ms 亮 / 500 ms 灭。
+ *
+ * 为什么不是每帧刷：时间帧 10 s 才来一次，中间靠**板载 tick 自己递推秒**
+ * （见 src/uart_link.c 的 current_clock）。每帧都做字符串格式化毫无收益。
+ *
+ * ⚠ 值没变就不要调 PhoneUI_text_set —— 它内部会置脏，无条件调用等于
+ *   每 250 ms 强制重绘这几个 label（对帧率没影响，但没必要）。 */
+static void net_refresh(uint32 dt_ms)
+{
+	static uint32 acc = 0;
+	static char prev_hm[8] = "", prev_hh[4] = "", prev_mm[4] = "";
+	static char prev_date[40] = "", prev_wx[40] = "";
+	static int  prev_blink = -1;
+	acc += dt_ms;
+	if (acc < 250u)
+		return;
+	acc = 0;
+
+	char hm[8];
+	BoardNet_ClockHM(hm, (int)sizeof(hm));
+	if (strcmp(hm, prev_hm) != 0)
+	{
+		strcpy(prev_hm, hm);
+		for (int i = 0; i < status_clock_n; ++i)
+			if (status_clock[i] != NULL)
+				PhoneUI_text_set(status_clock[i], hm);
+	}
+
+	/* 大时间：小时、分钟分开刷（冒号单独处理） */
+	BoardNet_ClockHH(s_net_hh, (int)sizeof(s_net_hh));
+	if (strcmp(s_net_hh, prev_hh) != 0)
+	{
+		strcpy(prev_hh, s_net_hh);
+		if (home_clock_h != NULL)
+			PhoneUI_text_set(home_clock_h, s_net_hh);
+	}
+	BoardNet_ClockMM(s_net_mm, (int)sizeof(s_net_mm));
+	if (strcmp(s_net_mm, prev_mm) != 0)
+	{
+		strcpy(prev_mm, s_net_mm);
+		if (home_clock_m != NULL)
+			PhoneUI_text_set(home_clock_m, s_net_mm);
+	}
+	/* 冒号闪烁：亮时画 ":"，灭时画空串。
+	 * ⚠ 空串而不是空格 —— 这一格是独立 label，写空串不影响左右两格位置；
+	 *   写空格反而会留下一个看不见的宽度（无影响但没意义）。 */
+	int blink = BoardNet_ColonBlink();
+	if (blink != prev_blink)
+	{
+		prev_blink = blink;
+		if (home_clock_c != NULL)
+			PhoneUI_text_set(home_clock_c, blink ? ":" : "");
+	}
+
+	if (BoardNet_HasTime())
+	{
+		BoardNet_DateText(s_net_date, (int)sizeof(s_net_date));
+		if (strcmp(s_net_date, prev_date) != 0)
+		{
+			strcpy(prev_date, s_net_date);
+			if (home_date != NULL)
+				PhoneUI_text_set(home_date, s_net_date);
+		}
+	}
+
+	if (BoardNet_HasWeather())
+	{
+		BoardNet_WeatherText(s_net_wx, (int)sizeof(s_net_wx));
+		if (strcmp(s_net_wx, prev_wx) != 0)
+		{
+			strcpy(prev_wx, s_net_wx);
+			if (home_count != NULL)
+				PhoneUI_text_set(home_count, s_net_wx);
+		}
+	}
+}
+
 static void status_bar(GYOBJ parent)
 {
 	GYcolor ink = parent == app_page ? INK : WHITE;
-	PhoneUI_left_label(parent, 19, 4, 54, "9:41", ink, 2);
+	/* 状态栏时间：原来是硬编码 "9:41"，现在取 ESP32 的 NTP 时间。
+	 * 句柄要留着 —— status_bar 在首页和 app 页各调一次，net_refresh() 两边一起刷。 */
+	char clk[8];
+	BoardNet_ClockHM(clk, (int)sizeof(clk));
+	GYOBJ t = PhoneUI_left_label(parent, 19, 4, 54, clk, ink, 2);
+	if (status_clock_n < 2)
+		status_clock[status_clock_n++] = t;
 	GYOBJ icon = YMGUI_Creat_Obj_Creat(parent, 248, 3, 56, 18);
 	icon->bg_color = ink;
 	icon->draw_cb = status_draw;
@@ -1440,12 +1590,25 @@ static void build_home(void)
 		pages[i] = YMGUI_Creat_Obj_Creat(home_strip, W * i, 0, W, 408);
 		pages[i]->draw_cb = NULL;
 	}
-	PhoneUI_left_label(pages[0], 22, 9, 240, "09:41", WHITE, 1);
-	home_date = PhoneUI_left_label(pages[0], 25, 75, 272, T("9月29日  星期二"), RGB(232, 230, 243), 0);
+	/* 桌面大时间 / 日期 / 天气：原来全是硬编码，改成从 ESP32 上行链路取。
+	 * 没同步到时 board 层返回占位串（"--:--" / "未同步" / "等待天气"）。
+	 * 大时间是 **HH:MM + 冒号闪烁**（秒位不要了），三个 label 各自绝对定位 ——
+	 * 冒号那格闪成空串时，左右两格的位置不受任何影响。
+	 *
+	 * ⚠⚠ 宽度必须按**字体真实步进**给，不能拍脑袋（2026-10-08 踩过：给了 60px，
+	 *   而 display 字体一个数字就占 33px ⇒ 两个数字要 66px，第 2 位右边被裁掉）。
+	 *   实测（从 elf 里读 phone_font_display_advance 表，ASCII 段）：
+	 *     数字 '0'..'9' 步进 **33 px**，冒号 ':' 步进 **18 px**
+	 *   ⇒ 两数字 66px，故小时/分钟各给 **70px**（留 4px 余量）。
+	 *   参考：regular（状态栏那种）数字只有 9px，"23:35" 共 41px，54px 宽绰绰有余。 */
+	home_clock_h = PhoneUI_left_label(pages[0], 22, 9, 70, net_hh(), WHITE, 1);
+	home_clock_c = PhoneUI_left_label(pages[0], 90, 9, 22, ":", WHITE, 1);
+	home_clock_m = PhoneUI_left_label(pages[0], 110, 9, 70, net_mm(), WHITE, 1);
+	home_date = PhoneUI_left_label(pages[0], 25, 75, 272, net_date(), RGB(232, 230, 243), 0);
 	GYOBJ widget = PhoneUI_panel(pages[0], 22, 123, 276, 79, RGB(68, 71, 110));
 	widget->draw_cb = PhoneUI_glass_draw;
 	home_widget_title = PhoneUI_left_label(widget, 16, 11, 170, T("给生活留一点空白"), WHITE, 0);
-	home_count = PhoneUI_left_label(widget, 16, 40, 178, T("多云 / 22 C"), RGB(224, 224, 240), 2);
+	home_count = PhoneUI_left_label(widget, 16, 40, 178, net_weather(), RGB(224, 224, 240), 2);
 	GYOBJ weather = YMGUI_Creat_Obj_Creat(widget, 210, 12, 52, 52);
 	weather->draw_cb = PhoneUI_weather_draw;
 
@@ -2050,6 +2213,9 @@ void PhoneShell_BoardTick(uint32 elapsed_ms)
 	}
 	board_ime_step();
 	PhoneCalc_BoardProbe();   /* 计算器格式化探针：见 apps/calculator.c 顶部的注释 */
+	/* ESP32 上行链路：把 NTP 时间 / 天气刷进界面。内部自带 500 ms 节流，
+	 * 每帧调也没关系。放在 advance 之前，好让本拍的置脏由 advance 里的刷新完成。 */
+	net_refresh(elapsed_ms);
 	advance(elapsed_ms);
 	YMGUI_Refresh(ctx);
 }
