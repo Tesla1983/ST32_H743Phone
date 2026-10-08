@@ -102,6 +102,10 @@ int PhoneUI_text_width(const char* value, uint8 large);
 void PhoneUI_draw_text(GYSURFACE surface, const char* value, GYcolor color,
 					   uint8 large, int cx, int top);
 void PhoneUI_text_set(GYOBJ obj, const char* value);
+/* 与 label **当前内容**比较，不同才写回并置脏。
+ * 周期刷新一律用它 —— 用调用方自缓存 last 值做比较会在"别的路径改过 label"后
+ * 永久失同步（详见 phone_ui.c 里的长注释）。 */
+void PhoneUI_text_if_changed(GYOBJ obj, const char* value);
 GYOBJ PhoneUI_label_ex(GYOBJ parent, int x, int y, int w, const char* value,
 					   GYcolor color, uint8 large);
 GYOBJ PhoneUI_label(GYOBJ parent, int x, int y, int w, const char* value, GYcolor color);

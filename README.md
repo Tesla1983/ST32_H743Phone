@@ -20,8 +20,8 @@
 | 外部 Flash | **W25Q128**，16 MB | **QSPI**，memory-mapped（XIP）@ `0x9000_0000` |
 | FMC 内核时钟 | **220 MHz**（PLL2_R） | 现写时序 `ADDSET=2 / DATAST=4` |
 | LCD 背光 | 定时器 PWM 调光 | 调暗不再占用 CPU 画像素 |
-| 低速晶振 | **32.768 kHz（LSE，可用）** | `Y1` + 6 pF×2，接 PC14/PC15 |
-| VBAT | BAT54C 在 `VCC3.3` 与 `VBAT_IN` 间自动切换 | **板子未接后备电池** ⇒ 断电后 RTC 归零 |
+| 低速晶振 | **32.768 kHz（LSE，可用）** | `Y1` + 6 pF×2，接 PC14/PC15 ⇒ **已接 RTC**（`src/rtc_clock.c`） |
+| VBAT | BAT54C 在 `VCC3.3` 与 `VBAT_IN` 间自动切换 | **板子未接后备电池** ⇒ **真断电**后备份域（RTC + BKP）归零；但按复位键 / SWD reset / 看门狗复位时 VDD 没断 ⇒ RTC 时间与 BKP 标记**都保持** |
 | TF 卡槽 | Micro SD（**无卡检测脚**，只能靠 CMD0/CMD8 通信判断有没有卡） | **SDMMC1 4-bit**：D0–D3 = PC8–PC11、CLK = PC12、CMD = PD2，均 AF12 |
 
 > TF 卡引脚来自厂商「实验26 SD卡实验」的 `Drivers/BSP/SDMMC/sdmmc_sdcard.h`，
@@ -74,6 +74,8 @@ E:\ymgui-h743\
 │   ├─ sd_card.c/.h              # TF 卡：SDMMC1 4-bit 轮询驱动 + 写读比对自检（L2-1/2）
 │   ├─ fatfs_port.c/.h           # FatFs 的 diskio 适配 + 文件系统自检（L2-3）
 │   ├─ img_store.c/.h            # 图库：TF 卡 BMP → RGB565 → 灌 W25Q128 + 索引 + XIP 直读接口
+│   ├─ uart_link.c/.h            # ESP32 上行链路：USART6 收 $DT/$WD/$WF，自写 ISR（不走 HAL IT）
+│   ├─ rtc_clock.c/.h            # 板载 RTC（LSE 32.768 kHz）：跨复位保持时间，$DT 到达时校准
 │   └─ main.c                    # 主循环：各模块 tick + 产线动作调度 + 渲染
 ├─ tools\                        # 宿主机侧 Python 工具（读板上变量、抓屏、回归、灌库）
 ├─ ci\                           # 构建输入检查 + 固件可复现性闸门
@@ -337,12 +339,12 @@ LCD    0x6010_0000           FMC NE1 + A19 作 RS
 ## 8. 资源占用（出货形态）
 
 ```text
-FLASH   1 789 476 B  / 2 MB   85.32 %   （含 FatFs + CP936 转码表 + 图库 + ESP32 上行链路）
-DTCM       31 912 B  / 128 KB  24.35 %  （含 uart_link 的 512 B 环形缓冲 —— 无 DMA，放 CPU 私有区最快）
+FLASH   1 791 308 B  / 2 MB   85.42 %   （含 FatFs + CP936 转码表 + 图库 + ESP32 上行链路 + RTC）
+DTCM       31 824 B  / 128 KB  24.28 %  （含 uart_link 的 512 B 环形缓冲 —— 无 DMA，放 CPU 私有区最快）
 SRAM1      10 752 B  / 128 KB   8.20 %  （TF 卡 4 KB 缓冲 + 图库 .bss_img 6 KB + DMA 台架 512 B）
 SRAM2      62 000 B  / 128 KB  47.30 %  （IME 词典索引）
 SRAM3       20 KB    /  32 KB  62.50 %
-text 1 785 300 / data 4 168 / bss 645 264（bss 含 AXI 的 .bss_sd_dma 512 KB 段）
+text 1 787 132 / data 4 168 / bss 645 176（bss 含 AXI 的 .bss_sd_dma 512 KB 段）
 heap0 峰值  32 832 B /  52.0 KB  66 %
 heap1 峰值  71 432 B / 204.0 KB  34 %   （复位后干净态；跑过导入/文件系统后会涨，那是累计值）
 ```
@@ -385,7 +387,7 @@ heap1 峰值  71 432 B / 204.0 KB  34 %   （复位后干净态；跑过导入/�
 | 16 个 APP 仍是演示态 | 文件系统已通、**相册已接真图**（BMP → W25Q128 → XIP 显示）；笔记/短信/文件管理器仍要改成读写卡上的真实文件 |
 | 相册只认 BMP | BMP 解码器 ~4.5 KB FLASH、逐行流式，先把它跑通（A10）。**JPEG 未做**：H743 自带硬件 JPEG + DMA2D，但硬件不做缩放、输出缓冲照样占内存（284×230 RGB565 = 130 640 B）⇒ 要么卡上预缩到 ≤240×180，要么自己写降采样 |
 | FLASH 85.32% 偏高 | `ffunicode.c` 里 `uni2oem936` + `oem2uni936` 两张 GBK 表占 **174 KB**。空间吃紧时把 `FF_CODE_PAGE` 从 936 改成 437 可省 ~170 KB，代价是中文文件名变乱码 |
-| 时间/天气只在收到帧后才可信 | 时间来自 ESP32 的 NTP（本工程**没编 RTC 驱动**）⇒ 掉电重启后要等首帧 `$DT`；之前显示占位 `--:--`。天气帧 **30 min** 一帧，开机后最坏要等半小时才有真实天气（期间显示占位"等待天气"）；想更快可以改对端 `CONFIG_UPLINK_WEATHER_INTERVAL_S` |
+| 时间**真断电**后要重等首帧 `$DT` | 时间源：板载 RTC（LSE）+ ESP32 的 NTP 校准。**复位**（按键 / SWD / 看门狗）时 VDD 不断、备份域保持 ⇒ 立刻有正确时间；**拔电**则备份域丢失（板上无后备电池）⇒ 要等首帧 `$DT` 才可信，之前显示占位 `--:--`。天气帧 **30 min** 一帧，最坏等半小时才有真实天气（期间显示"等待天气"）；想更快改对端 `CONFIG_UPLINK_WEATHER_INTERVAL_S` |
 | `$WD` 的 pm25 / aqi 收下了但没上屏 | 解析与诊断量都有（`g_net_pm25`/`g_net_aqi`），界面暂时只用了温度+天气文本+码。要展示空气质量得先设计放哪 |
 | 对端日志与帧混在同一行 | ESP32 的 `printf` 日志也走 UART2，`$DT` 帧前面带一整段日志前缀。当前解析取行内最后一个 `$`，工作正常；若将来对端日志里出现 `$`，需要在对端改成"只发帧" |
 

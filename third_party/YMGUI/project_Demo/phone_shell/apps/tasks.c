@@ -1,5 +1,6 @@
 #include "phone_ui.h"
 #include "phone_host.h"
+#include "phone_shell_board.h"   /* BoardNet_DateText：头部日期取真实时间（不再写死） */
 
 typedef struct
 {
@@ -83,7 +84,10 @@ static void on_add_task(GYOBJ btn)
 static void app_create(GYOBJ view)
 {
 	state = (AppState){.task_count = 3};
-	PhoneUI_app_header(view, "待办", "9月29日  星期二");
+	/* 头部日期取上行链路的真实日期；未同步时 board 层给 "未同步" 占位串。 */
+	char today[40];
+	BoardNet_DateText(today, (int)sizeof(today));
+	PhoneUI_app_header(view, "待办", today);
 	GYOBJ progress = PhoneUI_panel(view, 18, 66, 284, 62, RGB(229, 242, 238));
 	state.task_summary = PhoneUI_left_label(progress, 14, 7, 254, "已完成 0 / 3 项", RGB(44, 126, 106), 0);
 	state.task_progress = YMGUI_Creat_Bar_Creat(progress, 15, 40, 254, 4);

@@ -146,8 +146,9 @@ static void status_draw(GYOBJ obj, GYSURFACE surface, const GYrect* area)
  *
  * ⚠ 静态缓冲的代价：不能同时持有两次返回值（phone_shell 里不会这么用）。
  *
- * net_date()/net_weather() 在**没同步到**时仍返回原翻译文案（T(...)），
- * 于是切语言照常生效、界面也不会突然冒出"等待天气"这种半成品字样。 */
+ * net_date()/net_weather() 一律返回 board 层的真实结果并过一遍 T()：
+ * 已同步 → "10月9日 星期五" / "晴 / 15℃"（表里没有，原样输出）；
+ * 未同步 → "未同步" / "等待天气"（表里有，英文模式下会翻）。 */
 
 static char s_net_hms[12], s_net_date[40], s_net_wx[40];
 static char s_net_hh[4], s_net_mm[4];
@@ -168,24 +169,23 @@ static const char* net_mm(void)
 	return s_net_mm;
 }
 
+/* 日期 / 天气文本：**总是**返回 board 层的真实结果（未同步时是占位串
+ * "未同步" / "等待天气"），再交给 T() 走翻译 —— 表里查得到就翻，查不到原样。
+ *
+ * ⚠ 2026-10-09 改动：原来没同步时返回硬编码的 T("9月29日  星期二") /
+ *   T("多云 / 22 C")。那是**假数据**：屏幕上看不出"没同步"和"真是这一天"的区别，
+ *   而且一旦有别的路径把这个假值写进 label，周期刷新就再也纠正不回来
+ *   （实测就是日期永久停在 "9月29日 星期二"）。占位串才是诚实的表达。 */
 static const char* net_date(void)
 {
-	if (BoardNet_HasTime())
-	{
-		BoardNet_DateText(s_net_date, (int)sizeof(s_net_date));
-		return s_net_date;
-	}
-	return T("9月29日  星期二");
+	BoardNet_DateText(s_net_date, (int)sizeof(s_net_date));
+	return T(s_net_date);
 }
 
 static const char* net_weather(void)
 {
-	if (BoardNet_HasWeather())
-	{
-		BoardNet_WeatherText(s_net_wx, (int)sizeof(s_net_wx));
-		return s_net_wx;
-	}
-	return T("多云 / 22 C");
+	BoardNet_WeatherText(s_net_wx, (int)sizeof(s_net_wx));
+	return T(s_net_wx);
 }
 
 /* 每 250 ms 把上行链路的数据刷进界面。
@@ -202,71 +202,35 @@ static const char* net_weather(void)
 static void net_refresh(uint32 dt_ms)
 {
 	static uint32 acc = 0;
-	static char prev_hm[8] = "", prev_hh[4] = "", prev_mm[4] = "";
-	static char prev_date[40] = "", prev_wx[40] = "";
-	static int  prev_blink = -1;
 	acc += dt_ms;
 	if (acc < 250u)
 		return;
 	acc = 0;
 
+	/* ⚠ 下面一律用 PhoneUI_text_if_changed（与 label 现值比较），**不要**改回
+	 *   "本函数自己缓存上一次写入的字符串"：
+	 *   PhoneHost_RefreshLanguage() 会在切语言时整体重设桌面小组件（含日期/天气），
+	 *   自带缓存的话，缓存里仍是刷新时写的真值、label 却已被换成别的 ⇒ 比较恒等
+	 *   ⇒ 日期永久停在切语言那一刻的内容（2026-10-09 实测：数据层 10/9/5 正确，
+	 *   屏幕一直显示硬编码 "9月29日 星期二"）。 */
+
 	char hm[8];
 	BoardNet_ClockHM(hm, (int)sizeof(hm));
-	if (strcmp(hm, prev_hm) != 0)
-	{
-		strcpy(prev_hm, hm);
-		for (int i = 0; i < status_clock_n; ++i)
-			if (status_clock[i] != NULL)
-				PhoneUI_text_set(status_clock[i], hm);
-	}
+	for (int i = 0; i < status_clock_n; ++i)
+		PhoneUI_text_if_changed(status_clock[i], hm);
 
 	/* 大时间：小时、分钟分开刷（冒号单独处理） */
 	BoardNet_ClockHH(s_net_hh, (int)sizeof(s_net_hh));
-	if (strcmp(s_net_hh, prev_hh) != 0)
-	{
-		strcpy(prev_hh, s_net_hh);
-		if (home_clock_h != NULL)
-			PhoneUI_text_set(home_clock_h, s_net_hh);
-	}
+	PhoneUI_text_if_changed(home_clock_h, s_net_hh);
 	BoardNet_ClockMM(s_net_mm, (int)sizeof(s_net_mm));
-	if (strcmp(s_net_mm, prev_mm) != 0)
-	{
-		strcpy(prev_mm, s_net_mm);
-		if (home_clock_m != NULL)
-			PhoneUI_text_set(home_clock_m, s_net_mm);
-	}
+	PhoneUI_text_if_changed(home_clock_m, s_net_mm);
 	/* 冒号闪烁：亮时画 ":"，灭时画空串。
 	 * ⚠ 空串而不是空格 —— 这一格是独立 label，写空串不影响左右两格位置；
 	 *   写空格反而会留下一个看不见的宽度（无影响但没意义）。 */
-	int blink = BoardNet_ColonBlink();
-	if (blink != prev_blink)
-	{
-		prev_blink = blink;
-		if (home_clock_c != NULL)
-			PhoneUI_text_set(home_clock_c, blink ? ":" : "");
-	}
+	PhoneUI_text_if_changed(home_clock_c, BoardNet_ColonBlink() ? ":" : "");
 
-	if (BoardNet_HasTime())
-	{
-		BoardNet_DateText(s_net_date, (int)sizeof(s_net_date));
-		if (strcmp(s_net_date, prev_date) != 0)
-		{
-			strcpy(prev_date, s_net_date);
-			if (home_date != NULL)
-				PhoneUI_text_set(home_date, s_net_date);
-		}
-	}
-
-	if (BoardNet_HasWeather())
-	{
-		BoardNet_WeatherText(s_net_wx, (int)sizeof(s_net_wx));
-		if (strcmp(s_net_wx, prev_wx) != 0)
-		{
-			strcpy(prev_wx, s_net_wx);
-			if (home_count != NULL)
-				PhoneUI_text_set(home_count, s_net_wx);
-		}
-	}
+	PhoneUI_text_if_changed(home_date, net_date());
+	PhoneUI_text_if_changed(home_count, net_weather());
 }
 
 static void status_bar(GYOBJ parent)
@@ -1956,10 +1920,14 @@ void PhoneHost_RefreshLanguage(void)
 		PhoneUI_text_set(app_title, T(PhoneApps_Get(current_app)->title));
 	}
 
-	/* 桌面小组件 */
-	if (home_date != NULL)         { PhoneUI_text_set(home_date, T("9月29日  星期二")); }
+	/* 桌面小组件。
+	 * ⚠ 日期与天气**不要**写死文案 —— 它们是上行链路的实时数据，
+	 *   写死会把真值覆盖掉（且周期刷新当时用的是自带缓存，覆盖后再也纠正不回来，
+	 *   2026-10-09 实测即为此 bug：日期永久显示 "9月29日 星期二"）。
+	 *   这里改成取 net_date()/net_weather()：切语言照样生效，内容仍是真的。 */
+	if (home_date != NULL)         { PhoneUI_text_set(home_date, net_date()); }
 	if (home_widget_title != NULL) { PhoneUI_text_set(home_widget_title, T("给生活留一点空白")); }
-	if (home_count != NULL)        { PhoneUI_text_set(home_count, T("多云 / 22 C")); }
+	if (home_count != NULL)        { PhoneUI_text_set(home_count, net_weather()); }
 	if (home_music_title != NULL)  { PhoneUI_text_set(home_music_title, T("晚间海浪")); }
 	if (home_music_status != NULL) { PhoneUI_text_set(home_music_status, T("Yaomi 音乐 / 已暂停")); }
 

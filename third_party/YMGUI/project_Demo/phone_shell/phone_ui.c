@@ -1,6 +1,8 @@
 #include "phone_ui.h"
 #include "phone_shell_board.h"   /* BoardNet_WeatherCode()（只有板级构建才有） */
 
+#include <string.h>              /* strcmp：PhoneUI_text_if_changed 用 */
+
 static const GYfont* fonts[] = {&phone_font_regular, &phone_font_display, &phone_font_small, &phone_font_title};
 static const uint8* font_advances[] = {phone_font_regular_advance, phone_font_display_advance,
 									   phone_font_small_advance, phone_font_title_advance};
@@ -169,6 +171,31 @@ void PhoneUI_text_set(GYOBJ obj, const char* value)
 		t->value[end] = 0;
 	}
 	YMGUI_Obj_Invalidate(obj);
+}
+
+/* 只在**内容真的变了**时才写回并置脏。
+ *
+ * 【为什么不能各自记一份"上次写入的字符串"】
+ *   周期性刷新（上行链路的时间/日期/天气）若用调用方自己缓存的 last 值做比较，
+ *   一旦有别的路径直接改了 label（例如 PhoneHost_RefreshLanguage 在切语言时
+ *   把桌面小组件整体重设一遍），缓存就与 label 实际内容脱钩：缓存仍是旧值、
+ *   label 却已被改掉 ⇒ 比较恒等 ⇒ **永远不再刷新**。
+ *   2026-10-09 实测现象即此：链路数据层 g_net_mon/mday/wday = 10/9/5 全对，
+ *   屏幕上却一直显示切语言时写入的硬编码 "9月29日 星期二"。
+ *   ⇒ 判据必须是 **label 当前内容**（PhoneText.value），它才是唯一真源。 */
+void PhoneUI_text_if_changed(GYOBJ obj, const char* value)
+{
+	PhoneText* t;
+	if (obj == NULL)
+		return;
+	t = (PhoneText*)obj->user_data;
+	if (t == NULL)
+		return;
+	if (value == NULL)
+		value = "";
+	if (strcmp(t->value, value) == 0)
+		return;                       /* 一致：不置脏，省一次重绘 */
+	PhoneUI_text_set(obj, value);
 }
 
 GYOBJ PhoneUI_label_ex(GYOBJ parent, int x, int y, int w, const char* value,

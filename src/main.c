@@ -57,6 +57,7 @@
 #include "fatfs_port.h"
 #include "img_store.h"
 #include "uart_link.h"
+#include "rtc_clock.h"
 #include "app_config.h"
 
 /* ---- 供 SWD 直接读的指示量（地址用 arm-none-eabi-nm 查）----
@@ -732,6 +733,15 @@ int main(void)
      *   记进 g_uart_rc 就返回，UI 上时间显示"--:--"、天气显示"等待天气"。
      * 判据看 g_uart_rx_bytes 有没有在涨、g_uart_err_fe 是不是 0。 */
     (void)uart_link_init(115200u);
+
+    /* ---- 板载 RTC（LSE 32.768 kHz，原理图 Y1 / PC14-PC15）2026-10-09 ----
+     * 解决"每次复位都要等首帧 $DT 才有时间与日期"：VDD 不断时备份域保持，
+     * 复位后 RTC 直接给出正确时间（$DT 到达后再校准一次）。
+     * ⚠ 最多阻塞约 1.5 s 等 LSE 起振（实测本板 <300 ms）；起不来会回退 LSI，
+     *   两者都失败只记 g_rtc_rc 并返回，**不影响任何其他功能**
+     *   —— 此时时间退回 uart_link 的 tick 递推（旧行为）。
+     * 判据：g_rtc_rc=0 / g_rtc_src=0(LSE) / g_rtc_valid=1 / g_rtc_sets 在涨。 */
+    (void)Rtc_Init();
 
     uint32_t last_cyc = DWT->CYCCNT;
 

@@ -61,6 +61,9 @@ static const PhoneLangEntry s_dict[] =
     { "9月29日  星期二",        "Sep 29  Tue" },
     { "给生活留一点空白",       "Leave a little room" },
     { "多云 / 22 C",            "Cloudy / 22 C" },
+    /* 上行链路未同步时 board 层给这两个占位串（真实数据查不到表 ⇒ 原样显示） */
+    { "未同步",                 "Not synced" },
+    { "等待天气",               "Waiting for weather" },
     { "晚间海浪",               "Evening waves" },
     { "Yaomi 音乐 / 播放中",    "Yaomi Music / Playing" },
     { "Yaomi 音乐 / 已暂停",    "Yaomi Music / Paused" },

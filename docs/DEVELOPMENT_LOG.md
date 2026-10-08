@@ -1703,3 +1703,90 @@ FLASH **1 785 300 B（85.13%）**，比上一版 +1 376 B。CI 参考哈希按 a
 
 > 注：`phone_shell/README.md` 是上游 Demo 的说明文档，此处只做**增量补注**（加一句
 > "本工程新增"），没有改动它对上游行为的原始描述。
+
+---
+
+## 2026-10-09 · 修复"重启后日期显示默认" + 接入板载 RTC（LSE）
+
+### 1. 用户报的现象
+
+时间是对的（NTP 上行链路在跑），但**日期显示成默认值**，重启后也不会变成当前日期。
+
+### 2. 取证：先分清"数据层错"还是"显示层错"
+
+两条独立证据，先定位在哪一层，避免改错地方：
+
+| 证据 | 命令 | 结果 |
+| --- | --- | --- |
+| 数据层 | `tools/read_vars.py g_net_year g_net_mon g_net_mday g_net_wday` | `2026 / 10 / 9 / 5`（星期五）—— **全对**，`$DT` 帧 397 帧在涨 |
+| 显示层 | `tools/clock_shot.py` → `build/clock_date.png` | 桌面日期 = **"9月29日 星期二"** |
+
+⇒ 链路解析、时区换算都没问题，**缺陷在 UI 层**。
+
+### 3. 根因：两处叠加，缺一不可
+
+1. `phone_shell.c` 的 `net_refresh()` 每 250 ms 刷一次日期/天气，但**用自己缓存的
+   `prev_date` / `prev_wx`** 与 board 层返回值比较，相同就不写 label。
+2. `PhoneHost_RefreshLanguage()`（切语言时调用）把 `home_date` / `home_count`
+   **无条件写回硬编码文案** `T("9月29日  星期二")` / `T("多云 / 22 C")`。
+
+覆盖之后，`net_refresh` 的缓存里仍是上一次写入的真值，于是比较**恒等** ⇒ 再也不刷新
+⇒ 日期永久停在切语言那一刻的内容。天气同一 bug（只是用户先注意到了日期）。
+
+> 为什么这次不是"改一行就算完"：只把 `RefreshLanguage` 改成取真值，缓存失同步这条
+> 耦合缺陷仍然在（下次任何第三方路径改 label 就会复发）。所以修的是**判据本身**。
+
+### 4. 修法：判据改成 label 当前内容
+
+新增 `PhoneUI_text_if_changed(GYOBJ, const char*)`（`phone_ui.c/.h`）：
+与 `PhoneText.value`（label 当前内容，唯一真源）比较，不同才写回并置脏。
+所有周期刷新一律走它，删掉调用方自己的 `prev_*` 缓存：
+
+| 文件 | 改动 |
+| --- | --- |
+| `phone_ui.c/.h` | 新增 `PhoneUI_text_if_changed`（含"为什么不能用自缓存"的长注释） |
+| `phone_shell.c` | `net_refresh()` 删掉 5 个 `prev_*` 缓存，全部改走新函数；`PhoneHost_RefreshLanguage()` 的日期/天气改成 `net_date()` / `net_weather()` |
+| `phone_shell.c` | `net_date()` / `net_weather()` 未同步时**不再返回假日期/假天气**，改回 board 层的占位串（"未同步" / "等待天气"）—— 假数据在屏幕上看不出"没同步"和"真是这天"的区别 |
+| `phone_lang.c` | 补两条词条 `未同步 / 等待天气`（英文模式下也翻） |
+| `phone_shade.c` | 控制中心同样改用新函数，删掉 `s_shade_*_prev`；创建时的硬编码 fallback 去掉 |
+| `apps/tasks.c` | 待办页头部日期改 `BoardNet_DateText()`（原来写死 "9月29日  星期二"） |
+
+### 5. 根本解：接入板载 RTC（LSE 32.768 kHz）
+
+原来时间是"$DT 帧 + 板载 tick 递推"，**每次复位都要重新等首帧 $DT（最长 10 s）**，
+而且递推只累加当日秒数、日期不会自己跨天。板上有 32.768 kHz 晶振（原理图 `Y1`，
+PC14/PC15）就该用起来 ⇒ 新增 `src/rtc_clock.c/.h` + HAL 的 `hal_rtc` / `hal_rtc_ex`。
+
+三条实现上的坑（都写在 `rtc_clock.c` 文件头）：
+
+1. **不要无条件重选 RTC 时钟源**。`HAL_RCCEx_PeriphCLKConfig` 选源时会置
+   `RCC_BDCR.BDRST`，**复位整个备份域** —— 对"VDD 没断、RTC 正在走"的板子再选一次，
+   正好把要保住的时间和 BKP 标记清掉。⇒ 先读 `RCC->BDCR.RTCSEL`，非 0 就只开 RTCEN。
+2. **`HAL_RTC_GetTime` 之后必须紧跟 `HAL_RTC_GetDate`**（影子寄存器解锁），
+   反过来读会拿到陈旧值（表现为"分钟不动"）。
+3. **预分频要匹配时钟源**：LSE (127+1)×(255+1)=32768；回退 LSI 时 (127+1)×(249+1)=32000。
+
+其余设计：BKP_DR0 存 `0x594D4752`（'YMGR'）+ 年份合理性（2024..2099）双判据决定
+`Rtc_IsValid()`；`$DT` 到达时校准但**偏差 ≤2 s 不写**（少停表、也不把网络抖动写进去）；
+`BoardNet_HasTime()` / `current_clock()` / `BoardNet_DateText()` 一律**优先 RTC**，
+tick 递推降为 fallback。
+
+> ⚠ **物理限制（不是软件能解决的）**：板上 VBAT 经 BAT54C 从 VDD 取电，**没有后备电池**。
+> 所以"拔电"后备份域归零、仍要等首帧 `$DT`；而**按复位键 / SWD reset / 看门狗复位**时
+> VDD 一直在 ⇒ RTC 与 BKP 都保持 —— 用户说的"重启"属后者，这一条已解决。
+
+### 6. 验收（全部整数判据 + 上屏）
+
+| 项 | 判据 | 结果 |
+| --- | --- | --- |
+| RTC 初始化 | `g_rtc_rc=0`、`g_rtc_src=0`（LSE，不是 LSI 回退） | PASS |
+| **RTC 跨复位保持** | **复位后约 2 s 读：`g_net_dt_pkts=0`（一帧 $DT 都还没收到）而 `g_rtc_valid=1`、`g_rtc_sets=0`** | PASS |
+| 日期上屏 | `clock_shot.py` → `build/clock_date.png` = "10月9日 星期五" | PASS |
+| 切语言回归 | `tools/lang_check.py` 三项全 PASS（中→英→重启→切回中文），之后日期仍正确 | PASS |
+| 板上镜像 | `tools/verify_board_image.py` → 机内 flash 1 791 308 B 与本地 bin **逐字节一致** | PASS |
+| 资源 | FLASH 1 791 308 B（85.42%），比第五版 +1 832 B | — |
+
+CI 参考哈希已更新为第六版（`bef0f3e0…` / `b9f3fdd7…`），旧第五版两行按规矩注释掉。
+
+> ⚠ 抓屏前必须 `g_frame_mirror=1` + `g_force_redraw=1` 并等 ≥0.3 s，否则抓到的老帧
+> 会让人误判"没修好"（静止时脏区为空，YMGUI_Refresh 直接 return）。

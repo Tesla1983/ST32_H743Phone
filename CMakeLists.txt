@@ -236,6 +236,11 @@ set(APP_SRC
 	# ⚠ 不能走 HAL 的 IT 接收 —— 厂商 usart.c 占着 HAL_UART_RxCpltCallback 与
 	#   HAL_UART_MspInit 两个全局符号，详见 src/uart_link.h 顶部。
 	src/uart_link.c
+	# 板载 RTC（2026-10-09）：LSE 32.768 kHz（原理图 Y1，PC14/PC15）→ RTC。
+	# 解决"每次复位都要等 ESP32 首帧 $DT 才有时间/日期"的结构性缺陷：
+	# VDD 不断时备份域保持，重启后立即有正确时间。⚠ 板子**没有后备电池**
+	# （VBAT 经 BAT54C 从 VDD 取电），真断电仍会归零 —— 详见 src/rtc_clock.h 顶部。
+	src/rtc_clock.c
 	# 图库（2026-10-08）：TF 卡上的 BMP → RGB565 → 灌 W25Q128 → XIP 直读显示。
 	# 流式处理，峰值 RAM 只有 6 KB，与图片尺寸无关（详见 src/img_store.h 顶部）。
 	src/img_store.c
@@ -379,6 +384,11 @@ set(HAL_SRC
 	# HAL 的 FMC 封装在 LL 层：HAL_SRAM_Init 会调 FMC_NORSRAM_Init /
 	# FMC_NORSRAM_Timing_Init / FMC_NORSRAM_Extended_Timing_Init，缺了会 undefined reference
 	${TP}/STM32H7xx_HAL_Driver/Src/stm32h7xx_ll_fmc.c
+	# RTC（2026-10-09）：板载 32.768 kHz 晶振 Y1 → LSE → RTC，让时间/日期
+	# 在**复位后立即可用**，不再等 ESP32 首帧 $DT。_ex 提供 BKP 寄存器读写
+	# （HAL_RTCEx_BKUPRead/Write），本模块用 BKP_DR0 记"备份域已校准"标记。
+	${TP}/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_rtc.c
+	${TP}/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_rtc_ex.c
 )
 
 # ---- YMGUI 库本体（12 个可移植层，GLOB 与官方同口径）----

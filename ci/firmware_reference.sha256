@@ -130,5 +130,26 @@
 #     满负载整帧 10.92 ms / 91.6 FPS（复位后干净态，与上一基准 10.91 ms 持平）。
 #     ⚠ 测帧率前必须 reset —— 跑过 img_check/fs_check 后同一份固件会读到 ~12.5 ms。
 # FLASH 1 789 476 B（85.32%），比第四版 +5 552 B。
-895f86526941344cf27eb2650d47d72efea5c20f4878a71f97b121cf14c924cb  ymgui-h743.bin
-870daf163a00f1be7d9b15fa3e8b3a7a5c54a4460d3d0991ed7a6d4bd0ffd102  ymgui-h743.elf
+# 895f86526941344cf27eb2650d47d72efea5c20f4878a71f97b121cf14c924cb  ymgui-h743.bin
+# 870daf163a00f1be7d9b15fa3e8b3a7a5c54a4460d3d0991ed7a6d4bd0ffd102  ymgui-h743.elf
+
+# ---- 第六版（2026-10-09）：板载 RTC（LSE）+ 桌面日期显示缺陷修复 ----
+#
+# 为什么变（按上面「更新时机」的 a：有意为之的功能改动）：
+#   1. 新增 src/rtc_clock.c/.h + HAL 的 hal_rtc / hal_rtc_ex ⇒ 时间不再只靠
+#      ESP32 的 $DT 帧 + 板载 tick 递推，复位后立即可用（VDD 不断则备份域保持）。
+#   2. 修 UI 缺陷：桌面日期/天气原先在切语言时被 PhoneHost_RefreshLanguage()
+#      写回硬编码文案，而周期刷新用的是"自带缓存值"做比较 ⇒ 覆盖后永久失同步。
+#      改为与 label 现值比较（PhoneUI_text_if_changed）。
+#
+# 板上实测（复位后约 2 s，即**首帧 $DT 到达之前**读）：
+#   g_rtc_rc=0 · g_rtc_src=0（LSE，非 LSI 回退）· g_rtc_valid=1 · g_rtc_sets=0
+#   g_net_dt_pkts=0（此时一帧 $DT 都还没收到）⇒ RTC 确实跨复位保持。
+# 抓屏：桌面日期 "10月9日 星期五"；跑过 tools/lang_check.py（中→英→重启→中）
+#   之后日期仍为该值 ⇒ 切语言不再覆盖实时日期。
+#
+# 回归：lang_check 三项全 PASS（交互 / 扇区 240 落盘 CRC / 掉电重启保持）；
+#   clock_shot 状态栏与大时间与 $DT 一致、天气链路正常。
+# FLASH 1 791 308 B（85.42%），比第五版 +1 832 B。
+bef0f3e0136c294ea565e575508717b22a393296f52359296a124fccd12b4b87  ymgui-h743.bin
+b9f3fdd702bec03171fb9715105e3917f738ffa961df75771950e2ea84c7d0f9  ymgui-h743.elf

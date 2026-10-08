@@ -12,7 +12,6 @@ static GYCTX ctx;
  * 句柄存下来，由 PhoneShade_Update 每 500 ms 刷。 */
 static GYOBJ shade_clock, shade_date;
 static char s_shade_hm[8], s_shade_date[40];
-static char s_shade_hm_prev[8], s_shade_date_prev[40];
 static uint32 s_shade_acc;
 static GYOBJ trigger, overlay, sheet, tiles[PHONE_QUICK_CAPACITY], bright, cards[2], empty, preview, preview_image;
 static int enabled, visible, closing, start_y, drag_origin, dragging;
@@ -347,21 +346,14 @@ void PhoneShade_Update(int allow)
 		return;
 	s_shade_acc = 0;
 
+	/* ⚠ 判据是 label **当前内容**（PhoneUI_text_if_changed），不是本文件自己缓存
+	 *   的 s_shade_*_prev —— 缓存与 label 脱钩后会永久失同步，见 phone_ui.c 的
+	 *   长注释（2026-10-09 桌面日期就是这么卡住的）。 */
 	BoardNet_ClockHM(s_shade_hm, (int)sizeof(s_shade_hm));
-	if (shade_clock && strcmp(s_shade_hm, s_shade_hm_prev) != 0)
-	{
-		strcpy(s_shade_hm_prev, s_shade_hm);
-		PhoneUI_text_set(shade_clock, s_shade_hm);
-	}
-	if (BoardNet_HasTime())
-	{
-		BoardNet_DateText(s_shade_date, (int)sizeof(s_shade_date));
-		if (shade_date && strcmp(s_shade_date, s_shade_date_prev) != 0)
-		{
-			strcpy(s_shade_date_prev, s_shade_date);
-			PhoneUI_text_set(shade_date, s_shade_date);
-		}
-	}
+	PhoneUI_text_if_changed(shade_clock, s_shade_hm);
+
+	BoardNet_DateText(s_shade_date, (int)sizeof(s_shade_date));
+	PhoneUI_text_if_changed(shade_date, s_shade_date);
 }
 void PhoneShade_SetWifi(int on)
 {
@@ -400,10 +392,9 @@ void PhoneShade_Init(GYCTX context)
 	BoardNet_ClockHM(s_shade_hm, (int)sizeof(s_shade_hm));
 	shade_clock = PhoneUI_left_label(sheet, 18, 27, 165, s_shade_hm, WHITE, 3);
 	PhoneUI_left_label(sheet, 196, 33, 110, "控制中心", WHITE, 0);
-	if (BoardNet_HasTime())
-		BoardNet_DateText(s_shade_date, (int)sizeof(s_shade_date));
-	else
-		snprintf(s_shade_date, sizeof(s_shade_date), "%s", "9月29日 星期二");
+	/* 未同步时 board 层给 "未同步" 占位串，**不要**在这里写死一个假日期 ——
+	 * 假日期与真日期在屏幕上无法区分（2026-10-09 修复）。 */
+	BoardNet_DateText(s_shade_date, (int)sizeof(s_shade_date));
 	shade_date = PhoneUI_left_label(sheet, 18, 65, 176, s_shade_date, RGB(162, 174, 198), 2);
 	if (PhoneQuick_Count() > 8)
 	{
