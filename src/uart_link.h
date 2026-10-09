@@ -1,10 +1,19 @@
 /* ===========================================================================
  * ESP32 ↔ STM32H743 串口链路（USART6 / PC6-TX / PC7-RX，115200 8N1）
  *
- * 接线（用户 2026-10-08 确认，已连好）：
- *   PC6 (USART6_TX) → ESP32 GPIO16 (UART2_RX)
- *   PC7 (USART6_RX) ← ESP32 GPIO17 (UART2_TX)
+ * 接线：
+ *   PC6 (USART6_TX) → 对端帧口的 RX
+ *   PC7 (USART6_RX) ← 对端帧口的 TX
  *   GND ↔ GND
+ *
+ * ⚠ 2026-10-09 实测更正：对端**帧口默认是 UART0 = GPIO1(TX)/GPIO3(RX)**，
+ *   不是原来以为的 GPIO17。判据 = 板上 g_uart_line 里出现过完全不含 '$' 的
+ *   纯日志行（`I (62165694) wifi_sta: [状态] 已连接 ...`），说明 PC7 上跑的
+ *   一直是 ESP32 的 console 日志流；界面上的时间靠"取最后一个 '$'"从日志行里
+ *   抠出来，属于**靠巧合工作**。对端已重写串口层（帧/日志分口），
+ *   详见 E:\workbuddy\esp32-com8\docs\UPLINK-NTP-WEATHER.md 第六节。
+ *   修完之后 g_uart_line 收到的是 `$DT,1791533908,2026-10-09,16:18:28,5*25`
+ *   这种 39 字节纯帧（此前是 100~148 字节的日志行）。
  *
  * 对端固件与协议出自 E:\workbuddy\esp32-com8（docs/UPLINK-NTP-WEATHER.md）。
  * 帧格式（NMEA 风格，'\r\n' 结尾）：
