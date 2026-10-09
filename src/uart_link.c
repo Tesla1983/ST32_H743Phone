@@ -1116,3 +1116,41 @@ int BoardNet_WeatherCode(void)
 {
     return g_net_code;
 }
+
+/* ---- WiFi 链路状态 ----
+ * 三态而非两态：界面上"还不知道"（开机到首帧 $WF 之前，约几十秒）
+ * 和"已知断开"必须长得不一样，否则用户会把未同步误读成断网。
+ * 判据是 g_net_wf_pkts —— $WF 只在状态变化时发，收到过一帧就说明链路说过了话。 */
+int BoardNet_WifiUp(void)
+{
+    if (g_net_wf_pkts == 0u) return -1;
+    return g_net_wf_up ? 1 : 0;
+}
+
+int BoardNet_WifiRssi(void)
+{
+    if (g_net_wf_pkts == 0u) return 0;
+    return g_net_wf_rssi;
+}
+
+/* RSSI → 格数。阈值按常见家用路由器的实际观感取：
+ *   ≥ -55 dBm 满格（贴着路由器）
+ *   ≥ -70     两格（正常室内）      ← 本板实测 -76 落在下一档
+ *   ≥ -85     一格（勉强能连）
+ *   < -85     零格（只画底座圆点，连上但很虚）
+ * 手机系统一般也是这个量级，不必精确到 dBm。 */
+int BoardNet_WifiBars(void)
+{
+    if (g_net_wf_pkts == 0u) return -1;
+    if (!g_net_wf_up)        return 0;
+    int r = g_net_wf_rssi;
+    if (r >= -55) return 3;
+    if (r >= -70) return 2;
+    if (r >= -85) return 1;
+    return 0;
+}
+
+const char* BoardNet_WifiIp(void)
+{
+    return g_net_wf_ip;
+}

@@ -40,7 +40,7 @@
 | `YMGUI/GUI/YMGUI_Event.c` | 事件分发（注意：`sendEvent` **不冒泡**、`event_cb == NULL` **静默丢弃**） |
 | `YMGUI/WIDGET/YMGUI_EditView.c` / `TextInput.c` | 输入法相关的编辑控件 |
 | `project_Demo/phone_shell/apps/settings.c` | **自建滚动容器 + 自绘滚动条** —— 上游 YMGUI **没有滚动条控件**（引擎只有对象级 `scroll_y` 与 `ClipChildren`；`List`/`EditView`/`TextView`/`Table`/`Grid` 都能滚但都不画条）。本页把七项卡片改可滚动并补了一根 3 px 灰条。上游若新增同类控件，这里最可能冲突；用法与几何算式见 `docs/SCROLL_VIEW.md` |
-| `project_Demo/phone_shell/*` | 电话外壳本身：桌面、最近任务、IME、壁纸 ribbon、设置页 |
+| `project_Demo/phone_shell/*` | 电话外壳本身：桌面、最近任务、IME、壁纸 ribbon、设置页、**状态栏 WiFi 图标**（`phone_shell.c` 的 `status_draw`：原来硬画的 4 格假信号柱已换成按 `$WF` 真值 RSSI 分档的 WiFi 扇面，数据经 `BoardNet_WifiUp/WifiBars` 取自 `src/uart_link.c`） |
 
 ## 未入库的部分（`.gitignore` 排除）
 

@@ -82,6 +82,11 @@ static GYOBJ recent_title, recent_clear_button;                /* 最近任务�
  * status_clock[] 存两个是因为 status_bar() 在**首页与 app 页各调一次**。 */
 static GYOBJ status_clock[2];
 static int   status_clock_n;
+/* 状态栏右侧图标（WiFi + 电池）的句柄，同样两个（首页 / app 页各一个）。
+ * 为什么要句柄：图标是 draw_cb 画的，draw_cb 只在重绘时被调用，
+ * 数据变了必须 YMGUI_Obj_Invalidate() 才会重画（见 net_refresh）。 */
+static GYOBJ status_icon[2];
+static int   status_icon_n;
 /* 桌面大时间拆成三个 label —— 小时 / 冒号 / 分钟。
  * 为什么要拆：冒号要每秒闪一次（"冒号 ↔ 空"），单独拼在一个 label 里会因
  * ':' 与空格不等宽而让分钟数字左右跳位（见 src/uart_link.c 的 BoardNet_ClockHH）。 */
@@ -115,16 +120,95 @@ static void home_select(int index, int animate);
 
 
 
+/* ---- 状态栏右侧图标：WiFi（左，x=0..15）+ 电池（右，x=27..55）----
+ *
+ * ⚠ 2026-10-10 前情：左边这 4 根柱子是**硬画的假信号**——纯几何 Fill、
+ *   永远满格、不读任何数据，和当初硬编码 "9:41" 是同一类问题。
+ *   现在换成接真值的 WiFi 图标，数据来自 ESP32 的 `$WF,<up>,<ip>,<rssi>`
+ *   （src/uart_link.c:424 早就解析了，只是一直没人用）。
+ *
+ * ⚠⚠ 语义必须写清：**WiFi 射频在对端 ESP32 上，H743 本身没有无线**。
+ *     本板是通过 UART 把 ESP32 当网络协处理器/网关用的，
+ *     所以这里画的是"经 ESP32 网关的联网状态"，不是本芯片的无线状态。
+ *     图标本身是诚实的（链路确实存在且已通），但别让人以为 H743 自带 WiFi。
+ *
+ * 三态必须长得不一样 —— 否则"开机后还没收到首帧 $WF"（约几十秒）
+ * 会被误读成断网：
+ *     未知(-1) → 只有底座圆点（淡）
+ *     断开( 0) → 圆点 + 最外一条弧（淡）
+ *     已连( 1) → 圆点 + N 条弧（不透明，N = 信号格 0..3）
+ *
+ * ⚠ 电池那半边**仍然是装饰性的**（板上没有电池、也没有电量计，
+ *    fill 宽度写死 16 = 永远满格）。留着是因为状态栏右侧总得有点东西，
+ *    真要诚实应该换成"供电来源"，但那需要先有硬件可测。 */
+
+/* 图标规格：16 × 14，放在 56 × 18 的区域里（y 下移 2 使其垂直居中）。 */
+#define WIFI_ICON_W 16
+#define WIFI_ICON_H 14
+
+/* draw_cb 上一次**实际画出来**的 up / bars。
+ * ⚠ 判据必须是"画出来的"，不能是"我上次调用时传了什么"——
+ *   后者会在别的路径改过数据后失同步，跟 2026-10-09 那个
+ *   "自缓存 last 值导致日期永久停在切语言那一刻"是同一个坑。
+ *   初值取 -99 保证首帧必画。 */
+static int s_wifi_drawn_up   = -99;
+static int s_wifi_drawn_bars = -99;
+
+static void wifi_dot(GYSURFACE s, int x, int y, GYcolor ink, int opa)
+{
+	GYrect d = {(GYcoord)x, (GYcoord)y, 6, 5};
+	PhoneUI_rounded(s, &d, ink, 2, (GYopa)opa);
+}
+
+/* 一条弧 = 顶行横杠 + 下一行左右两个端点块（像素级近似 "⌒"）。
+ * 端点块比顶行更靠外一点，这样才有弧度感而不是一条直线。 */
+static void wifi_arc(GYSURFACE s, int x, int y, int inset, int top_w, int end_w,
+					 GYcolor ink, int opa)
+{
+	GYrect top = {(GYcoord)(x + inset), (GYcoord)y, (GYcoord)top_w, 1};
+	YMGUI_Draw_Fill(s, &top, ink, (GYopa)opa);
+
+	int yy = y + 1;
+	GYrect l = {(GYcoord)(x + inset - end_w + 1), (GYcoord)yy, (GYcoord)end_w, 1};
+	GYrect r = {(GYcoord)(x + inset + top_w - 1),  (GYcoord)yy, (GYcoord)end_w, 1};
+	YMGUI_Draw_Fill(s, &l, ink, (GYopa)opa);
+	YMGUI_Draw_Fill(s, &r, ink, (GYopa)opa);
+}
+
+static void wifi_bars(GYSURFACE s, int x, int y, int bars, GYcolor ink, int opa)
+{
+	static const int inset[3] = {2, 4, 6};    /* 顶行左端相对图标左边缘 */
+	static const int top_w[3] = {12, 8, 4};   /* 由外向内依次变窄 */
+	static const int end_w[3] = {3, 2, 2};
+	static const int dy[3]    = {0, 3, 6};
+
+	if (bars > 3) bars = 3;
+	for (int i = 0; i < bars; ++i)
+		wifi_arc(s, x, y + dy[i], inset[i], top_w[i], end_w[i], ink, opa);
+}
+
 static void status_draw(GYOBJ obj, GYSURFACE surface, const GYrect* area)
 {
-	(void)obj;
 	GYcolor ink = obj->bg_color;
-	for (int i = 0; i < 4; ++i)
-	{
-		GYrect bar = {(GYcoord)(area->x + i * 5), (GYcoord)(area->y + 13 - i * 3),
-					  3, (GYcoord)(4 + i * 3)};
-		YMGUI_Draw_Fill(surface, &bar, ink, GY_OPA_COVER);
-	}
+
+	/* ---- WiFi：接真值 ---- */
+	int up   = BoardNet_WifiUp();      /* 1 / 0 / -1（还没收到过） */
+	int bars = BoardNet_WifiBars();    /* 0..3，-1 = 还没收到过 */
+	int opa  = (up == 1) ? (int)GY_OPA_COVER : 90;   /* 未确认的态一律画淡 */
+	int ix   = area->x;
+	int iy   = area->y + 2;
+
+	wifi_dot(surface, ix + 5, iy + 9, ink, opa);
+	if (up == 1)
+		wifi_bars(surface, ix, iy, bars < 0 ? 0 : bars, ink, opa);
+	else if (up == 0)
+		wifi_bars(surface, ix, iy, 1, ink, opa);   /* 已知断开：只留最外一条弧 */
+	/* up < 0（还没收到过 $WF）：只有底座点，一条弧都不画 */
+
+	s_wifi_drawn_up   = up;
+	s_wifi_drawn_bars = bars;
+
+	/* ---- 电池：装饰性绘制，原样保留 ---- */
 	GYrect rim = {(GYcoord)(area->x + 27), (GYcoord)(area->y + 3), 25, 13};
 	PhoneUI_rounded(surface, &rim, ink, 4, GY_OPA_COVER);
 	GYrect gap = {(GYcoord)(area->x + 29), (GYcoord)(area->y + 5), 19, 9};
@@ -231,6 +315,18 @@ static void net_refresh(uint32 dt_ms)
 
 	PhoneUI_text_if_changed(home_date, net_date());
 	PhoneUI_text_if_changed(home_count, net_weather());
+
+	/* WiFi 图标：draw_cb 不会自己察觉数据变了，必须显式置脏。
+	 * ⚠ 判据是"draw_cb 上次**实际画出来**的值"（s_wifi_drawn_*），
+	 *   不是本函数自己缓存的"上次刷新成了什么" —— 后者一旦被别的路径
+	 *   （自检脚本直写内存、切语言重建控件）改过就永久失同步，
+	 *   2026-10-09 的日期 bug 就是这么来的。 */
+	int wup = BoardNet_WifiUp(), wbars = BoardNet_WifiBars();
+	if (wup != s_wifi_drawn_up || wbars != s_wifi_drawn_bars)
+	{
+		for (int i = 0; i < status_icon_n; ++i)
+			YMGUI_Obj_Invalidate(status_icon[i]);
+	}
 }
 
 static void status_bar(GYOBJ parent)
@@ -246,6 +342,9 @@ static void status_bar(GYOBJ parent)
 	GYOBJ icon = YMGUI_Creat_Obj_Creat(parent, 248, 3, 56, 18);
 	icon->bg_color = ink;
 	icon->draw_cb = status_draw;
+	/* 句柄同样要留着：WiFi 图标接的是真数据，变了得有人置它脏（见 net_refresh）。 */
+	if (status_icon_n < 2)
+		status_icon[status_icon_n++] = icon;
 }
 
 

@@ -231,4 +231,16 @@ void BoardNet_DateText(char* out, int n);     /* "10月8日 星期四" */
 void BoardNet_WeatherText(char* out, int n);  /* "晴 / 20℃" */
 int  BoardNet_WeatherCode(void);              /* 天气码；-1 = 没收到，图标按它选 */
 
+/* ---- WiFi 链路状态（给状态栏图标用）----
+ * ⚠ 数据来源是 ESP32 的 `$WF,<up>,<ip>,<rssi>` —— **WiFi 射频在对端**，
+ *   本板没有 WiFi。这里报的是"经 ESP32 网关的联网状态"，不是本芯片的无线状态。
+ *   界面上画 WiFi 图标是诚实的（链路确实存在且已通），但语义要写清楚，
+ *   别让后来者以为 H743 自带 WiFi。
+ * ⚠ 2026-10-10 之前这几个量解析了却没人用（UI 层一处都没引用），
+ *   状态栏那 4 格信号柱是硬画的假信号 —— 现在换成接真值的 WiFi 图标。 */
+int  BoardNet_WifiUp(void);                   /* 1=已连  0=已断开  -1=还没收到过 $WF */
+int  BoardNet_WifiRssi(void);                 /* dBm（负数）；没收到过返回 0 */
+int  BoardNet_WifiBars(void);                 /* 0..3 信号格数；-1 = 还没收到过 $WF */
+const char* BoardNet_WifiIp(void);            /* "192.168.1.2"；没收到过返回 "" */
+
 #endif /* UART_LINK_H */
