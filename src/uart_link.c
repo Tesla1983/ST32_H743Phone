@@ -103,6 +103,7 @@ volatile uint8_t  g_net_wf_ip[24];
 volatile uint32_t g_net_dt_pkts;
 volatile uint32_t g_net_wd_pkts;
 volatile uint32_t g_net_wf_pkts;
+volatile uint32_t g_net_wx_pkts;
 volatile uint32_t g_net_xor_fail;
 volatile uint32_t g_net_bad_pkts;
 
@@ -140,6 +141,14 @@ volatile uint8_t  g_cmd_body[UART_LINK_BODY_CAP];
 volatile uint32_t g_cmd_body_len;
 volatile uint32_t g_cmd_req;
 
+/* ---- 逐城天气诊断量（2026-10-10）---- */
+volatile uint32_t g_city_req;
+volatile uint32_t g_city_ok;
+volatile uint32_t g_city_to;
+volatile uint32_t g_city_scan;
+volatile uint32_t g_city_last_scan;
+volatile int      g_city_idx = -1;
+
 /* ---- 二进制收取状态（$!BD 的裸负载）----
  * s_bin_need != 0 即"二进制模式"：此时收到的字节**不参与行重组**，
  * 直接按序填进 g_cmd_body，填满 need 个就收工。
@@ -168,6 +177,7 @@ static uint32_t s_bin_t0;      /* 进入二进制模式时的时基，用于超�
 #define CMD_PH_WEA     3u
 #define CMD_PH_WDATA   4u
 #define CMD_PH_DONE    5u
+#define CMD_PH_CITY    6u     /* 逐城天气扫描（开机序列跑完之后才进） */
 
 static uint32_t s_cmd_phase;
 static uint32_t s_cmd_t0;      /* 本阶段起点 */
@@ -310,6 +320,62 @@ static int split_fields(char* buf, char** f, int max)
     return n;
 }
 
+/* ====================== 逐城天气（2026-10-10）======================
+ * 天气 app 要显示多城，而 $WD 只有「默认城市」那一城 —— 所以走命令通道
+ * 逐城问（$?WEA,<城市码> → $WX），结果存在这张表里。
+ *
+ * ⚠ 城市码是 2026-10-10 在**主机上逐个请求 sojson 接口验证过**的：
+ *   三个码都 HTTP 200，且响应里 cityInfo.city 与下表的名字一致
+ *   （杭州→杭州市 / 上海→上海市 / 成都→成都市）。不是照抄网上的清单。
+ *   要加城市：下面两张表各加一项并改 CITY_N，UI 会自动多出一行。
+ */
+#define CITY_N  3
+
+static const char* const s_city_name[CITY_N] = {"杭州", "上海", "成都"};
+static const char* const s_city_key[CITY_N]  = {"101210101", "101020100", "101270101"};
+
+typedef struct
+{
+    int     valid;      /* 1 = 拿到过一次数据（保留旧值给界面显示，刷新期间不闪空） */
+    int     gen;        /* 数据属于第几轮扫描 —— 用来判"本轮这一城是否已回来" */
+    int     temp_x10;
+    int     rh;
+    int     pm25;
+    int     aqi;
+    int     code;
+    uint8_t text[24];   /* UTF-8 天气文本，如 "晴" */
+} CityWx;
+
+static CityWx s_city_wx[CITY_N];
+
+/* 扫描状态。s_city_gen 单调递增，每开一轮扫描 +1。
+ * ⚠ 为什么用 gen 而不是在扫描开始时清 valid：
+ *   清了 valid，界面在每轮刷新的那几秒里会闪成 "--"；留着旧值继续显示，
+ *   靠 gen 对不上来判"本轮还没回来"，用户体验和判据两头都站得住。 */
+static uint32_t s_city_gen;
+static int      s_city_sent;    /* 当前这一城的命令是否已发出 */
+static uint32_t s_city_t0;      /* 发出命令时的时基 */
+static uint32_t s_city_scan_t0; /* 上一轮扫描结束的时基（用来算重扫间隔） */
+static uint32_t s_city_next_ms; /* 距下一轮扫描的间隔（成功=30 min，有城没拿到=60 s） */
+static int      s_city_scanned; /* 0 = 从没扫完过一轮 */
+
+/* 逐城超时。
+ * ⚠ 为什么是 12 s 而不是"看着够就行"的 8 s：对端 uplink_task 的循环里有一次
+ *   `vTaskDelay(1000)`（最坏 1 s 才轮到处理事件位），而它 HTTP 的
+ *   `timeout_ms` 是 **10000** —— 也就是说对端自己要 11 s 才会放弃。
+ *   我们给 8 s 会出现"对端还在等 HTTP、我们已经判超时并跳去问下一城"，
+ *   于是那一城永远少一拍（2026-10-10 实测：第二轮扫描 `g_city_to=1`，
+ *   杭州卡在上一代 gen=1 的数据上，要等满 30 min 才补）。
+ *   ⇒ 本板的超时必须**大于对端 HTTP 超时 + 一个循环拍**。 */
+#define CITY_TIMEOUT_MS     12000u
+/* 整轮重扫间隔。与对端 $WD 的 30 min 周期对齐 —— 天气本来就半小时一变，
+ * 问得更密只是白白让对端多发几次 HTTP。 */
+#define CITY_RESCAN_MS      1800000u
+/* 有城市没拿到时的**补扫**间隔。为什么不能也等 30 min：
+ *   一次偶发超时就让那一城显示整整半小时的旧值，界面上无从分辨
+ *   （它显示的是真数据，只是不是当前值 —— 这比显示"--"更有误导性）。 */
+#define CITY_RETRY_MS       60000u
+
 /* ====================== 帧解析 ====================== */
 
 /* 解析一整行（不含 '\r' '\n'）。返回 0 = 识别成功。 */
@@ -416,6 +482,48 @@ static int parse_frame(const uint8_t* line, uint32_t len)
         }
         g_net_wx_text[i] = 0;
         g_net_wd_pkts++;
+        return 0;
+    }
+
+    if (nf >= 8 && f[0][0] == 'W' && f[0][1] == 'X')
+    {
+        /* $WX,<citykey>,<temp_x10>,<rh>,<pm25>,<aqi>,<code>,<text>
+         * 逐城天气 —— $?WEA,<城市码> 的应答。
+         *
+         * ⚠ 靠 citykey 对号入座，**不要**按"当前正在问哪一城"来记：
+         *   某一城超时后本模块会跳去问下一城，这时上一城的 $WX 才姗姗来迟的话
+         *   就会被记到错的槽位上，而且看不出错了。citykey 是当初问的那个码
+         *   原样回传的，对不上就是真的对不上。 */
+        int idx = -1;
+        for (int i = 0; i < CITY_N; ++i)
+        {
+            const char* a = s_city_key[i];
+            const char* b = f[1];
+            while (*a != 0 && *a == *b) { ++a; ++b; }
+            if (*a == 0 && *b == 0) { idx = i; break; }
+        }
+        if (idx < 0)
+            return -5;                      /* 不是我们问过的城市，忽略 */
+
+        CityWx* w = &s_city_wx[idx];
+        w->temp_x10 = to_int(f[2]);
+        w->rh       = to_int(f[3]);
+        w->pm25     = to_int(f[4]);
+        w->aqi      = to_int(f[5]);
+        w->code     = to_int(f[6]);
+
+        uint32_t i = 0;
+        const char* t = f[7];
+        while (t[i] != 0 && i + 1u < (uint32_t)sizeof(w->text))
+        {
+            w->text[i] = (uint8_t)t[i];
+            ++i;
+        }
+        w->text[i] = 0;
+
+        w->valid = 1;
+        w->gen   = (int)s_city_gen;
+        g_net_wx_pkts++;
         return 0;
     }
 
@@ -704,6 +812,70 @@ static void cmd_tick(uint32_t now_ms)
         else if (now_ms - s_cmd_t0 > 20000u)
         {
             s_cmd_phase = CMD_PH_DONE;      /* 20 s 还没等到，放弃（30 min 后对端会自己推） */
+        }
+        break;
+
+    case CMD_PH_DONE:
+        /* 空闲态：只负责"到点重扫一次逐城天气"。
+         * ⚠ g_cmd_rx == 0 说明**发送方向根本不通**（线没接/对端没在听），
+         *   这时还去问只会每 8 s 往线上吐一帧，既没用又占主循环 —— 直接不动。 */
+        if (g_cmd_rx == 0u)
+            break;
+        if (s_city_scanned != 0 && (now_ms - s_city_scan_t0 < s_city_next_ms))
+            break;
+        s_city_gen++;
+        g_city_idx  = 0;
+        s_city_sent = 0;
+        s_cmd_phase = CMD_PH_CITY;
+        break;
+
+    case CMD_PH_CITY:
+        /*
+         * 逐城串行：**一次只问一城**，等它的 $WX 回来（或超时）再问下一城。
+         *
+         * 为什么不一口气把三城都发出去：对端那边是「一个槽位的邮箱」
+         * （见 E:\workbuddy\esp32-com8\main\time_weather.c），连发三帧只会
+         * 让后两帧回 $!RS,WEA,0（忙），城市码还被互相覆盖。
+         * 串行是协议要求，不是保守。
+         */
+        if (s_city_sent == 0)
+        {
+            g_city_req++;
+            s_city_sent = 1;
+            s_city_t0   = now_ms;
+            (void)uart_link_cmd("?WEA", s_city_key[g_city_idx]);
+            break;
+        }
+        /* 本轮这一城回来了？判据是 gen 对得上（不是 valid —— 那可能是上轮旧值） */
+        if (s_city_wx[g_city_idx].gen == (int)s_city_gen)
+        {
+            g_city_ok++;
+            s_city_sent = 0;
+        }
+        else if (now_ms - s_city_t0 > CITY_TIMEOUT_MS)
+        {
+            g_city_to++;                    /* 对端没回：跳过，问下一城 */
+            s_city_sent = 0;
+        }
+
+        if (s_city_sent == 0)
+        {
+            if (++g_city_idx >= CITY_N)
+            {
+                /* 本轮到齐了几个？到齐才等 30 min，缺了就 60 s 后补扫。
+                 * 判据用 gen（不是 valid）：valid 可能是上几轮的旧值。 */
+                int got = 0;
+                for (int i = 0; i < CITY_N; ++i)
+                    if (s_city_wx[i].gen == (int)s_city_gen) ++got;
+
+                g_city_idx       = -1;
+                s_city_scanned   = 1;
+                s_city_scan_t0   = now_ms;
+                s_city_next_ms   = (got >= CITY_N) ? CITY_RESCAN_MS : CITY_RETRY_MS;
+                g_city_last_scan = got;
+                g_city_scan++;
+                s_cmd_phase      = CMD_PH_DONE;
+            }
         }
         break;
 
@@ -1115,6 +1287,165 @@ void BoardNet_WeatherText(char* out, int n)
 int BoardNet_WeatherCode(void)
 {
     return g_net_code;
+}
+
+/* ====================== 逐城天气（天气 app 用）====================== */
+
+int BoardNet_CityCount(void)
+{
+    return CITY_N;
+}
+
+const char* BoardNet_CityName(int i)
+{
+    if (i < 0 || i >= CITY_N) return "";
+    return s_city_name[i];
+}
+
+int BoardNet_CityHasData(int i)
+{
+    if (i < 0 || i >= CITY_N) return 0;
+    return s_city_wx[i].valid ? 1 : 0;
+}
+
+int BoardNet_CityCode(int i)
+{
+    if (i < 0 || i >= CITY_N || !s_city_wx[i].valid) return -1;
+    return s_city_wx[i].code;
+}
+
+int BoardNet_CityTempX10(int i)
+{
+    if (i < 0 || i >= CITY_N || !s_city_wx[i].valid) return 0;
+    return s_city_wx[i].temp_x10;
+}
+
+int BoardNet_CityRh(int i)
+{
+    if (i < 0 || i >= CITY_N || !s_city_wx[i].valid) return -1;
+    return s_city_wx[i].rh;
+}
+
+int BoardNet_CityPm25(int i)
+{
+    if (i < 0 || i >= CITY_N || !s_city_wx[i].valid) return -1;
+    return s_city_wx[i].pm25;
+}
+
+int BoardNet_CityAqi(int i)
+{
+    if (i < 0 || i >= CITY_N || !s_city_wx[i].valid) return -1;
+    return s_city_wx[i].aqi;
+}
+
+/* 往 out 尾部追加字符串（带容量保护）。返回新的长度。 */
+static int app_text(char* out, int n, int k, const char* s)
+{
+    int i = 0;
+    while (s[i] != 0 && k < n - 1) { out[k++] = s[i]; ++i; }
+    out[k < n ? k : n - 1] = 0;
+    return k;
+}
+
+/* 往 out 尾部追加一个十进制整数（含负号）。返回新的长度。 */
+static int app_int(char* out, int n, int k, int v)
+{
+    char b[12];
+    int  m = 0;
+    if (v < 0) { if (k < n - 1) out[k++] = '-'; v = -v; }
+    if (v == 0) b[m++] = '0';
+    while (v > 0 && m < (int)sizeof(b)) { b[m++] = (char)('0' + v % 10); v /= 10; }
+    while (m > 0 && k < n - 1) { out[k++] = b[--m]; }
+    out[k < n ? k : n - 1] = 0;
+    return k;
+}
+
+/* "21℃" / "--"。⚠ 没数据时给 "--" 而不是 "0℃" —— 界面上必须能区分
+ * "还没取到"和"真的是 0 度"，否则用户会以为杭州现在是 0 度。 */
+void BoardNet_CityTempText(int i, char* out, int n)
+{
+    if (n <= 0) return;
+    out[0] = 0;
+    if (!BoardNet_CityHasData(i)) { (void)app_text(out, n, 0, "--"); return; }
+
+    int k  = 0;
+    int tx = s_city_wx[i].temp_x10;
+    if (tx < 0) { if (k < n - 1) out[k++] = '-'; tx = -tx; }
+    k = app_int(out, n, k, tx / 10);
+    if (tx % 10 != 0)
+    {
+        if (k < n - 1) out[k++] = '.';
+        k = app_int(out, n, k, tx % 10);
+    }
+    /* "℃" = E2 84 83 */
+    if (k + 3 < n) { out[k++] = (char)0xE2; out[k++] = (char)0x84; out[k++] = (char)0x83; }
+    out[k < n ? k : n - 1] = 0;
+}
+
+/* "晴" / "等待数据" */
+void BoardNet_CityCondText(int i, char* out, int n)
+{
+    if (n <= 0) return;
+    out[0] = 0;
+    if (!BoardNet_CityHasData(i)) { (void)app_text(out, n, 0, "等待数据"); return; }
+    if (s_city_wx[i].text[0] == 0) { (void)app_text(out, n, 0, "未知"); return; }
+    (void)app_text(out, n, 0, (const char*)s_city_wx[i].text);
+}
+
+/* "湿度 69%  PM2.5 31  AQI 111" / ""（没数据时给空串，界面那一行自然留白）
+ *
+ * ⚠ 分隔符只用**两个空格**，不用 "·" 之类的分隔点：U+00B7 要落到中文字体里
+ *   才画得出来，而这个工程挂的是裁剪过的字体子集，缺字会画成空白或豆腐块。
+ *   空格是 ASCII，字体里一定有 —— 这是实测过的安全选择。
+ * ⚠ 字段缺失（接口没给）时**整段不显示**，而不是显示 "-1"：对端解析不到时
+ *   写的是 -1，那是"无数据"的内部标记，不该直接端上界面。 */
+void BoardNet_CitySubText(int i, char* out, int n)
+{
+    if (n <= 0) return;
+    out[0] = 0;
+    if (!BoardNet_CityHasData(i)) return;
+
+    static const char u_hum[] = "湿度 ";
+    static const char u_pm[]  = "PM2.5 ";
+    static const char u_aqi[] = "AQI ";
+
+    int k = 0;
+    if (s_city_wx[i].rh >= 0)
+    {
+        k = app_text(out, n, k, u_hum);
+        k = app_int(out, n, k, s_city_wx[i].rh);
+        if (k < n - 1) out[k++] = '%';
+        out[k < n ? k : n - 1] = 0;
+    }
+    if (s_city_wx[i].pm25 >= 0)
+    {
+        if (k > 0 && k + 2 < n) { out[k++] = ' '; out[k++] = ' '; }
+        out[k < n ? k : n - 1] = 0;
+        k = app_text(out, n, k, u_pm);
+        k = app_int(out, n, k, s_city_wx[i].pm25);
+    }
+    if (s_city_wx[i].aqi >= 0)
+    {
+        if (k > 0 && k + 2 < n) { out[k++] = ' '; out[k++] = ' '; }
+        out[k < n ? k : n - 1] = 0;
+        k = app_text(out, n, k, u_aqi);
+        k = app_int(out, n, k, s_city_wx[i].aqi);
+    }
+    out[k < n ? k : n - 1] = 0;
+}
+
+int BoardNet_CityUpdatedCount(void)
+{
+    int c = 0;
+    for (int i = 0; i < CITY_N; ++i)
+        if (s_city_wx[i].valid) ++c;
+    return c;
+}
+
+/* 1 = 正在逐城扫描。界面拿它决定副标题写"更新中"还是"已是最新"。 */
+int BoardNet_CityBusy(void)
+{
+    return (g_city_idx >= 0) ? 1 : 0;
 }
 
 /* ---- WiFi 链路状态 ----

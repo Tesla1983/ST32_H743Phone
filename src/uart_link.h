@@ -26,6 +26,11 @@
  *     $<TYPE>,<字段1>,<字段2>,...*<HH>\r\n
  *   HH = 对 "<TYPE>,<字段...>"（不含 '$'、不含 '*'）逐字节 XOR，2 位大写十六进制。
  *
+ *   $WX,<citykey>,<temp_x10>,<rh>,<pm25>,<aqi>,<code>,<text>*HH
+ *                                                      逐城天气，$?WEA,<城市码> 的应答。
+ *          citykey = 当初问的那个城市码（原样回传）⇒ 靠它对号入座，
+ *          某一城超时后后续帧不会错位记到别的城市上。
+ *          其余字段与 $WD 相同。
  *   $DT,<unix_ts>,<YYYY-MM-DD>,<HH:MM:SS>,<wday>*HH     时间，每 10 s 一帧
  *          unix_ts=UTC 秒；日期与时间**已按 CST-8 换算** ⇒ 可直接显示，不要再加时区
  *          wday = ISO 8601：1=周一 … 7=周日
@@ -51,6 +56,14 @@
  *   $?PING                 → $!RS,PING,1,<uptime_ms>   握手（判据：g_cmd_tx/rx 都涨）
  *   $?WEA                  → $!RS,WEA,1（已受理，随后推 $WD）/ -1（对端未联网）
  *                            解决"STM32 复位后天气最多要等 30 min"的问题：开机问一次。
+ *   $?WEA,<城市码>         → $!RS,WEA,1（已受理，随后推 **$WX**）/ 0（对端忙，稍后重试）
+ *                            逐城天气（2026-10-10 新增，给天气 app 的多城列表用）。
+ *                            ⚠ 应答是 $WX 不是 $WD：$WD 是**默认城市**的周期推送，
+ *                              桌面/控制中心按它显示；逐城结果若也挤进 $WD，
+ *                              那些界面会把杭州当成默认城市显示 —— 那是骗人。
+ *                            ⚠ **一次只能问一城**：对端邮箱只有一个槽位（见对端
+ *                              time_weather.c 的说明），连发会回 $!RS,WEA,0。
+ *                              本模块因此做成"发一城 → 等 $WX 或超时 → 再下一城"。
  *   $?WGET,<id>,<url>      → $!BD,<id>,<len>,<crc16> + len 字节裸负载；失败回 $!RS,WGET,0
  *                            通用 HTTP 通道，给将来下图片 / 下固件用。
  *
@@ -153,6 +166,7 @@ extern volatile uint8_t  g_net_wf_ip[24];
 extern volatile uint32_t g_net_dt_pkts;    /* 收到的 $DT 帧数 */
 extern volatile uint32_t g_net_wd_pkts;    /* 收到的 $WD 帧数 */
 extern volatile uint32_t g_net_wf_pkts;    /* 收到的 $WF 帧数 */
+extern volatile uint32_t g_net_wx_pkts;    /* 收到的 $WX（逐城天气）帧数 */
 extern volatile uint32_t g_net_xor_fail;   /* XOR 校验失败的帧数 */
 extern volatile uint32_t g_net_bad_pkts;   /* 有 '$' 有 '*' 但字段不对的帧数 */
 
@@ -165,10 +179,26 @@ extern volatile uint32_t g_cmd_tx;           /* 已发出的命令帧数 */
 extern volatile uint32_t g_cmd_rx;           /* 已收到的 $! 响应帧数 */
 extern volatile uint32_t g_cmd_xor_fail;     /* 响应校验失败（说明线路有噪声） */
 extern volatile uint32_t g_cmd_ping_ok;      /* PING 握手成功次数 */
-extern volatile uint32_t g_cmd_weather_req;  /* 发出的 $?WEA 次数 */
+extern volatile uint32_t g_cmd_weather_req;  /* 发出的 $?WEA 次数（默认城市） */
 extern volatile uint32_t g_cmd_weather_ack;  /* 收到 $!RS,WEA,1 的次数 */
 extern volatile uint32_t g_cmd_weather_ok;   /* 请求之后确实等到 $WD 的次数 */
 extern volatile uint32_t g_cmd_phase;        /* 命令状态机当前阶段（见 .c 里的枚举） */
+
+/* ---- 逐城天气（2026-10-10，天气 app 用）----
+ * 判据一句话：**g_city_ok 达到城市数（3）** 即三个城市都拿到真数据。
+ *   g_city_req  已发出的 $?WEA,<城市码> 次数（每城一次，逐城串行）
+ *   g_city_ok   本轮已拿到数据的城市数（0..CITY_N）
+ *   g_city_to   逐城请求超时次数（对端没回 $WX；连着涨 = 对端没联网或不认这个命令）
+ *   g_city_scan 完成的整轮扫描次数
+ *   g_city_last_scan 上一轮**到齐**的城市数（== 3 才算全绿；< 3 则 60 s 后自动补扫）
+ *   g_city_idx  当前正在问的城市下标（-1 = 当前没在扫描）
+ * ⚠ 复位后要先让开机序列跑完（PING→WEA→WDATA，几秒），扫描才开始。 */
+extern volatile uint32_t g_city_req;
+extern volatile uint32_t g_city_ok;
+extern volatile uint32_t g_city_to;
+extern volatile uint32_t g_city_scan;
+extern volatile uint32_t g_city_last_scan;
+extern volatile int      g_city_idx;
 
 /* $!BD 大块数据 */
 extern volatile uint32_t g_cmd_bd_pkts;      /* 收到 BD 头帧数 */
@@ -230,6 +260,32 @@ int  BoardNet_ColonBlink(void);               /* 1 = 冒号该亮（秒为偶数
 void BoardNet_DateText(char* out, int n);     /* "10月8日 星期四" */
 void BoardNet_WeatherText(char* out, int n);  /* "晴 / 20℃" */
 int  BoardNet_WeatherCode(void);              /* 天气码；-1 = 没收到，图标按它选 */
+
+/* ---- 逐城天气（给天气 app 用，2026-10-10）----
+ * 与上面同一套分层：UI 只拿"能直接画的字符串"，温度×10 → "21℃" 这类换算
+ * 收在本模块里；phone_shell 不认识 g_city_* / s_city_*。
+ *
+ * ⚠ 数据来自 ESP32 的 $?WEA,<城市码> → $WX，是**真网络数据**；
+ *   拿不到时返回占位串（"--" / "等待数据"），界面上要能一眼区分
+ *   "没取到"和"真的是 0℃"（与 BoardNet_WeatherText 同一条纪律）。
+ *
+ * ⚠ 城市表在这里硬编码（3 城），城市码是 2026-10-10 在主机上逐个请求
+ *   sojson 接口验证过的（HTTP 200 且 cityInfo.city 与名字一致），
+ *   不是照抄网上的清单。要加城市：往 s_city_name / s_city_key 里各加一项，
+ *   并把 CITY_N 改掉（UI 会自动多出一行）。 */
+int  BoardNet_CityCount(void);                     /* 城市数（3） */
+const char* BoardNet_CityName(int i);              /* "杭州"；i 越界返回 "" */
+int  BoardNet_CityHasData(int i);                  /* 1 = 已拿到真数据；0 = 还没有 */
+int  BoardNet_CityCode(int i);                     /* 天气数字码；-1 = 无数据 */
+int  BoardNet_CityTempX10(int i);                  /* 温度×10；无数据返回 0 且 HasData=0 */
+int  BoardNet_CityRh(int i);                       /* 湿度 %；-1 = 无数据 */
+int  BoardNet_CityPm25(int i);                     /* PM2.5；-1 = 无数据 */
+int  BoardNet_CityAqi(int i);                      /* AQI；-1 = 无数据 */
+void BoardNet_CityTempText(int i, char* out, int n);   /* "21℃" / "--" */
+void BoardNet_CityCondText(int i, char* out, int n);   /* "晴" / "等待数据" */
+void BoardNet_CitySubText(int i, char* out, int n);    /* "湿度 69% · PM2.5 31" / "" */
+int  BoardNet_CityUpdatedCount(void);              /* 已拿到数据的城市数（0..N） */
+int  BoardNet_CityBusy(void);                      /* 1 = 正在扫描（界面可显示"更新中"） */
 
 /* ---- WiFi 链路状态（给状态栏图标用）----
  * ⚠ 数据来源是 ESP32 的 `$WF,<up>,<ip>,<rssi>` —— **WiFi 射频在对端**，

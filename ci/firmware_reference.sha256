@@ -403,5 +403,60 @@
 #   · 板上核验：tools/verify_board_image.py 全量读回 1 630 892 字节与 .bin **完全一致**。
 #
 # FLASH 1 630 892 B（77.77%），比第十二版 +584 B。
-9947538f04dfa11ff955a1a393b18d05e3956b5be7c628a187f9cf91c585c4fa  ymgui-h743.bin
-1a51463e9f0a7159007cbbb620482b686b1959e17a23d3d0b5422839a08e5b32  ymgui-h743.elf
+# --- 第十三版（状态栏 WiFi 图标接真值）：已被第十四版取代 ---
+# 9947538f04dfa11ff955a1a393b18d05e3956b5be7c628a187f9cf91c585c4fa  ymgui-h743.bin
+# 1a51463e9f0a7159007cbbb620482b686b1959e17a23d3d0b5422839a08e5b32  ymgui-h743.elf
+
+# ============================================================================
+# 第十四版（2026-10-10）· 天气 app 接真数据：多城市链路补通（逐城天气 $WX）
+# ============================================================================
+# 改动（a 类：有意为之的功能改动），**两侧固件都要动**：
+#
+# 对端 E:\workbuddy\esp32-com8（不是 git 仓库，随本版一起烧录）：
+#   · main/uplink_protocol.h：新增帧类型 FRM_WEATH_X = "WX"
+#       $WX,<citykey>,<temp_x10>,<rh>,<pm25>,<aqi>,<code>,<text>
+#   · main/time_weather.c：weather_fetch() 重构为 weather_fetch_city(code, out)
+#     （默认城市退化为一次调用，周期逻辑一行未改）；新增 send_weather_city_frame()、
+#     一个槽位的"待取城市"邮箱 s_req_city + time_weather_request_city()；
+#     uplink_task 消费新事件位 CMD_EV_WEATHER_CITY（结果写进局部 weather_t，
+#     **不碰 s_wx** —— 否则天气 app 翻页会把桌面/控制中心的默认城市顺手改掉）。
+#   · main/uplink_cmd.c/.h：cmd_weather_now(args) 支持城市码；登记失败回 $!RS,WEA,0。
+#
+# 本仓库：
+#   · src/uart_link.h/.c：解析 $WX（**靠 citykey 对号入座**，不靠"当前在问哪一城"）；
+#     新增城市表（杭州 101210101 / 上海 101020100 / 成都 101270101，
+#     三个码都在主机上实测 HTTP 200 且 cityInfo.city 与名字一致，不是抄清单）；
+#     新增 BoardNet_City* 一组 UI 接口；命令状态机在开机序列（PING→WEA→WDATA）
+#     跑完之后进 CMD_PH_CITY **逐城串行**扫描，30 min 重扫；
+#     ⚠ 对端邮箱只有一个槽位 ⇒ **必须一次只问一城**（对端忙时回 $!RS,WEA,0，
+#       而不是悄悄覆盖城市码 —— 覆盖会让本板傻等一个永远不来的 $WX）。
+#   · 扫描用**代次 gen**判新鲜度（不清理 valid），留旧值继续显示，刷新期间不闪空。
+#   · 缺城自动补扫：本轮到齐 < 3 时 60 s 后重扫（不是等满 30 min）。
+#     ⚠ 逐城超时 8 s → **12 s**：对端 uplink_task 循环有 1 s 延时 + HTTP timeout_ms=10000
+#       ⇒ 8 s 会在对端还等 HTTP 时就判超时并跳去问下一城（实测 g_city_to=1、
+#       杭州卡在上一代数据上 30 min）。本板超时必须 > 对端 HTTP 超时 + 一个循环拍。
+#   · apps/weather.c **整页重写**：删掉三张写死的表与"离线示例天气"副标题，
+#     改为读 BoardNet_City*；副标题按真实状态（等待网络数据 / 更新中 2/3 /
+#     实时 HH:MM 更新）；没数据时一律占位串（"--" / "等待数据"），
+#     **绝不拿 0℃ 冒充"没取到"**。⚠ 不复用 PhoneUI_app_header（它不返回副标题句柄）。
+#   · tools/weather_shot.py（新增验收脚本）。
+#
+# 验收：
+#   · 数据（SWD 直读 s_city_wx）：g_city_req=3 g_city_ok=3 g_city_to=0
+#     g_city_scan=1 g_city_last_scan=3 g_net_wx_pkts=3；三城逐字段与主机独立抓取一致。
+#   · 视觉：连按 4 次「切换城市」抓 4 张，城市区域哈希前三张互异、第 4 张 == 第 1 张
+#     ⇒ 确实按 3 城循环；截图上的 杭州 21.4℃ 晴 / 上海 20.2℃ 多云 / 成都 20.6℃ 多云
+#     与板上 s_city_wx 逐字段对得上；副标题无"离线示例天气"。
+#   · 板上核验：verify_board_image.py 全量读回 **1 632 972 字节与 .bin 完全一致**。
+#
+# ⚠ 本版踩到的三个工具坑（都写进 tools/weather_shot.py 注释了）：
+#   1. 拿整张 PNG 的 md5 比"画面是否相同"会误报 FAIL（状态栏走秒 + 副标题走分）
+#      ⇒ 只比城市区域，且窗口要**排除副标题**（绝对 y 73..91）。
+#   2. 桌面 current_page 是 int*，要解**两次**引用（符号地址 → 指针值 → 页号）。
+#      少解一次 ⇒ 翻页循环永远到不了第 1 页，"成功打开了一个 app"但打开的不是天气。
+#   3. **current_app 不能判"app 是否已打开"**（它在桌面页面上仍读上一次开过的 app）
+#      ⇒ 真正的判据是 scene == 2（APP）。gallery_shot.py 的用法同理可疑。
+#
+# FLASH 1 632 972 B（77.87%），比第十三版 +2 080 B。
+3812181f8211a3f639c5be6183fa165ba130b4857901e83e00c42963fc8e25d2  ymgui-h743.bin
+e6e40d9e502065842682423bbc7e959e920bf2ceb5d147579d3f7f5fd403e331  ymgui-h743.elf
