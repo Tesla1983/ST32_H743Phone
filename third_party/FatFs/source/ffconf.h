@@ -84,7 +84,12 @@
 / Locale and Namespace Configurations
 /---------------------------------------------------------------------------*/
 
-#define FF_CODE_PAGE	936
+/* ⚠ 本工程改成了 437（原值 936），理由与代价实测见 src/fatfs_port.h 顶部。
+ * 936 那张双字节转码表在 ffunicode.c 里占 1894~7350 行 ≈ 170 KB FLASH；
+ * 437 是单字节表，只占 12 行。省下来的 170 KB 是纯 .rodata，没有任何功能依赖它。
+ * 代价：FatFs 不再**认得**中文字符（不做 GBK↔UTF-16 转码）。本工程所有路径常量
+ * 都是 ASCII（/YMGUI/PIC、/YMGUI/NOTE、note<N>.txt、pic.bmp / .jpg），不受影响。 */
+#define FF_CODE_PAGE	437
 /* This option specifies the OEM code page to be used on the target system.
 /  Incorrect code page setting can cause a file open failure.
 /

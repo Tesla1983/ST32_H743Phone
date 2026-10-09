@@ -1450,6 +1450,25 @@ void img_store_poll(void)
         }
         g_img_rc = 0u;
     }
+    else if (mode == 7u)
+    {
+        /* 删除 g_img_path 指向的文件。
+         * 为什么要有这一条：验收脚本往卡上丢测试文件，跑完必须能收走，
+         * 否则第二次跑时基线里已经有它 ⇒ 判据"条目数 +1"永远达不到
+         * （2026-10-09 实测卡上残留 selftest.bmp 导致 files_check.py 误报 FAIL）。
+         * UI 将来的"删除照片 / 删除笔记"也走这一条。
+         * FR_NO_FILE（文件本就不存在）也算达成目的 —— 删除是幂等操作。 */
+        if (fatfs_ensure_mounted() == 0)
+        {
+            FRESULT fr = f_unlink(g_img_path);
+            g_img_fs_rc = (uint32_t)fr;
+            g_img_rc    = (fr == FR_OK || fr == FR_NO_FILE) ? 0u : (uint32_t)fr;
+        }
+        else
+        {
+            g_img_rc = RC_PARAM;
+        }
+    }
     else
     {
         g_img_rc = RC_PARAM;
@@ -1699,9 +1718,10 @@ int BoardPic_LastRc(void)
 /* ---- 笔记：/YMGUI/NOTE 下的 .txt ----
  * 与照片共用同一张扫描表（同一时刻只服务一个分类，见 img_store.h 的说明）。
  *
- * ⚠ 文件名固定用 ASCII 的 note<N>.txt：卡是 FAT32 + FF_CODE_PAGE=936，
- *   中文文件名要过 CP936 转码，写进去再读回来未必逐字节一致；
- *   而笔记正文是 UTF-8 原样读写，不受影响 ⇒ 标题放正文第一行。 */
+ * ⚠ 文件名固定用 ASCII 的 note<N>.txt。原因有两条：
+ *   ① FF_CODE_PAGE 已是 437（2026-10-09 从 936 改来，省 178 KB FLASH），
+ *      FatFs 不再做 GBK↔UTF-16 转码 ⇒ 中文名自己保证不了往返一致；
+ *   ② 笔记正文是 UTF-8 原样读写，不受代码页影响 ⇒ 标题放正文第一行。 */
 int BoardNote_Scan(void)
 {
     (void)img_scan_mkdir(IMG_NOTE_DIR);

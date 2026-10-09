@@ -84,6 +84,20 @@ def run_mode(mode, timeout=180):
     return False
 
 
+def unlink(path):
+    """删除卡上的一个文件（mode 7，2026-10-09 为此新增的夹具）。
+
+    为什么必须有：测试文件跑完留在卡上，下一轮再跑时基线扫描里已经含它，
+    ② 的判据"条目数 +1"就永远达不到（实测被这个假 FAIL 误导过一次）。
+    删除在固件里是幂等的（FR_NO_FILE 也返回 0），所以不存在的文件也能"删"。
+    """
+    pb = path.encode("ascii") if isinstance(path, str) else path
+    ic.wr8(bench.T["g_img_path"][0], pb + b"\0")
+    if not run_mode(7):
+        return False
+    return rd1("g_img_rc") == 0
+
+
 def put_file(path, blob):
     """把 blob 分片写进卡上的 path（复用 img_check 的写文件夹具，只是路径不同）。"""
     wr_path(path)
@@ -114,6 +128,16 @@ def main():
         return 1
 
     ok = True
+
+    # ⓪ 先清掉上一轮的测试文件，保证基线干净（删除幂等，文件不存在也返回 0）
+    print("=" * 66)
+    print("⓪ 清理上一轮残留的测试文件")
+    print("=" * 66)
+    for p in (PIC_FILE, b"/YMGUI/PIC/cp_probe.bmp"):
+        if not unlink(p):
+            print("  [FAIL] 删除 %s 失败（g_img_rc=%d）" % (p, rd1("g_img_rc")))
+            return 1
+        print("  已清理 %s" % p)
 
     # ① 建目录 + 扫一次（基线）
     print("=" * 66)
@@ -166,6 +190,16 @@ def main():
     nrc, ncmp, nbytes = rd1("g_note_rc"), rd1("g_note_cmp"), rd1("g_note_bytes")
     print("  g_note_rc = %d（0 = 成功）  失配 %d 字节  长度 %d 字节" % (nrc, ncmp, nbytes))
     ok = ok and (nrc == 0) and (ncmp == 0) and (nbytes > 0)
+
+    # ⑤ 收尾：删掉本轮写进去的测试文件，卡上不留垃圾
+    print("=" * 66)
+    print("⑤ 清理本轮产生的测试文件")
+    print("=" * 66)
+    if not unlink(PIC_FILE):
+        print("  [FAIL] 清理 %s 失败" % PIC_FILE)
+        ok = False
+    else:
+        print("  已清理 %s" % PIC_FILE)
 
     print("=" * 66)
     if ok:

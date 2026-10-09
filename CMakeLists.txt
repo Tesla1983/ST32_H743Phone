@@ -349,7 +349,9 @@ set(VENDOR_SRC
 # 来源：厂商资料包「实验27 FATFS实验」的 Middlewares/FATFS/source（ST 分发版）。
 # 只改了 ffconf.h（LFN 改静态缓冲 / 关 MKFS / 关 RTC 依赖），ff.c 等本体未改。
 # ffunicode.c 是各代码页的转码表——文件 1.9 MB 是**源码**体积，
-# 编进去的只有 FF_CODE_PAGE=936 那一份表（由 #if 决定），不是 1.9 MB。
+# 编进去的只有 FF_CODE_PAGE 指定的那一份表（由 #if 决定），不是 1.9 MB。
+# 2026-10-09 把 936（GBK 双字节表 ≈170 KB）换成 437（单字节表 ≈0 KB），
+# FLASH 立刻省 178 KB；理由与代价见 src/fatfs_port.h 顶部。
 # ⚠ 厂商那份 ffsystem.c **故意不编**：它 include 他们自己的 "./MALLOC/malloc.h"，
 #   提供的两样东西我们都不需要 ——
 #     · get_fattime()  仅当 FF_FS_NORTC == 0 才被调用（本工程没接 RTC，已设为 1）；
