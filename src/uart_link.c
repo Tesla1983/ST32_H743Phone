@@ -111,6 +111,59 @@ volatile int      g_uart_st_mon, g_uart_st_mday, g_uart_st_wday;
 volatile uint32_t g_uart_st_epoch;
 volatile int      g_uart_st_temp, g_uart_st_code;
 
+/* ---- 命令通道诊断量（2026-10-09）---- */
+volatile uint32_t g_cmd_tx;
+volatile uint32_t g_cmd_rx;
+volatile uint32_t g_cmd_xor_fail;
+volatile uint32_t g_cmd_ping_ok;
+volatile uint32_t g_cmd_weather_req;
+volatile uint32_t g_cmd_weather_ack;
+volatile uint32_t g_cmd_weather_ok;
+volatile uint32_t g_cmd_phase;
+volatile uint32_t g_cmd_bd_pkts;
+volatile uint32_t g_cmd_bd_id;
+volatile uint32_t g_cmd_bd_len;
+volatile uint32_t g_cmd_bd_crc_bad;
+volatile uint32_t g_cmd_bd_timeout;
+volatile uint32_t g_cmd_bd_toobig;
+volatile uint8_t  g_cmd_body[UART_LINK_BODY_CAP];
+volatile uint32_t g_cmd_body_len;
+volatile uint32_t g_cmd_req;
+
+/* ---- 二进制收取状态（$!BD 的裸负载）----
+ * s_bin_need != 0 即"二进制模式"：此时收到的字节**不参与行重组**，
+ * 直接按序填进 g_cmd_body，填满 need 个就收工。
+ * 为什么必须有超时：万一负载少发了几个字节（对端异常/线路丢字节），
+ * 没有超时就会把后续的推送帧也当成负载吞掉，链路永久错位。 */
+static uint32_t s_bin_need;
+static uint32_t s_bin_got;
+static uint32_t s_bin_id;
+static uint16_t s_bin_crc;
+static uint32_t s_bin_t0;      /* 进入二进制模式时的时基，用于超时 */
+#define BIN_TIMEOUT_MS   4000u
+
+/* ---- 命令状态机 ----
+ * IDLE  等板子起来（让对端上电那 ~0.5 s 的 ROM 乱码先过去）
+ * LINK  等线上出现字节 —— 证明"收"方向是通的，才值得去试"发"
+ * PING  已发 $?PING，等 $!RS
+ * WEA   已发 $?WEA，等受理回执
+ * WDATA 已受理，等 $WD 真的到（这才是 P1 的最终目的）
+ * DONE  结束（成功或放弃）
+ * ⚠ PING 3 次都没回就**不再往下走**：发方向不通时 WEA 同样不通，
+ *   继续发只是白占阻塞时间。判据也就变得极其干净：
+ *   g_cmd_tx=3 且 g_cmd_rx=0 ⇒ 发送方向的线没接。 */
+#define CMD_PH_IDLE    0u
+#define CMD_PH_LINK    1u
+#define CMD_PH_PING    2u
+#define CMD_PH_WEA     3u
+#define CMD_PH_WDATA   4u
+#define CMD_PH_DONE    5u
+
+static uint32_t s_cmd_phase;
+static uint32_t s_cmd_t0;      /* 本阶段起点 */
+static uint32_t s_cmd_try;     /* 本阶段已尝试次数 */
+static uint32_t s_cmd_wd0;     /* 发 WEA 时的 $WD 计数，用来判断"真的等到了" */
+
 /* ====================== 小工具 ====================== */
 
 static int to_int(const char* s)
@@ -156,6 +209,77 @@ static int hex2(const char* p)
         v = (v << 4) | d;
     }
     return v;
+}
+
+/* 4 位大写十六进制 → 数值（CRC-16 用）。非十六进制返回 -1。 */
+static int hex4(const char* p)
+{
+    int hi = hex2(p);
+    int lo = hex2(p + 2);
+    if (hi < 0 || lo < 0)
+        return -1;
+    return (hi << 8) | lo;
+}
+
+/* CRC-16/CCITT-FALSE：poly 0x1021，初值 0xFFFF，无反射、无末异或。
+ * ⚠ 与对端 uplink_cmd.c 的 crc16_ccitt() **逐位相同**，改一边必须改另一边。
+ * 为什么裸负载不用 XOR8：XOR 对"字节换位""整段偏移"完全无感，
+ * 而裸负载没有帧边界可依，只能靠长度 + CRC。 */
+/* 形参带 volatile：g_cmd_body 是 volatile 的（脚本会经 SWD 直接读它），
+ * C 允许"加限定"转换，因此普通指针也能传进来。 */
+static uint16_t crc16(const volatile uint8_t* d, uint32_t n)
+{
+    uint16_t c = 0xFFFFu;
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        c ^= (uint16_t)((uint16_t)d[i] << 8);
+        for (int b = 0; b < 8; ++b)
+            c = (c & 0x8000u) ? (uint16_t)((c << 1) ^ 0x1021u)
+                              : (uint16_t)(c << 1);
+    }
+    return c;
+}
+
+/* 组一条命令帧 "$<type>[,<body>]*HH\r\n"（HH = 2 位大写十六进制 XOR）。
+ * body 为 NULL 或空串时不写逗号（$?PING*HH 而不是 $?PING,*HH）。
+ * ⚠ 手写而不用 snprintf：不必为了 6 个字符把 printf 家族拖进固件。
+ * 校验范围与对端一致：type（含前导 '?'）+ [','] + body。 */
+static int cmd_frame(char* out, int cap, const char* type, const char* body)
+{
+    static const char HEX[] = "0123456789ABCDEF";
+    int      k = 0;
+    uint8_t  x = 0;
+    int      has_body = (body != NULL && body[0] != 0);
+
+    if (out == NULL || cap < 8 || type == NULL)
+        return -1;
+
+    out[k++] = '$';
+    for (const char* p = type; *p != 0; ++p)
+    {
+        if (k >= cap - 6) return -1;
+        out[k++] = *p;
+        x ^= (uint8_t)*p;
+    }
+    if (has_body)
+    {
+        if (k >= cap - 6) return -1;
+        out[k++] = ',';
+        x ^= (uint8_t)',';
+        for (const char* p = body; *p != 0; ++p)
+        {
+            if (k >= cap - 6) return -1;
+            out[k++] = *p;
+            x ^= (uint8_t)*p;
+        }
+    }
+    out[k++] = '*';
+    out[k++] = HEX[(x >> 4) & 0xFu];
+    out[k++] = HEX[x & 0xFu];
+    out[k++] = '\r';
+    out[k++] = '\n';
+    out[k]   = 0;
+    return k;
 }
 
 /* 原地按 ',' 切分：把分隔符写成 '\0'，返回字段数。
@@ -221,7 +345,15 @@ static int parse_frame(const uint8_t* line, uint32_t len)
     int claimed = hex2(star + 1);
     if (claimed < 0 || claimed != (int)x)
     {
-        g_net_xor_fail++;
+        /* 按方向分开记：推送帧坏 → g_net_xor_fail；响应帧坏 → g_cmd_xor_fail。
+         * 分开的意义：命令方向的那根线往往是后补的，坏帧会集中出现在那一侧，
+         * 混在一个计数里就看不出是哪根线的问题。
+         * ⚠ 两个计数都必须**真的被用到**：本工程开了 --gc-sections，
+         *   只声明不使用的全局变量会被整段回收，脚本读符号时直接 KeyError。 */
+        if (dollar[1] == '!')
+            g_cmd_xor_fail++;
+        else
+            g_net_xor_fail++;
         return -4;
     }
 
@@ -291,6 +423,48 @@ static int parse_frame(const uint8_t* line, uint32_t len)
         }
         g_net_wf_ip[i] = 0;
         g_net_wf_pkts++;
+        return 0;
+    }
+
+    /* ---- 命令响应：$!RS,<CMD>,<rc>[,<附加>] ---- */
+    if (nf >= 3 && f[0][0] == '!' && f[0][1] == 'R' && f[0][2] == 'S')
+    {
+        g_cmd_rx++;
+        /* f[1] = 命令名，f[2] = rc。只认"受理成功"（rc > 0）才推进状态机。 */
+        if (nf >= 3 && f[1][0] == 'W' && f[1][1] == 'E' && f[1][2] == 'A')
+        {
+            if (to_int(f[2]) > 0)
+                g_cmd_weather_ack++;
+        }
+        return 0;
+    }
+
+    /* ---- 大块数据头帧：$!BD,<id>,<len>,<crc16> ----
+     * 之后紧跟 len 字节裸负载，由 uart_link_poll 的二进制模式收走。
+     * ⚠ 这里**不能**直接 return 后继续按行解析：负载里可能含 '$'、'\r'、'\n'，
+     *   按行收必然错位。所以只在这里置状态，收字节的动作交给二进制模式。 */
+    if (nf >= 4 && f[0][0] == '!' && f[0][1] == 'B' && f[0][2] == 'D')
+    {
+        uint32_t n   = to_u32(f[2]);
+        int      crc = hex4(f[3]);
+        g_cmd_bd_pkts++;
+
+        if (crc < 0)
+        {
+            g_cmd_bd_crc_bad++;      /* CRC 字段本身坏，不敢进二进制模式 */
+            return 0;
+        }
+        if (n == 0u || n > UART_LINK_BODY_CAP)
+        {
+            g_cmd_bd_toobig++;       /* 装不下（或对端报 0 字节）：整块放弃 */
+            return 0;
+        }
+        s_bin_need = n;
+        s_bin_got  = 0u;
+        s_bin_id   = to_u32(f[1]);
+        g_cmd_bd_id = s_bin_id;
+        s_bin_crc  = (uint16_t)crc;
+        s_bin_t0   = s_now_ms;
         return 0;
     }
 
@@ -388,6 +562,139 @@ int uart_link_init(uint32_t baud)
     return 0;
 }
 
+/* ====================== 命令通道（本板 → 对端） ====================== */
+
+/* 手工触发用的测试 URL（g_cmd_req=3）。选它是因为**本机实测可达**，
+ * 而且响应 < 2048 字节时不会被截断，方便脚本和 PC 端抓到的内容逐字节比对。
+ * 现在实测响应约 3.5 KB ⇒ 会被截到 2048，脚本按 2048 比对即可。 */
+#define CMD_TEST_URL  "http://t.weather.sojson.com/api/weather/city/101010100"
+
+int uart_link_cmd(const char* type, const char* body)
+{
+    char out[64];
+    int  n = cmd_frame(out, (int)sizeof(out), type, body);
+    if (n <= 0)
+        return -1;
+    g_cmd_tx++;
+    (void)uart_link_send(out);      /* 阻塞轮询，短帧 <20 字节 ⇒ ~0.2 ms @921600 */
+    return n;
+}
+
+static void cmd_tick(uint32_t now_ms)
+{
+    /* ---- 脚本手工触发（g_cmd_req）：写 1/2/3，发完自动清 0 ---- */
+    if (g_cmd_req != 0u)
+    {
+        uint32_t r = g_cmd_req;
+        g_cmd_req  = 0u;
+        if (r == 1u)
+        {
+            (void)uart_link_cmd("?PING", NULL);
+        }
+        else if (r == 2u)
+        {
+            g_cmd_weather_req++;
+            (void)uart_link_cmd("?WEA", NULL);
+        }
+        else if (r == 3u)
+        {
+            (void)uart_link_cmd("?WGET", "1," CMD_TEST_URL);
+        }
+        return;
+    }
+
+    switch (s_cmd_phase)
+    {
+    case CMD_PH_IDLE:
+        /* 等 2 s：让对端上电那一段 ROM 乱码（74880 波特）先过去，
+         * 否则我们发的命令会混在乱码里，对端收到的是脏行。 */
+        if (now_ms < 2000u)
+            break;
+        s_cmd_phase = CMD_PH_LINK;
+        s_cmd_t0    = now_ms;
+        break;
+
+    case CMD_PH_LINK:
+        /* 先确认"收"方向通了（线上有字节），再试"发" —— 收都不通时
+         * 发的方向多半也没接，这时发命令只是白占阻塞时间。 */
+        if (g_uart_rx_bytes != 0u)
+        {
+            s_cmd_phase = CMD_PH_PING;
+            s_cmd_t0    = now_ms;
+            s_cmd_try   = 0u;
+            (void)uart_link_cmd("?PING", NULL);
+        }
+        else if (now_ms - s_cmd_t0 > 10000u)
+        {
+            s_cmd_phase = CMD_PH_DONE;      /* 10 s 一个字节都没有 ⇒ 线不通 */
+        }
+        break;
+
+    case CMD_PH_PING:
+        if (g_cmd_rx != 0u)                 /* 收到任意 $!RS 即算握手成功 */
+        {
+            g_cmd_ping_ok++;
+            s_cmd_phase = CMD_PH_WEA;
+            s_cmd_t0    = now_ms;
+            s_cmd_try   = 0u;
+            s_cmd_wd0   = g_net_wd_pkts;
+            g_cmd_weather_req++;
+            (void)uart_link_cmd("?WEA", NULL);
+            break;
+        }
+        if (now_ms - s_cmd_t0 > 1500u)
+        {
+            if (++s_cmd_try >= 3u)
+            {
+                s_cmd_phase = CMD_PH_DONE;  /* 发方向不通，不再往下试 */
+                break;
+            }
+            s_cmd_t0 = now_ms;
+            (void)uart_link_cmd("?PING", NULL);
+        }
+        break;
+
+    case CMD_PH_WEA:
+        if (g_cmd_weather_ack != 0u)
+        {
+            s_cmd_phase = CMD_PH_WDATA;
+            s_cmd_t0    = now_ms;
+            break;
+        }
+        if (now_ms - s_cmd_t0 > 2000u)
+        {
+            if (++s_cmd_try >= 3u)
+            {
+                s_cmd_phase = CMD_PH_DONE;
+                break;
+            }
+            s_cmd_t0 = now_ms;
+            g_cmd_weather_req++;
+            (void)uart_link_cmd("?WEA", NULL);
+        }
+        break;
+
+    case CMD_PH_WDATA:
+        /* 真正的判据：受理之后 $WD 帧数**涨了**。
+         * 只看 $!RS,WEA,1 不够 —— 那只说明对端答应了，不代表天气真取到了。 */
+        if (g_net_wd_pkts > s_cmd_wd0)
+        {
+            g_cmd_weather_ok++;
+            s_cmd_phase = CMD_PH_DONE;
+        }
+        else if (now_ms - s_cmd_t0 > 20000u)
+        {
+            s_cmd_phase = CMD_PH_DONE;      /* 20 s 还没等到，放弃（30 min 后对端会自己推） */
+        }
+        break;
+
+    default:
+        break;
+    }
+
+    g_cmd_phase = s_cmd_phase;
+}
+
 /* ====================== 中断 ====================== */
 
 void USART6_IRQHandler(void)
@@ -455,6 +762,23 @@ void uart_link_poll(uint32_t now_ms)
         s_tail = (s_tail + 1u) & RING_MASK;
         g_uart_last_ms = now_ms;
 
+        /* 二进制模式（$!BD 的裸负载）：**按长度收**，不看内容、不参与行重组。
+         * 这样负载里含 '$' / '\r' / '\n' 也不会把解析搞乱。 */
+        if (s_bin_need != 0u)
+        {
+            g_cmd_body[s_bin_got++] = c;
+            if (s_bin_got >= s_bin_need)
+            {
+                uint16_t cc = crc16(g_cmd_body, s_bin_need);
+                g_cmd_bd_len   = s_bin_need;
+                g_cmd_body_len = s_bin_need;
+                s_bin_need     = 0u;
+                if (cc != s_bin_crc)
+                    g_cmd_bd_crc_bad++;
+            }
+            continue;
+        }
+
         if (c == (uint8_t)'\n')
         {
             if (s_line_n > 0u)
@@ -485,6 +809,17 @@ void uart_link_poll(uint32_t now_ms)
                 s_line_n = 0u;          /* 超长：整行作废，等下一帧 */
         }
     }
+
+    /* 二进制模式超时兜底：负载少发几个字节时，没有这个会一直吞掉后续的
+     * 推送帧（时间/天气），链路永久错位 —— 所以宁可丢这一块也要退出。
+     * 用减法比较，天然正确处理 32 位时基回绕。 */
+    if (s_bin_need != 0u && (now_ms - s_bin_t0) > BIN_TIMEOUT_MS)
+    {
+        g_cmd_bd_timeout++;
+        s_bin_need = 0u;
+    }
+
+    cmd_tick(now_ms);
 
     g_uart_idle_ms = now_ms - g_uart_last_ms;
 }

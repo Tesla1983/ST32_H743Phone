@@ -727,12 +727,22 @@ int main(void)
      * 必须由人显式触发：SWD 写 g_sd_test = 1，或 python tools/sd_check.py。 */
     (void)sd_card_init();
 
-    /* ---- ESP32 上行链路（USART6 / PC6-TX / PC7-RX，115200）----
+    /* ---- ESP32 上行链路（USART6 / PC6-TX / PC7-RX，921600）----
      * 对端每 10 s 发一帧 $DT（NTP 时间）、每 30 min 一帧 $WD（天气）。
      * ⚠ 没接对端 / 波特率不对**不影响任何其他功能**：uart_link_init 只把失败
      *   记进 g_uart_rc 就返回，UI 上时间显示"--:--"、天气显示"等待天气"。
-     * 判据看 g_uart_rx_bytes 有没有在涨、g_uart_err_fe 是不是 0。 */
-    (void)uart_link_init(115200u);
+     * 判据看 g_uart_rx_bytes 有没有在涨、g_uart_err_fe 是不是 0。
+     *
+     * ⚠ 波特率 2026-10-09 从 115200 提到 **921600**（对端同步改，
+     *   CONFIG_UPLINK_UART_BAUD）：为 P2 的 $!BD 大块数据通道准备的 ——
+     *   115200 下传 2 KB 要 178 ms，921600 只要 22 ms。
+     *   误差账（两侧都算过，不是拍的）：
+     *     USART6 内核时钟 = PCLK2 = 100 MHz；HAL 的 UART_DIV_SAMPLING16
+     *     = (100e6 + 460800) / 921600 = **BRR 109** ⇒ 实际 917 431（−0.45%）
+     *     对端 ESP32 是 80 MHz APB + 小数分频，误差 <0.02%
+     *     ⇒ 合计约 0.46%，远在 8N1/16 倍采样的容差（约 ±2%）内。
+     *   实测判据：稳定期 g_uart_err_fe / ne 增量为 0（见 tools/uart_check.py）。 */
+    (void)uart_link_init(921600u);
 
     /* ---- 板载 RTC（LSE 32.768 kHz，原理图 Y1 / PC14-PC15）2026-10-09 ----
      * 解决"每次复位都要等首帧 $DT 才有时间与日期"：VDD 不断时备份域保持，

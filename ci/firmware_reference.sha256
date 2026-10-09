@@ -249,5 +249,63 @@
 #   img_check XIP 读回 vs 主机参考**逐字节失配 0**；
 #   jpeg_check 三用例（240×180 误差 3.51 / 284×230 误差 3.61 / 640×480 正确拒绝 rc=7），
 #   平坦区平均误差 2.72 / 2.73 且**零超差**，与第九版完全一致 ⇒ 无回归。
-a9f06c972ca27a4031c903b3357771a7d9362ed926582f7341306c1e47514ab3  ymgui-h743.bin
-c286b46af91215bdb8047601c73356d438fc568c683a7ef06e223094cc889e06  ymgui-h743.elf
+# --- 第十版（FF_CODE_PAGE 437）：已被第十一版取代 ---
+# a9f06c972ca27a4031c903b3357771a7d9362ed926582f7341306c1e47514ab3  ymgui-h743.bin
+# c286b46af91215bdb8047601c73356d438fc568c683a7ef06e223094cc889e06  ymgui-h743.elf
+
+# ============================================================================
+# 第十一版（2026-10-09）· 命令通道 P0/P1/P2 + 波特率 115200 → 921600
+# ============================================================================
+# 本版做了两件事，都集中在 USART6 这一条链路上：
+#
+# 1. **命令通道**（本板 → 对端 ESP32），把对端当成"外挂 WiFi"用：
+#      $?PING                → $!RS,PING,1,<uptime_ms>
+#      $?WEA                 → $!RS,WEA,1（受理）→ 随后推 $WD
+#      $?WGET,<id>,<url>     → $!BD,<id>,<len>,<crc16> + len 字节裸负载
+#    实现要点（容易踩的）：
+#    · 二进制模式：$!BD 头帧之后**按长度收** len 字节，字节不再参与行重组 ——
+#      否则负载里含 '$' 或 CR/LF 必然把解析搞乱。带 4 s 超时兜底，
+#      负载缺字节时宁可丢这一块，也不让后续推送帧被吞掉（那会永久错位）。
+#    · CRC-16/CCITT-FALSE（poly 0x1021 / 初值 0xFFFF / 无反射），
+#      与对端 uplink_cmd.c 的 crc16_ccitt() 逐位一致，改一边必须改另一边。
+#    · 开机状态机：IDLE→LINK→PING→WEA→WDATA→DONE。PING 3 次无回应即放弃
+#      （发方向不通时 WEA 同样不通，继续发只白占阻塞时间）。
+#      判据因此极简：**g_cmd_tx=3 且 g_cmd_rx=0 ⇒ 发送方向的线没接**。
+#    · --gc-sections 会回收"只声明不使用"的全局量：g_cmd_xor_fail 第一版就是
+#      这样被回收掉，脚本读符号直接 KeyError。现在它真的被用到了（按方向分计数）。
+#
+# 2. **波特率 115200 → 921600**（为 $!BD 大块数据准备；2 KB 从 178 ms → 22 ms）。
+#      误差账：USART6 内核时钟 = PCLK2 = 100 MHz，HAL 的整数分频 BRR = 109
+#      ⇒ 实际 917 431（−0.45%），对端 80 MHz + 小数分频（<0.02%），
+#      合计约 0.46%，远在 8N1/16 倍采样容差内。
+#
+# ★ 本版在**对端**（E:\workbuddy\esp32-com8，不是 git 仓库）新增/改动的文件：
+#     main/uplink_cmd.c / .h（新增：常驻命令接收任务）
+#     main/uplink_uart.c/.h（新增 uplink_frame_port / uplink_cmd_port 查询）
+#     main/time_weather.c（消费 CMD_EV_WEATHER_NOW；新增缓存天气重推）
+#     main/Kconfig.projbuild（UPLINK_CMD_PORT / UPLINK_WEATHER_REPUSH_S）
+#     tools/cmd_check.py（新增：用 PC 冒充 STM32 验收命令通道）
+#
+# 验收（全部 PASS）：
+#   · 对端三用例（tools/cmd_check.py，PC 冒充 STM32，零 GPIO 风险）：
+#       PING → $!RS,PING,1,4786*20
+#       WEA  → $!RS,WEA,1*42 → 随后 $WD,259,43,76,105,17,霾*D2
+#       WGET → $!BD,1,2048,DF73*32 + 2048 字节，CRC 一致，
+#              **与 PC 抓的同一 URL 逐字节相同**（总长 4106，按设计截断到 2048）
+#   · tools/uart_check.py --wait 20（推送方向，921600）：PASS
+#       baud=921600、+3 帧、$DT +2、FE=0 NE=0、XOR 失败 0
+#   · 70 s 稳定期增量：FE/NE/ORE/PE 全 +0、XOR 失败 +0、坏帧 +0
+#   · 复位后首帧 $WD 用时 **39 s**（此前最坏 1800 s）—— 由对端重推兜底兑现
+#   · tools/clock_shot.py 抓屏正常（18:41 / 10月9日 星期五 / 霾 25.9℃）
+#
+# ⚠ **命令方向在板上暂未通**（不是软件问题）：实测 g_cmd_tx=3 / g_cmd_rx=0。
+#   为判定"线接没接"，把 PC6 临时切成带下拉的输入**被动读电平**
+#   （不驱动任何引脚）：PC7=1（被对端 TX 空闲高电平驱动 ⇒ 方法有效）、
+#   **PC6=0 ⇒ 没有东西在驱动它**，即 PC6 未接到 GPIO3。
+#   ⇒ 需补一根线：PC6(USART6_TX) → 对端命令口 RX（默认 UART2 / GPIO16，板上 RX2）。
+#     不要接到 GPIO3 —— 那是板载 CH340 的 TX，两个推挽驱动会抢同一条线。
+#   接好后 g_cmd_rx 会自然开始增长，无需改任何代码（命令口默认已是 OTHER）。
+#
+# FLASH 1 630 292 B（77.74%）。
+813535f58c927ca7cd1ffbe5f5ecd5c22e5933d2909d175e897aa3c6215dfc23  ymgui-h743.bin
+ecce4359a27a318219bc35640b42a1f38645f57b05ad44c0d3f0dc23b6eb2f9a  ymgui-h743.elf

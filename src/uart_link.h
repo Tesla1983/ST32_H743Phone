@@ -1,5 +1,5 @@
 /* ===========================================================================
- * ESP32 ↔ STM32H743 串口链路（USART6 / PC6-TX / PC7-RX，115200 8N1）
+ * ESP32 ↔ STM32H743 串口链路（USART6 / PC6-TX / PC7-RX，**921600** 8N1）
  *
  * 接线：
  *   PC6 (USART6_TX) → 对端帧口的 RX
@@ -34,6 +34,32 @@
  *   $WD,200,47,65,111,0,晴*EB
  *   $WF,1,192.168.1.2,-76*08
  *
+ * ---- 命令通道（2026-10-09 新增，把对端 ESP32 当成"外挂 WiFi"用）----
+ *   上面那一组是**推送**（对端主动，10 s / 30 min 一帧）。命令通道把方向反过来：
+ *
+ *     命令（本板 → 对端）  $?<CMD>[,<参数>]*HH\r\n
+ *     响应（对端 → 本板）  $!RS,<CMD>,<rc>[,<附加>]*HH\r\n      单行响应
+ *                          $!BD,<id>,<len>,<crc16>*HH\r\n      头帧
+ *                          <紧跟 len 字节裸负载>                二进制负载
+ *
+ *   $?PING                 → $!RS,PING,1,<uptime_ms>   握手（判据：g_cmd_tx/rx 都涨）
+ *   $?WEA                  → $!RS,WEA,1（已受理，随后推 $WD）/ -1（对端未联网）
+ *                            解决"STM32 复位后天气最多要等 30 min"的问题：开机问一次。
+ *   $?WGET,<id>,<url>      → $!BD,<id>,<len>,<crc16> + len 字节裸负载；失败回 $!RS,WGET,0
+ *                            通用 HTTP 通道，给将来下图片 / 下固件用。
+ *
+ *   ⚠ 大数据为什么要"头帧 + 定长裸负载"：本模块单行上限只有 200 字节
+ *     （UART_LINK_LINE_MAX，超了整行作废），而 HTTP 响应随便几 KB。
+ *     所以头帧仍是普通 ASCII 行（有 XOR，长度与 CRC 可信），
+ *     之后**按长度收**恰好 len 字节 —— 负载里含 '$' 或换行都不会乱。
+ *     本模块由此多出一个"二进制模式"：进入后字节不再参与行重组。
+ *
+ *   ⚠ 发送方向要接一根线：PC6(USART6_TX) → 对端命令口的 RX。
+ *     默认推荐接到 **GPIO16**（对端 UART2 的 RX，纯 GPIO）；
+ *     **不要**接到 GPIO3 —— 那是开发板上标 "RX" 的脚，已被板载 CH340 的 TX
+ *     驱动着，两个推挽驱动同一条线会形成直通电流。
+ *     判据：g_cmd_tx 涨而 g_cmd_rx 不涨 ⇒ 这根线没接（或对端没在听）。
+ *
  * ⚠⚠ 三个绕开厂商代码的决定（改这几处前先读懂，否则会原样再踩一遍）：
  *
  * 1. **不能用 HAL 的 HAL_UART_Receive_IT()**。
@@ -49,7 +75,9 @@
  * 2. **USART6 挂在 APB2**，时钟源默认 D2PCLK2 = PCLK2 = 100 MHz
  *    （厂商 sys.c：SYSCLK 400M / HCLK 200M / APB2 = 100M）。HAL 的
  *    UART_GETCLOCKSOURCE 认 USART6（stm32h7xx_hal_uart_ex.h:340），未用 RCCEx
- *    改过源时取的就是 PCLK2 ⇒ 115200 的 BRR 算得对。
+ *    改过源时取的就是 PCLK2 ⇒ 波特率算得对。
+ *    2026-10-09 提到 921600：整数分频 BRR=109 ⇒ 实际 917 431（−0.45%），
+ *    对端 80 MHz + 小数分频（<0.02%）⇒ 合计约 0.46%，在 8N1/16 倍采样容差内。
  *
  * 3. **中断向量要手工开槽**。启动文件原来是 `.rept 150` 全落 Default_Handler
  *    （死循环）。USART6_IRQn = 71，要把 150 拆成 49 + 1 + 21 + 1 + 78
@@ -69,6 +97,10 @@
 #include <stdint.h>
 
 #define UART_LINK_LINE_MAX  200u   /* 单行上限，超了丢掉重来 */
+
+/* 命令通道的负载上限（$!BD 的裸数据）。与对端 uplink_cmd.c 的 CMD_BODY_CAP
+ * **必须一致**：不一致时会出现"对端发 2048、本板判超限丢弃"。 */
+#define UART_LINK_BODY_CAP  2048u
 
 /* ---- 链路诊断量（全部 volatile，SWD 可读）---- */
 extern volatile int      g_uart_rc;         /* 0 = 初始化成功；<0 见 .c 里的返回码 */
@@ -90,7 +122,7 @@ extern volatile uint32_t g_uart_line_len;
 
 /* 开机后最早的 16 个字节。对端若**不发换行符**，g_uart_line 会一直是空的，
  * 这时靠这 16 个字节也能看出它在发什么；还能看波特率对不对
- * （115200 收到 0x00/0xFF 或固定乱码，多半是速率或电平不匹配）。 */
+ * （收到 0x00/0xFF 或固定乱码，多半是速率或电平不匹配）。 */
 extern volatile uint8_t  g_uart_raw[16];
 extern volatile uint32_t g_uart_raw_n;
 
@@ -117,6 +149,34 @@ extern volatile uint32_t g_net_wf_pkts;    /* 收到的 $WF 帧数 */
 extern volatile uint32_t g_net_xor_fail;   /* XOR 校验失败的帧数 */
 extern volatile uint32_t g_net_bad_pkts;   /* 有 '$' 有 '*' 但字段不对的帧数 */
 
+/* ---- 命令通道诊断量（2026-10-09）----
+ * 判链路是否双向通：**只看 g_cmd_tx 与 g_cmd_rx**。
+ *   g_cmd_tx 涨、g_cmd_rx 不涨  ⇒ 发送方向的线没接 / 对端没在听（最常见）
+ *   两者都涨                    ⇒ 双向通
+ */
+extern volatile uint32_t g_cmd_tx;           /* 已发出的命令帧数 */
+extern volatile uint32_t g_cmd_rx;           /* 已收到的 $! 响应帧数 */
+extern volatile uint32_t g_cmd_xor_fail;     /* 响应校验失败（说明线路有噪声） */
+extern volatile uint32_t g_cmd_ping_ok;      /* PING 握手成功次数 */
+extern volatile uint32_t g_cmd_weather_req;  /* 发出的 $?WEA 次数 */
+extern volatile uint32_t g_cmd_weather_ack;  /* 收到 $!RS,WEA,1 的次数 */
+extern volatile uint32_t g_cmd_weather_ok;   /* 请求之后确实等到 $WD 的次数 */
+extern volatile uint32_t g_cmd_phase;        /* 命令状态机当前阶段（见 .c 里的枚举） */
+
+/* $!BD 大块数据 */
+extern volatile uint32_t g_cmd_bd_pkts;      /* 收到 BD 头帧数 */
+extern volatile uint32_t g_cmd_bd_id;        /* 最后一次的 id（回传给请求方） */
+extern volatile uint32_t g_cmd_bd_len;       /* 最后一次收到的负载长度 */
+extern volatile uint32_t g_cmd_bd_crc_bad;   /* CRC 校验失败次数 */
+extern volatile uint32_t g_cmd_bd_timeout;   /* 等负载超时（长度对不上）次数 */
+extern volatile uint32_t g_cmd_bd_toobig;    /* 长度超过本板缓冲，直接丢弃 */
+extern volatile uint8_t  g_cmd_body[UART_LINK_BODY_CAP];  /* 最近一次收到的负载 */
+extern volatile uint32_t g_cmd_body_len;
+
+/* 手工触发（脚本用）：写 1 = 发一次 $?PING；写 2 = 发一次 $?WEA；
+ * 写 3 = 发一次 $?WGET 取 httpbin 的 1 KB 测试数据。固件发完自动清 0。 */
+extern volatile uint32_t g_cmd_req;
+
 /* ---- 自检（没有对端也能验证「解析 → 换算 → 显示」这条链）----
  * 写 1：把上面三行实测样本逐字节喂进**真正的解析函数**（不是另写一份），
  *       跑完固件清 0。链路本身通不通仍然要看 g_uart_rx_bytes 有没有在涨 ——
@@ -137,6 +197,12 @@ extern volatile int      g_uart_st_temp, g_uart_st_code;
 int  uart_link_init(uint32_t baud);        /* 返回 0 成功 */
 void uart_link_poll(uint32_t now_ms);      /* 主循环每拍调一次 */
 int  uart_link_send(const char* text);     /* 发送（回显/握手用），返回发出字节数 */
+
+/* 发一条命令帧 $?<type>[,<body>]*HH\r\n（body 为 NULL 或空串时不带逗号）。
+ * 返回发出的字节数；<0 = 参数非法或缓冲不足。
+ * ⚠ 发送是**阻塞轮询**（115200 下每字节 ~87 µs，921600 下 ~11 µs），命令帧都很短，
+ *   但别在渲染路径里高频调用。 */
+int  uart_link_cmd(const char* type, const char* body);
 
 /* ---- 给 UI 的换算结果 ----
  * 为什么要这几个：phone_shell 不认识 g_net_* 这些变量，也不该认识（与
