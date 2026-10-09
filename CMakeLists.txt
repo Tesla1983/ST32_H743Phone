@@ -389,6 +389,11 @@ set(HAL_SRC
 	# （HAL_RTCEx_BKUPRead/Write），本模块用 BKP_DR0 记"备份域已校准"标记。
 	${TP}/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_rtc.c
 	${TP}/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_rtc_ex.c
+	# JPEG 硬解码（2026-10-09）：H743 自带 JPEG 编解码器，用来在**不占整帧内存**
+	# 的前提下把卡上的 .jpg 转成 RGB565 灌进 W25Q128（流式分块，见 src/img_store.c
+	# 的 import_jpeg）。只编 hal_jpeg —— 不用 MDMA/DMA2D：解码走 polling，
+	# YCbCr→RGB565 由 CPU 做（65k 像素约几毫秒，比引两个新外设划算得多）。
+	${TP}/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_jpeg.c
 )
 
 # ---- YMGUI 库本体（12 个可移植层，GLOB 与官方同口径）----

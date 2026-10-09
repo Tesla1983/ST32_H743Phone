@@ -152,6 +152,14 @@ extern volatile uint32_t g_scan_cyc;     /* 上次扫描耗时的 DWT 周期数 
 extern volatile uint32_t g_scan_fs_rc;   /* 最后一个 FRESULT */
 extern volatile uint32_t g_scan_kind;    /* 上次扫的是哪个分类：1=照片 2=笔记 */
 
+/* ---- JPEG 解码诊断（2026-10-09）----
+ * g_jpeg_diag[0..3]  **第一块**的三个平面首字节（用来确认 Y/Cb/Cr 的排列顺序）与行号；
+ * g_jpeg_swap        运行期开关：1 = 把第二、三平面当 Cr、Cb（即交换色度分量）。
+ *   为什么做成开关：JPEG 输出的色度平面顺序要**靠板上实测**确定，猜错了就得重新
+ *   烧一次固件（一次 3.5 分钟）。做成开关后，读到 diag 就能当场定序、当场验证。 */
+extern volatile uint32_t g_jpeg_diag[8];
+extern volatile uint32_t g_jpeg_swap;
+
 /* 笔记读写的诊断量（SWD 直读，判据用） */
 extern volatile int32_t  g_note_rc;      /* 0 = 成功；<0 见 img_store.c 的返回码 */
 extern volatile uint32_t g_note_bytes;   /* 上次读/写的字节数 */

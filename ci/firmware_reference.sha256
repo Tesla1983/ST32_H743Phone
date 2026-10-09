@@ -170,5 +170,24 @@
 #   笔记含中文往返失配 0）；tools/ribbon_check.py 四项全 PASS；
 #   满负载 10.87 ms / 92.0 FPS（基线 10.92 ms / 91.6 FPS，无回归）。
 # FLASH 1 796 476 B（85.66%），比第六版 +5 168 B。
-1633fdcad3cda8c8ecbe9aece13e3dfc9be88ed556278f591f1d45b1d5fb79e8  ymgui-h743.bin
-741fd3a3d3806cb12f11c48bb3bdd88a73fa2fdc2d6585d95a5ce32fa7b8e57d  ymgui-h743.elf
+# 1633fdcad3cda8c8ecbe9aece13e3dfc9be88ed556278f591f1d45b1d5fb79e8  ymgui-h743.bin
+# 741fd3a3d3806cb12f11c48bb3bdd88a73fa2fdc2d6585d95a5ce32fa7b8e57d  ymgui-h743.elf
+
+# ---- 第八版（2026-10-09）：JPEG 硬件解码通路（**施工中，功能未验收**）----
+#
+# ⚠⚠ 本版是**带已知缺陷的中间状态**，只为保证"板上跑的那份 = 仓库里的那份"而更新哈希，
+#    **不是**把缺陷当成完成的功能。已知缺陷见 README §10：
+#    硬件解码的**输出数据没有真正落到缓冲里**（实测整块 768 字节全是 0x80 中性值），
+#    于是转出来的画面是灰的（平均每通道误差 67/255）。通路骨架是对的：
+#      · 尺寸解析正确（240×180 / 284×230 都能解出声明的宽高）
+#      · 分块 + 流式写 W25Q128 + XIP 索引正确（rc=0、字节数 = w*h*2 分毫不差）
+#      · 超尺寸拒绝正确（640×480 → rc=7 RC_TOO_WIDE）
+#    ⇒ 待修点：改用 HAL_JPEG_Decode_DMA/IT（厂商「实验30」用的是 MDMA 双缓冲 +
+#      中断，很可能 H7 的 JPEG 输出必须走 MDMA，CPU polling 读 DOR 拿不到数据）。
+#    修完要把本注释块整体替换掉。
+#
+# 为什么变：新增 src/img_store.c 的 import_jpeg（分块解码 + 边转边写 + 尺寸限制）、
+#   CMake 加 hal_jpeg、新增诊断量 g_jpeg_diag / g_jpeg_swap、新增 tools/jpeg_check.py。
+# FLASH 1 801 916 B（85.92%），比第七版 +5 440 B。
+03de97803bf6165bf08307d5cc33b4b3a67dbd80922a68d979a52745cc313945  ymgui-h743.bin
+70bbd12d911be0269ccd807082f417004ba36531bb910b5076b9eee77d4f67d6  ymgui-h743.elf

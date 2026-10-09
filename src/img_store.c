@@ -13,6 +13,7 @@
 #include "ff.h"
 #include "diskio.h"
 #include "stm32h7xx_hal.h"
+#include "stm32h7xx_hal_jpeg.h"
 #include "qspi_port.h"
 #include "fatfs_port.h"
 #include "board_fault.h"
@@ -38,6 +39,8 @@ int BoardNote_Load(int i, char* out, int n);
 #define RC_READ_ROW    12u
 #define RC_WRITE_FILE  13u
 #define RC_CLOSE       14u
+#define RC_JPEG_DEC    15u   /* JPEG：HAL_JPEG_Decode 没返回 HAL_OK */
+#define RC_JPEG_SHORT  16u   /* JPEG：解码出的字节数与头里声明的宽高不一致（多半是截断文件） */
 
 /* ---- 步骤编号（g_img_step）---- */
 #define STEP_MOUNT   1u
@@ -525,6 +528,521 @@ static uint32_t import_bmp(void)
     return 0u;
 }
 
+/* ===========================================================================
+ * JPEG 硬解码导入（2026-10-09）—— "没有整帧内存"怎么做
+ *
+ * 【问题】相册面板 284×230 的 RGB565 全帧 = 130 640 B，而把整帧留在 RAM 里
+ *   既不经济也不安全（还要留余量给别的分配）。
+ *
+ * 【解法：分块解码 + 边转边写】
+ *   H743 自带 JPEG 编解码器，输出是**按 MCU 行**增量吐出的：
+ *     4:2:0 → 一块 = 宽×16 行，YUV 共 24×宽 字节（厂商「实验30」实测公式）
+ *     4:2:2 → 一块 = 宽×8 行，16×宽 字节
+ *     4:4:4 → 一块 = 宽×8 行，24×宽 字节
+ *   于是：一块 YUV 到手 → 立刻转 RGB565 → 攒进 4 KB 块 → 满了就写 W25Q128
+ *   → 最后从 XIP 显示（零 RAM）。
+ *   峰值 RAM ≈ 输入 4 KB + YUV 块 7.7 KB ≈ 12 KB，而不是 130 KB。
+ *
+ * 【为什么不用 MDMA / DMA2D】
+ *   解码走 polling（HAL_JPEG_Decode），YCbCr→RGB565 由 CPU 做：65 k 像素
+ *   约几毫秒，比再引 MDMA + DMA2D 两个外设（还要开中断槽位）划算得多。
+ *
+ * 【尺寸硬限制 —— 这也是"没有内存"的另一半答案】
+ *   硬件**没有缩放**（JPEG CONFR0~7 无 SCALE 位，DMA2D 也不能缩放），
+ *   降采样只能 CPU 做。⇒ 超过上限的图**直接拒绝**，不去换内存布局迁就它。
+ *   真要显示大图，正确做法是在 PC 侧预缩到相册尺寸再放进卡里。
+ * =========================================================================== */
+
+#define JPEG_IN_BUF    4096u
+#define JPEG_MAX_W     320u                  /* 宽度上限（相册面板 284 宽） */
+#define JPEG_MAX_H     320u                  /* 高度上限：防止超大图占满 2 MB 图片区 */
+#define JPEG_YUV_MAX   (24u * JPEG_MAX_W)    /* 一块 YUV 上限：24×宽（4:2:0/4:4:4） */
+#define JPEG_TIMEOUT   3000u                 /* HAL_JPEG_Decode 的超时（ms） */
+
+#define JPEG_SUB_444   0u
+#define JPEG_SUB_420   1u
+#define JPEG_SUB_422   2u
+
+/* 路径是否以 .jpg / .jpeg 结尾（大小写不敏感）。
+ * 放在这里而不是复用 ext_match：后者定义在文件更后面，而 poll 要用它。 */
+static int path_is_jpeg(const char* p)
+{
+    int n = (int)strlen(p);
+    int i;
+    const char* tail;
+
+    if (n < 4) { return 0; }
+    tail = p + (n - 4);
+    if (!((tail[0] == '.') && (tail[1] == 'j' || tail[1] == 'J'))) { return 0; }
+    /* ".jpg" */
+    if ((tail[2] == 'p' || tail[2] == 'P') && (tail[3] == 'g' || tail[3] == 'G')) { return 1; }
+    /* ".jpeg"（末 5 字符） */
+    if (n >= 5)
+    {
+        const char* t5 = p + (n - 5);
+        if ((t5[0] == '.') && (t5[1] == 'j' || t5[1] == 'J') &&
+            (t5[2] == 'p' || t5[2] == 'P') && (t5[3] == 'e' || t5[3] == 'E') &&
+            (t5[4] == 'g' || t5[4] == 'G'))
+        {
+            return 1;
+        }
+    }
+    (void)i;
+    return 0;
+}
+
+__attribute__((section(".bss_img"), aligned(32)))
+static uint8_t s_jin[JPEG_IN_BUF];           /* 输入：从卡顺序读进来的 JPEG 字节流 */
+__attribute__((section(".bss_img"), aligned(32)))
+static uint8_t s_jyuv[JPEG_YUV_MAX];         /* 输出：硬件吐出的一块 YUV */
+
+typedef struct
+{
+    FIL      f;
+    int      eof;          /* 文件已读完 */
+    uint32_t w, h;
+    uint32_t sub;          /* JPEG_SUB_* */
+    uint32_t blk_h;        /* 一块的行数（420 = 16，422/444 = 8） */
+    uint32_t yuv_size;
+    uint32_t slot_off;     /* W25 数据区偏移（相对 IMG_DATA_ADDR） */
+    uint32_t written;      /* 已写入 W25 的字节数 */
+    uint32_t row;          /* 已输出到第几行（0-based） */
+    uint32_t blk_n;        /* s_blk 里攒的字节数（复用 BMP 导入那块 4 KB） */
+    int      qspi_err;
+} JpegCtx;
+
+static JpegCtx s_j;
+
+volatile uint32_t g_jpeg_diag[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+volatile uint32_t g_jpeg_swap    = 0;
+
+/* ---- YCbCr → RGB565（BT.601，整数定点）---- */
+static uint16_t jpeg_yuv_px(int y, int cb, int cr)
+{
+    int c = cb - 128;
+    int d = cr - 128;
+    int r = y + ((d * 1436) >> 10);            /* 1.402   */
+    int g = y - ((c * 352 + d * 731) >> 10);   /* 0.344 / 0.714 */
+    int b = y + ((c * 1814) >> 10);            /* 1.772   */
+
+    if (r < 0) r = 0; else if (r > 255) r = 255;
+    if (g < 0) g = 0; else if (g > 255) g = 255;
+    if (b < 0) b = 0; else if (b > 255) b = 255;
+
+    return (uint16_t)(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+}
+
+/* 把 nbytes 追加进 s_blk，攒满 4 KB 就写一次 W25。
+ * 返回 0 = 正常；非 0 = QSPI 写失败（s_j.qspi_err 里也记一份）。 */
+static int jpeg_emit(const uint8_t* src, uint32_t nbytes)
+{
+    uint32_t i = 0u;
+
+    while (i < nbytes)
+    {
+        uint32_t room = IMG_BLK - s_j.blk_n;
+        uint32_t n    = nbytes - i;
+
+        if (n > room) { n = room; }
+        memcpy(s_blk + s_j.blk_n, src + i, n);
+        s_j.blk_n += n;
+        i         += n;
+
+        if (s_j.blk_n >= IMG_BLK)
+        {
+            int q = qspi_write(s_blk, IMG_DATA_ADDR + s_j.slot_off + s_j.written,
+                               IMG_BLK);
+            g_img_qspi_rc = (uint32_t)q;
+            if (q != QSPI_OK)
+            {
+                s_j.qspi_err  = q;
+                g_img_qdiag[1] = (uint32_t)q;
+                g_img_qdiag[2] = IMG_DATA_ADDR + s_j.slot_off + s_j.written;
+                return -1;
+            }
+            s_j.written += IMG_BLK;
+            s_j.blk_n    = 0u;
+        }
+    }
+    return 0;
+}
+
+/* 一块 YUV → 若干行 RGB565 → 流式写 W25。
+ * 平面布局（厂商「实验30」实测）：Y 在前，然后 Cb，然后 Cr。 */
+static int jpeg_block_to_rgb(const uint8_t* yuv)
+{
+    uint32_t w     = s_j.w;
+    uint32_t rows  = s_j.blk_h;
+    uint32_t r;
+    uint8_t  line[2u * JPEG_MAX_W];
+
+    /* 第一块：把三个平面的首字节记下来 —— 用来在**板上实测**确认 Y/Cb/Cr 的
+     * 排列顺序（与主机侧 Pillow 的 YCbCr 参考比对即可定序，不用猜）。 */
+    if (s_j.row == 0u)
+    {
+        uint32_t ylen = w * s_j.blk_h;
+        uint32_t clen = (w / 2u) * ((s_j.sub == JPEG_SUB_420) ? (s_j.blk_h / 2u)
+                                                              : s_j.blk_h);
+        if (s_j.sub == JPEG_SUB_444) { clen = w * s_j.blk_h; }
+        g_jpeg_diag[0] = yuv[0];                       /* 第 1 个平面首字节 */
+        g_jpeg_diag[1] = yuv[ylen];                    /* 第 2 个平面首字节 */
+        g_jpeg_diag[2] = yuv[ylen + clen];             /* 第 3 个平面首字节 */
+        g_jpeg_diag[3] = yuv[1];                       /* Y 的第 2 个字节（对照） */
+        g_jpeg_diag[4] = ylen;
+        g_jpeg_diag[5] = clen;
+        g_jpeg_diag[6] = s_j.sub;
+    }
+
+    for (r = 0u; r < rows; r++)
+    {
+        uint32_t x;
+        if (s_j.row >= s_j.h) { break; }        /* 最后一块可能超出图像高度 */
+
+        for (x = 0u; x < w; x++)
+        {
+            int      yy, cb, cr;
+            uint16_t v;
+
+            yy = yuv[r * w + x];
+
+            /* 色度平面的顺序由 g_jpeg_swap 决定：0 = (Cb, Cr)，1 = (Cr, Cb)。
+             * 定序依据是板上读到的 g_jpeg_diag 与主机侧 YCbCr 参考的比对。 */
+            if (s_j.sub == JPEG_SUB_420)
+            {
+                /* Cb/Cr 各占 (w/2) × (blk_h/2) */
+                uint32_t cw = w / 2u;
+                uint32_t c1 = w * s_j.blk_h + (r / 2u) * cw + (x / 2u);
+                uint32_t c2 = w * s_j.blk_h + cw * (s_j.blk_h / 2u) + (r / 2u) * cw + (x / 2u);
+                if (g_jpeg_swap != 0u) { cr = yuv[c1]; cb = yuv[c2]; }
+                else                   { cb = yuv[c1]; cr = yuv[c2]; }
+            }
+            else if (s_j.sub == JPEG_SUB_422)
+            {
+                uint32_t cw = w / 2u;
+                uint32_t c1 = w * s_j.blk_h + r * cw + (x / 2u);
+                uint32_t c2 = w * s_j.blk_h + cw * s_j.blk_h + r * cw + (x / 2u);
+                if (g_jpeg_swap != 0u) { cr = yuv[c1]; cb = yuv[c2]; }
+                else                   { cb = yuv[c1]; cr = yuv[c2]; }
+            }
+            else    /* 4:4:4：三个平面同样大小 */
+            {
+                uint32_t c1 = w * s_j.blk_h + r * w + x;
+                uint32_t c2 = 2u * w * s_j.blk_h + r * w + x;
+                if (g_jpeg_swap != 0u) { cr = yuv[c1]; cb = yuv[c2]; }
+                else                   { cb = yuv[c1]; cr = yuv[c2]; }
+            }
+
+            v = jpeg_yuv_px(yy, cb, cr);
+            line[2u * x]     = (uint8_t)(v & 0xFFu);
+            line[2u * x + 1u] = (uint8_t)((v >> 8) & 0xFFu);
+        }
+
+        if (jpeg_emit(line, w * 2u) != 0) { return -1; }
+        s_j.row++;
+    }
+    return 0;
+}
+
+/* ---- HAL_JPEG 的两个回调（弱定义，本文件实现即覆盖）----
+ * ⚠ 它们是**全局符号**：整个固件只能有一份，也只有本模块在用 JPEG。 */
+
+void HAL_JPEG_GetDataCallback(JPEG_HandleTypeDef* hjpeg, uint32_t NbDecodedData)
+{
+    UINT    br = 0u;
+    FRESULT fr;
+
+    (void)NbDecodedData;
+
+    if (s_j.eof)
+    {
+        /* 长度 0 = 没有更多输入，HAL 会结束解码 */
+        HAL_JPEG_ConfigInputBuffer(hjpeg, s_jin, 0u);
+        return;
+    }
+
+    fr = f_read(&s_j.f, s_jin, JPEG_IN_BUF, &br);
+    g_img_fs_rc = (uint32_t)fr;
+    if ((fr != FR_OK) || (br == 0u))
+    {
+        s_j.eof = 1;
+        HAL_JPEG_ConfigInputBuffer(hjpeg, s_jin, 0u);
+        return;
+    }
+    HAL_JPEG_ConfigInputBuffer(hjpeg, s_jin, br);
+}
+
+void HAL_JPEG_DataReadyCallback(JPEG_HandleTypeDef* hjpeg, uint8_t* pDataOut,
+                                uint32_t OutDataLength)
+{
+    (void)pDataOut;
+    (void)OutDataLength;
+
+    if (jpeg_block_to_rgb(s_jyuv) != 0)
+    {
+        /* 写失败：把输入也断掉，让解码尽快收尾（错误已记在 s_j.qspi_err） */
+        s_j.eof = 1;
+        HAL_JPEG_ConfigInputBuffer(hjpeg, s_jin, 0u);
+    }
+    HAL_JPEG_ConfigOutputBuffer(hjpeg, s_jyuv, s_j.yuv_size);
+}
+
+/* ---- 自己解析 JPEG 头（SOF0/1/2）拿宽高与采样 ----
+ * 为什么不靠 HAL_JPEG_GetInfo：那样要等 "InfoReady" 回调，而**输出缓冲的大小
+ * 必须在发起解码时就给定**，回调里再配已经晚了。自己扫一遍标记更简单可控。 */
+static int jpeg_probe_header(const uint8_t* b, uint32_t n,
+                             uint32_t* w, uint32_t* h, uint32_t* sub)
+{
+    uint32_t i = 2u;                      /* 跳过 SOI（FF D8） */
+
+    while (i + 9u < n)
+    {
+        uint8_t  m;
+        uint32_t len;
+
+        if (b[i] != 0xFFu) { i++; continue; }
+        m = b[i + 1u];
+        /* 无长度字段的标记 */
+        if ((m == 0x01u) || (m == 0xD8u) || ((m >= 0xD0u) && (m <= 0xD7u)))
+        {
+            i += 2u;
+            continue;
+        }
+        if (i + 3u >= n) { break; }
+        len = ((uint32_t)b[i + 2u] << 8) | (uint32_t)b[i + 3u];
+        if (len < 2u) { break; }
+
+        if ((m == 0xC0u) || (m == 0xC1u) || (m == 0xC2u))   /* SOF0 / SOF1 / SOF2 */
+        {
+            uint8_t nf;
+            *h   = ((uint32_t)b[i + 5u] << 8) | (uint32_t)b[i + 6u];
+            *w   = ((uint32_t)b[i + 7u] << 8) | (uint32_t)b[i + 8u];
+            nf   = b[i + 9u];
+            if (nf < 3u)
+            {
+                return -2;                /* 灰度 / 分量数异常：本模块只处理 YCbCr 三分量 */
+            }
+            if (i + 11u < n)
+            {
+                uint8_t hv = b[i + 11u];
+                uint8_t hh = (uint8_t)(hv >> 4);
+                uint8_t vv = (uint8_t)(hv & 0x0Fu);
+                if ((hh == 2u) && (vv == 2u))      *sub = JPEG_SUB_420;
+                else if ((hh == 2u) && (vv == 1u)) *sub = JPEG_SUB_422;
+                else                                *sub = JPEG_SUB_444;
+            }
+            else
+            {
+                *sub = JPEG_SUB_444;
+            }
+            return 0;
+        }
+        if (m == 0xDAu) { return -1; }    /* 到 SOS 还没见着 SOF */
+        i += 2u + len;
+    }
+    return -1;
+}
+
+static uint32_t import_jpeg(void)
+{
+    FRESULT fr;
+    UINT    br = 0u;
+    uint32_t out_w, out_h, out_len, used, slot, slot_off;
+    JPEG_HandleTypeDef hj;
+    HAL_StatusTypeDef  hs;
+
+    /* ⚠ s_j 里含 FIL：必须在 f_open **之前**清零 —— 放到 f_open 之后会把刚打开的
+     * 文件对象清成 0，实测症状是回调里 f_read 返回 FR_INVALID_OBJECT(9)，
+     * 解码只走了 3 块（48 行）就因输入断流收尾（2026-10-09 踩到）。 */
+    memset(&s_j, 0, sizeof(s_j));
+
+    /* ---- 1) 挂载 + 打开 ---- */
+    g_img_step = STEP_MOUNT;
+    if (fatfs_ensure_mounted() != 0) { return RC_FS_MOUNT; }
+
+    g_img_step = STEP_OPEN;
+    g_img_path[IMG_PATH_MAX - 1u] = '\0';
+    fr = f_open(&s_j.f, g_img_path, FA_READ);
+    g_img_fs_rc = (uint32_t)fr;
+    if (fr != FR_OK) { return RC_OPEN; }
+
+    /* ---- 2) 读开头一段解析头 ---- */
+    g_img_step = STEP_HDR;
+    fr = f_read(&s_j.f, s_jin, JPEG_IN_BUF, &br);
+    g_img_fs_rc = (uint32_t)fr;
+    if ((fr != FR_OK) || (br < 64u))
+    {
+        (void)f_close(&s_j.f);
+        return RC_READ_HDR;
+    }
+
+    /* 头这一段已经读走了，回调从当前文件位置继续读 ⇒ s_j.eof 保持 0。
+     * （s_j.f 此时是有效的打开状态，不要再去动它。） */
+    g_img_step = STEP_PARSE;
+    if (jpeg_probe_header(s_jin, br, &out_w, &out_h, &s_j.sub) != 0)
+    {
+        (void)f_close(&s_j.f);
+        return RC_NOT_BMP;             /* 复用"格式不对"的返回码 */
+    }
+    if ((out_w == 0u) || (out_h == 0u) || (out_w > JPEG_MAX_W) || (out_h > JPEG_MAX_H))
+    {
+        (void)f_close(&s_j.f);
+        return RC_TOO_WIDE;            /* 超尺寸：硬件不能缩放，直接拒绝 */
+    }
+
+    s_j.w = out_w;
+    s_j.h = out_h;
+
+    if (s_j.sub == JPEG_SUB_422)
+    {
+        s_j.blk_h    = 8u;
+        s_j.yuv_size = 16u * out_w;
+    }
+    else
+    {
+        s_j.blk_h    = (s_j.sub == JPEG_SUB_420) ? 16u : 8u;
+        s_j.yuv_size = 24u * out_w;
+    }
+    if (s_j.yuv_size > JPEG_YUV_MAX)
+    {
+        (void)f_close(&s_j.f);
+        return RC_TOO_WIDE;
+    }
+
+    out_len = out_w * out_h * 2u;
+    g_img_src_w  = out_w;
+    g_img_src_h  = out_h;
+    g_img_bpp    = 24u;                /* 源是 YCbCr，这里只作标记 */
+    g_img_out_w  = out_w;
+    g_img_out_h  = out_h;
+    g_img_out_bytes = out_len;
+
+    /* ---- 3) 分配槽位（与 BMP 同一套：整段索引拷进 s_blk 再扫）---- */
+    g_img_step = STEP_ALLOC;
+    memcpy(s_blk, (const void *)XIP_PTR(IMG_IDX_ADDR), IMG_BLK);
+    __DSB();
+    __ISB();
+    used = idx_used_in(s_blk);
+    if ((used + out_len) > IMG_DATA_SIZE)
+    {
+        (void)f_close(&s_j.f);
+        return RC_NO_SPACE;
+    }
+    for (slot = 0u; slot < IMG_MAX_SLOTS; slot++)
+    {
+        const uint8_t* e = s_blk + slot * IMG_ENTRY_BYTES;
+        if (!((rd16(e) == IMG_MAGIC) && ((rd16(e + 2u) & IMG_FLAG_VALID) != 0u)))
+        {
+            break;
+        }
+    }
+    if (slot >= IMG_MAX_SLOTS)
+    {
+        (void)f_close(&s_j.f);
+        return RC_NO_SLOT;
+    }
+    slot_off = used;
+    g_img_slot = slot;
+
+    /* ---- 4) 解码：退出映射 → 解码（回调里流式写 W25）---- */
+    g_img_step = STEP_IMPORT;
+
+    s_j.slot_off = slot_off;
+    s_j.written  = 0u;
+    s_j.row      = 0u;
+    s_j.blk_n    = 0u;
+    s_j.qspi_err = 0;
+    s_j.eof      = 0;                  /* 允许回调继续读文件（头之后的数据） */
+
+    {
+        int q = qspi_exit_mmap();
+        g_img_qdiag[3] = (uint32_t)q;
+        q = qspi_read(s_line, IMG_DATA_ADDR + slot_off, 256u);   /* 探测读 */
+        g_img_qdiag[4] = (uint32_t)q;
+    }
+
+    /* 时钟要在 HAL_JPEG_Init 之前开（库不会自己开 AHB3 的 JPGDECEN） */
+    __HAL_RCC_JPGDECEN_CLK_ENABLE();
+
+    memset(&hj, 0, sizeof(hj));
+    hj.Instance = JPEG;
+    hs = HAL_JPEG_Init(&hj);
+
+    if (hs == HAL_OK)
+    {
+        hs = HAL_JPEG_Decode(&hj, s_jin, br, s_jyuv, s_j.yuv_size, JPEG_TIMEOUT);
+    }
+    g_img_qdiag[5] = (uint32_t)hs;      /* HAL 返回值只作诊断，成败看数据量 */
+    (void)HAL_JPEG_DeInit(&hj);
+    (void)f_close(&s_j.f);
+
+    /* ⚠ HAL 收尾时**不会**为最后一块触发 DataReady：
+     * 实测 180 行（4:2:0，11 块 = 176 行 + 最后 4 行）只出来了 176 行，
+     * 差的就是不足整块的尾巴 ⇒ 解码返回后手动把缓冲里的残留再处理一次。
+     * jpeg_block_to_rgb 内部有 `row >= h 就停`，所以只会补上缺的那几行。 */
+    if (s_j.row < s_j.h)
+    {
+        (void)jpeg_block_to_rgb(s_jyuv);
+    }
+
+    /* 收尾：把最后不满 4 KB 的尾巴写掉 */
+    if (s_j.blk_n != 0u)
+    {
+        int q = qspi_write(s_blk, IMG_DATA_ADDR + slot_off + s_j.written, s_j.blk_n);
+        g_img_qspi_rc = (uint32_t)q;
+        if (q != QSPI_OK)
+        {
+            s_j.qspi_err   = q;
+            g_img_qdiag[1] = (uint32_t)q;
+        }
+        else
+        {
+            s_j.written += s_j.blk_n;
+        }
+        s_j.blk_n = 0u;
+    }
+
+    g_img_step = STEP_INDEX;
+    (void)qspi_enter_mmap();
+
+    if (s_j.qspi_err != 0) { return RC_QSPI; }
+
+    /* 判据用**数据量**而不是 HAL 返回值：最后一块不触发回调时 HAL 可能返回非 OK，
+     * 但只要写入字节数与头里声明的宽高对得上，就是解码完整了。 */
+    if (s_j.written != out_len)
+    {
+        g_img_out_bytes = s_j.written;
+        return RC_JPEG_DEC;
+    }
+    if (s_j.written != out_len)
+    {
+        /* 解码出来的行数和头里声明的对不上 ⇒ 多半是截断文件，别写坏索引 */
+        g_img_out_bytes = s_j.written;
+        return RC_JPEG_SHORT;
+    }
+
+    /* ---- 5) 写索引条目 ---- */
+    {
+        uint8_t e[IMG_ENTRY_BYTES];
+        int     q;
+
+        memset(e, 0, sizeof(e));
+        wr16(e + 0u,  IMG_MAGIC);
+        wr16(e + 2u,  IMG_FLAG_VALID);
+        wr32(e + 4u,  slot_off);
+        wr32(e + 8u,  out_len);
+        wr16(e + 12u, (uint16_t)out_w);
+        wr16(e + 14u, (uint16_t)out_h);
+
+        q = qspi_write(e, IMG_IDX_ADDR + slot * IMG_ENTRY_BYTES, IMG_ENTRY_BYTES);
+        g_img_qspi_rc = (uint32_t)q;
+        if (q != QSPI_OK) { return RC_QSPI; }
+    }
+
+    (void)qspi_enter_mmap();
+    g_img_used = used_bytes();
+    return 0u;
+}
+
 /* QSPI 分步诊断（g_img_test=4）
  *
  * 分两组，专门用来对比"退出映射前有没有做过大量 XIP 读"：
@@ -670,7 +1188,9 @@ void img_store_poll(void)
 
     if (mode == 1u)
     {
-        g_img_rc = import_bmp();
+        /* 按扩展名分流：.jpg/.jpeg 走硬件解码，其余按 BMP 处理。
+         * 这样 tools/img_check.py 原有的 BMP 流程完全不受影响。 */
+        g_img_rc = (path_is_jpeg(g_img_path) != 0) ? import_jpeg() : import_bmp();
     }
     else if (mode == 2u)
     {
