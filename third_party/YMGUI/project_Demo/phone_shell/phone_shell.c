@@ -120,31 +120,72 @@ static void home_select(int index, int animate);
 
 
 
-/* ---- 状态栏右侧图标：WiFi（左，x=0..15）+ 电池（右，x=27..55）----
+/* ---- 状态栏右侧图标组：WiFi（左 x=0..15）+ 4 格信号柱（中 x=18..35）+ 电池（右 x=45..72）----
  *
- * ⚠ 2026-10-10 前情：左边这 4 根柱子是**硬画的假信号**——纯几何 Fill、
- *   永远满格、不读任何数据，和当初硬编码 "9:41" 是同一类问题。
- *   现在换成接真值的 WiFi 图标，数据来自 ESP32 的 `$WF,<up>,<ip>,<rssi>`
- *   （src/uart_link.c:424 早就解析了，只是一直没人用）。
+ * ⚠ 2026-10-10 第二轮：按用户要求把 4 格信号柱**回退**回来。
+ *   ⚠ 那 4 根柱子是**装饰性**的：纯几何 Fill、恒满格、不读任何数据
+ *     （与电池同一性质——板上既没有蜂窝也没有电量计）。
+ *     真值只由**左边的 WiFi 图标**表达，两者别混为一谈。
+ *
+ * WiFi 图标（16×14）接真值，数据来自 ESP32 的 `$WF,<up>,<ip>,<rssi>`：
+ *     已连( 1) → 按 BoardNet_WifiBars() 点亮「圆点 + N 条弧」（不透明）
+ *     断开( 0) → 全部暗色 + 红色斜杠
+ *     未知(-1) → 全部暗色、无斜杠（开机到首帧 $WF 之间，别被误读成掉线）
  *
  * ⚠⚠ 语义必须写清：**WiFi 射频在对端 ESP32 上，H743 本身没有无线**。
- *     本板是通过 UART 把 ESP32 当网络协处理器/网关用的，
- *     所以这里画的是"经 ESP32 网关的联网状态"，不是本芯片的无线状态。
- *     图标本身是诚实的（链路确实存在且已通），但别让人以为 H743 自带 WiFi。
+ *     本板是把 ESP32 当网络协处理器/网关用的，图标表达的是
+ *     "经 ESP32 网关的联网状态"，不是本芯片的无线状态。
  *
- * 三态必须长得不一样 —— 否则"开机后还没收到首帧 $WF"（约几十秒）
- * 会被误读成断网：
- *     未知(-1) → 只有底座圆点（淡）
- *     断开( 0) → 圆点 + 最外一条弧（淡）
- *     已连( 1) → 圆点 + N 条弧（不透明，N = 信号格 0..3）
- *
- * ⚠ 电池那半边**仍然是装饰性的**（板上没有电池、也没有电量计，
- *    fill 宽度写死 16 = 永远满格）。留着是因为状态栏右侧总得有点东西，
- *    真要诚实应该换成"供电来源"，但那需要先有硬件可测。 */
+ * ★ 形制照抄 E:\esp32S3_TFT2.8_project（其 main/gui.c 的「状态栏 WiFi 图标」）：
+ *   16×14 位图 = 三层扇面弧（半径 4/7/10、扇区 ±45°）+ 底座圆点（半径 1.5），
+ *   未点亮的弧保留暗色轮廓（"几格信号"一眼可读），未连接时叠左上→右下的红斜杠。
+ *   位图表由该工程 `tools/wifi_icon_gen.py` 确定性生成（几何参数见该文件），
+ *   本工程用同一张表 ⇒ 两边形状逐像素一致。
+ *   ⚠ 改形状要改那边的脚本再把表同步过来，**不要手改下面两张表**
+ *     （手改会与那边的预览图脱钩，审查过的形状就不再是上屏形状）。
+ */
 
-/* 图标规格：16 × 14，放在 56 × 18 的区域里（y 下移 2 使其垂直居中）。 */
 #define WIFI_ICON_W 16
 #define WIFI_ICON_H 14
+/* 4 格柱与电池整体右移的量 = WiFi 图标 16 + 间隙 2。
+ * 容器宽度因此从 56 加到 74（右边缘 302 与改动前一致 ⇒ 电池没被挤）。 */
+#define STATUS_SHIFT 18
+
+/* tier 语义：0=空 1=圆点 2=内弧 3=中弧 4=外弧（参考工程脚本生成，勿手改） */
+static const uint8_t s_wifi_tier[WIFI_ICON_H][WIFI_ICON_W] = {
+	{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+	{0,0,0,0,4,4,4,4,4,4,4,0,0,0,0,0},
+	{0,0,4,4,0,0,0,0,0,0,0,4,4,0,0,0},
+	{0,4,0,0,0,0,0,0,0,0,0,0,0,4,0,0},
+	{4,0,0,0,0,3,3,3,3,3,0,0,0,0,4,0},
+	{0,0,0,3,3,0,0,0,0,0,3,3,0,0,0,0},
+	{0,0,3,0,0,0,0,0,0,0,0,0,3,0,0,0},
+	{0,0,0,0,0,2,2,2,2,2,0,0,0,0,0,0},
+	{0,0,0,0,2,2,0,0,0,2,2,0,0,0,0,0},
+	{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+	{0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0},
+	{0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0},
+	{0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0},
+	{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+};
+
+/* 未连接时的红色斜杠掩膜（左上 → 右下）。 */
+static const uint8_t s_wifi_slash[WIFI_ICON_H][WIFI_ICON_W] = {
+	{1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+	{0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0},
+	{0,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0},
+	{0,0,0,1,1,0,0,0,0,0,0,0,0,0,0,0},
+	{0,0,0,0,1,1,0,0,0,0,0,0,0,0,0,0},
+	{0,0,0,0,0,1,1,0,0,0,0,0,0,0,0,0},
+	{0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0},
+	{0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0},
+	{0,0,0,0,0,0,0,0,0,1,1,0,0,0,0,0},
+	{0,0,0,0,0,0,0,0,0,0,1,1,0,0,0,0},
+	{0,0,0,0,0,0,0,0,0,0,0,1,1,0,0,0},
+	{0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0},
+	{0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0},
+	{0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1},
+};
 
 /* draw_cb 上一次**实际画出来**的 up / bars。
  * ⚠ 判据必须是"画出来的"，不能是"我上次调用时传了什么"——
@@ -154,70 +195,97 @@ static void home_select(int index, int animate);
 static int s_wifi_drawn_up   = -99;
 static int s_wifi_drawn_bars = -99;
 
-static void wifi_dot(GYSURFACE s, int x, int y, GYcolor ink, int opa)
+/* 画 16×14 的 WiFi 位图：(x0, y0) = 图标左上角。
+ *
+ * 点亮规则沿用参考工程：**tier <= level+1 点亮**（level = 信号格 0..3）
+ *   level 3 全亮 / 2 点+内+中 / 1 点+内 / 0 只亮点；未确认的态一条都不点亮。
+ *
+ * 同色连续像素并成一次 Fill：224 个像素逐点 Fill 太碎，合并后每帧几十次。
+ * 循环多跑一列（x == WIFI_ICON_W）当哨兵，把行尾那段 run 冲出来。 */
+static void wifi_icon_draw(GYSURFACE s, int x0, int y0, int up, int bars, GYcolor ink)
 {
-	GYrect d = {(GYcoord)x, (GYcoord)y, 6, 5};
-	PhoneUI_rounded(s, &d, ink, 2, (GYopa)opa);
-}
+	const int level   = (bars < 0) ? 0 : bars;          /* -1（还没收到过）按 0 处理 */
+	const int lit     = (up == 1) ? (level + 1) : 0;    /* 未确认的态一条弧都不点亮 */
+	const GYcolor c_slash = RGB(231, 76, 60);            /* 参考工程 C_ALERT #E74C3C */
 
-/* 一条弧 = 顶行横杠 + 下一行左右两个端点块（像素级近似 "⌒"）。
- * 端点块比顶行更靠外一点，这样才有弧度感而不是一条直线。 */
-static void wifi_arc(GYSURFACE s, int x, int y, int inset, int top_w, int end_w,
-					 GYcolor ink, int opa)
-{
-	GYrect top = {(GYcoord)(x + inset), (GYcoord)y, (GYcoord)top_w, 1};
-	YMGUI_Draw_Fill(s, &top, ink, (GYopa)opa);
+	for (int y = 0; y < WIFI_ICON_H; ++y)
+	{
+		int run_x = 0, run_n = 0;
+		GYcolor run_c = 0;
+		GYopa run_o = GY_OPA_COVER;
 
-	int yy = y + 1;
-	GYrect l = {(GYcoord)(x + inset - end_w + 1), (GYcoord)yy, (GYcoord)end_w, 1};
-	GYrect r = {(GYcoord)(x + inset + top_w - 1),  (GYcoord)yy, (GYcoord)end_w, 1};
-	YMGUI_Draw_Fill(s, &l, ink, (GYopa)opa);
-	YMGUI_Draw_Fill(s, &r, ink, (GYopa)opa);
-}
+		for (int x = 0; x <= WIFI_ICON_W; ++x)
+		{
+			int on = 0;
+			GYcolor c = 0;
+			GYopa o = GY_OPA_COVER;
 
-static void wifi_bars(GYSURFACE s, int x, int y, int bars, GYcolor ink, int opa)
-{
-	static const int inset[3] = {2, 4, 6};    /* 顶行左端相对图标左边缘 */
-	static const int top_w[3] = {12, 8, 4};   /* 由外向内依次变窄 */
-	static const int end_w[3] = {3, 2, 2};
-	static const int dy[3]    = {0, 3, 6};
+			if (x < WIFI_ICON_W)
+			{
+				const uint8_t t = s_wifi_tier[y][x];
+				if (up == 0 && s_wifi_slash[y][x] != 0u)
+				{
+					on = 1; c = c_slash; o = GY_OPA_COVER;      /* 已知断开：红斜杠 */
+				}
+				else if (t != 0u)
+				{
+					on = 1; c = ink;
+					o = (t <= lit) ? GY_OPA_COVER : (GYopa)90;  /* 未点亮 = 暗色轮廓 */
+				}
+			}
 
-	if (bars > 3) bars = 3;
-	for (int i = 0; i < bars; ++i)
-		wifi_arc(s, x, y + dy[i], inset[i], top_w[i], end_w[i], ink, opa);
+			if (on && run_n != 0 && c == run_c && o == run_o)
+			{
+				run_n++;
+				continue;
+			}
+			if (run_n != 0)
+			{
+				GYrect r = {(GYcoord)(x0 + run_x), (GYcoord)(y0 + y), (GYcoord)run_n, 1};
+				YMGUI_Draw_Fill(s, &r, run_c, run_o);
+				run_n = 0;
+			}
+			if (on)
+			{
+				run_x = x; run_n = 1; run_c = c; run_o = o;
+			}
+		}
+	}
 }
 
 static void status_draw(GYOBJ obj, GYSURFACE surface, const GYrect* area)
 {
 	GYcolor ink = obj->bg_color;
 
-	/* ---- WiFi：接真值 ---- */
+	/* ---- WiFi 图标（左）：接真值 ----
+	 * 18 高的框里放 14 高的图标 ⇒ y 下移 2 垂直居中。 */
 	int up   = BoardNet_WifiUp();      /* 1 / 0 / -1（还没收到过） */
 	int bars = BoardNet_WifiBars();    /* 0..3，-1 = 还没收到过 */
-	int opa  = (up == 1) ? (int)GY_OPA_COVER : 90;   /* 未确认的态一律画淡 */
-	int ix   = area->x;
-	int iy   = area->y + 2;
-
-	wifi_dot(surface, ix + 5, iy + 9, ink, opa);
-	if (up == 1)
-		wifi_bars(surface, ix, iy, bars < 0 ? 0 : bars, ink, opa);
-	else if (up == 0)
-		wifi_bars(surface, ix, iy, 1, ink, opa);   /* 已知断开：只留最外一条弧 */
-	/* up < 0（还没收到过 $WF）：只有底座点，一条弧都不画 */
+	wifi_icon_draw(surface, area->x, area->y + 2, up, bars, ink);
 
 	s_wifi_drawn_up   = up;
 	s_wifi_drawn_bars = bars;
 
-	/* ---- 电池：装饰性绘制，原样保留 ---- */
-	GYrect rim = {(GYcoord)(area->x + 27), (GYcoord)(area->y + 3), 25, 13};
+	/* ---- 4 格信号柱（中）：回退的原实现（装饰性，恒满格，不读数据）---- */
+	for (int i = 0; i < 4; ++i)
+	{
+		GYrect bar = {(GYcoord)(area->x + STATUS_SHIFT + i * 5),
+					  (GYcoord)(area->y + 13 - i * 3), 3, (GYcoord)(4 + i * 3)};
+		YMGUI_Draw_Fill(surface, &bar, ink, GY_OPA_COVER);
+	}
+
+	/* ---- 电池（右）：装饰性，画法原样、整体右移 STATUS_SHIFT ---- */
+	int bx = area->x + STATUS_SHIFT;
+	GYrect rim = {(GYcoord)(bx + 27), (GYcoord)(area->y + 3), 25, 13};
 	PhoneUI_rounded(surface, &rim, ink, 4, GY_OPA_COVER);
-	GYrect gap = {(GYcoord)(area->x + 29), (GYcoord)(area->y + 5), 19, 9};
+	GYrect gap = {(GYcoord)(bx + 29), (GYcoord)(area->y + 5), 19, 9};
 	PhoneUI_rounded(surface, &gap, obj->parent == app_page ? PAPER : RGB(55, 67, 105), 2, GY_OPA_COVER);
-	GYrect fill = {(GYcoord)(area->x + 30), (GYcoord)(area->y + 6), 16, 7};
+	GYrect fill = {(GYcoord)(bx + 30), (GYcoord)(area->y + 6), 16, 7};
 	PhoneUI_rounded(surface, &fill, ink, 1, GY_OPA_COVER);
-	GYrect tip = {(GYcoord)(area->x + 53), (GYcoord)(area->y + 7), 2, 5};
+	GYrect tip = {(GYcoord)(bx + 53), (GYcoord)(area->y + 7), 2, 5};
 	YMGUI_Draw_Fill(surface, &tip, ink, GY_OPA_COVER);
 }
+
 
 
 
@@ -339,7 +407,12 @@ static void status_bar(GYOBJ parent)
 	GYOBJ t = PhoneUI_left_label(parent, 19, 4, 54, clk, ink, 2);
 	if (status_clock_n < 2)
 		status_clock[status_clock_n++] = t;
-	GYOBJ icon = YMGUI_Creat_Obj_Creat(parent, 248, 3, 56, 18);
+	/* 图标组：56 → 74 宽、起点 248 → 230。
+	 * 为什么改：左边要塞进 16px 的 WiFi 图标 + 2px 间隙，4 格柱与电池整体右移 18
+	 * （STATUS_SHIFT）⇒ **右边缘仍是 302**，与改动前逐像素一致，电池没被挤；
+	 * 左侧多出来的 18px 落在 x=230..247，首页/最近页这一带是空的，
+	 * app 页的标题 label 是居中短文本（80..240），实际字形在 x≈140..180，不会撞。 */
+	GYOBJ icon = YMGUI_Creat_Obj_Creat(parent, 230, 3, 74, 18);
 	icon->bg_color = ink;
 	icon->draw_cb = status_draw;
 	/* 句柄同样要留着：WiFi 图标接的是真数据，变了得有人置它脏（见 net_refresh）。 */

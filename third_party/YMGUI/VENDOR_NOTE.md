@@ -40,7 +40,7 @@
 | `YMGUI/GUI/YMGUI_Event.c` | 事件分发（注意：`sendEvent` **不冒泡**、`event_cb == NULL` **静默丢弃**） |
 | `YMGUI/WIDGET/YMGUI_EditView.c` / `TextInput.c` | 输入法相关的编辑控件 |
 | `project_Demo/phone_shell/apps/settings.c` | **自建滚动容器 + 自绘滚动条** —— 上游 YMGUI **没有滚动条控件**（引擎只有对象级 `scroll_y` 与 `ClipChildren`；`List`/`EditView`/`TextView`/`Table`/`Grid` 都能滚但都不画条）。本页把七项卡片改可滚动并补了一根 3 px 灰条。上游若新增同类控件，这里最可能冲突；用法与几何算式见 `docs/SCROLL_VIEW.md` |
-| `project_Demo/phone_shell/*` | 电话外壳本身：桌面、最近任务、IME、壁纸 ribbon、设置页、**状态栏 WiFi 图标**（`phone_shell.c` 的 `status_draw`：原来硬画的 4 格假信号柱已换成按 `$WF` 真值 RSSI 分档的 WiFi 扇面，数据经 `BoardNet_WifiUp/WifiBars` 取自 `src/uart_link.c`） |
+| `project_Demo/phone_shell/*` | 电话外壳本身：桌面、最近任务、IME、壁纸 ribbon、设置页、**状态栏右侧图标组**（`phone_shell.c` 的 `status_draw`：从左到右 WiFi 图标 → 4 格信号柱 → 电池，容器 `(230,3,74×18)`）。WiFi 图标是 16×14 **位图**（`s_wifi_tier` / `s_wifi_slash` 两张表），接 `$WF` 真值（`BoardNet_WifiUp/WifiBars`，取自 `src/uart_link.c`）；形制照抄外部工程 `E:\esp32S3_TFT2.8_project` 的 `main/gui.c`（表由其 `tools/wifi_icon_gen.py` 生成，勿手改）。4 格柱是按用户要求**回退**的老画法，**装饰性**（恒满格、不读数据），电池同样装饰性 |
 | `project_Demo/phone_shell/apps/weather.c` | **整个页面重写为真数据**（2026-10-10）。原来城市/温度/天气三张表 + 副标题"离线示例天气"全是写死的字符串；现在三城（杭州/上海/成都）走 `BoardNet_City*`（`src/uart_link.c`），真值来自"本板 `$?WEA,<城市码>` → 对端 HTTP → `$WX`"。上游若改 `apps/weather.c` 或 `PhoneUI_app_header`，这里必冲突（本页**不复用** `app_header`：它不返回副标题句柄，而副标题要按真实状态刷新，所以照它的版式自建了两个 label） |
 
 ## 未入库的部分（`.gitignore` 排除）
