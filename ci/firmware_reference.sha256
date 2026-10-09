@@ -189,5 +189,18 @@
 # 为什么变：新增 src/img_store.c 的 import_jpeg（分块解码 + 边转边写 + 尺寸限制）、
 #   CMake 加 hal_jpeg、新增诊断量 g_jpeg_diag / g_jpeg_swap、新增 tools/jpeg_check.py。
 # FLASH 1 801 916 B（85.92%），比第七版 +5 440 B。
-03de97803bf6165bf08307d5cc33b4b3a67dbd80922a68d979a52745cc313945  ymgui-h743.bin
-70bbd12d911be0269ccd807082f417004ba36531bb910b5076b9eee77d4f67d6  ymgui-h743.elf
+# 03de97803bf6165bf08307d5cc33b4b3a67dbd80922a68d979a52745cc313945  ymgui-h743.bin
+# 70bbd12d911be0269ccd807082f417004ba36531bb910b5076b9eee77d4f67d6  ymgui-h743.elf
+
+# ---- 第八版 b（2026-10-09）：JPEG 改中断模式（**仍在施工，色彩未对**）----
+# 与上一版同样带已知缺陷，更新哈希只为"板上跑的 = 仓库里的"。缺陷见 README §10。
+# 本版相对上一版的改动：
+#   · 启动文件开第三个槽 IRQ121 = JPEG（49+1+21+1+49+1+28），JPEG_IRQHandler 在 img_store.c；
+#   · import_jpeg 从 HAL_JPEG_Decode(polling) 改成 HAL_JPEG_Decode_IT；
+#   · 编入 hal_mdma（hal_jpeg 的 IRQ handler 静态引用 HAL_MDMA_Abort_IT，缺了链接不过）。
+# 实测：IT 与 polling 的**结果一模一样**（误差 67.84 / 68.02）⇒ 传输方式不是根因。
+# 新线索：第一块 Y 平面首字节 = 76，与主机参考 Y=76 **完全吻合** ⇒ 解码数据是有效的，
+#   但色度平面读到 190 / 72（参考 Cb=85 / Cr=255）⇒ 下一步查色度平面的偏移与取值。
+# FLASH 1 802 508 B（85.95%）。
+74b9cd1f8933561e101dfcad045aadbacbcdbd0ea8ad7b85a8f852cdbfe85044  ymgui-h743.bin
+0da9984a21d24f8df7b22d170d11c2dcf9f011a3175c0e7d2e55dfaa15986597  ymgui-h743.elf

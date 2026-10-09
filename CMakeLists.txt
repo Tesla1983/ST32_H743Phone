@@ -394,6 +394,9 @@ set(HAL_SRC
 	# 的 import_jpeg）。只编 hal_jpeg —— 不用 MDMA/DMA2D：解码走 polling，
 	# YCbCr→RGB565 由 CPU 做（65k 像素约几毫秒，比引两个新外设划算得多）。
 	${TP}/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_jpeg.c
+	# ⚠ hal_jpeg 的 HAL_JPEG_IRQHandler **静态引用** HAL_MDMA_Abort_IT（哪怕本工程
+	#   不走 MDMA 传输），所以 hal_mdma 必须一起编入，否则链接期 undefined reference。
+	${TP}/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_mdma.c
 )
 
 # ---- YMGUI 库本体（12 个可移植层，GLOB 与官方同口径）----

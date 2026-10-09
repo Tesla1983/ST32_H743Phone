@@ -616,6 +616,32 @@ static JpegCtx s_j;
 volatile uint32_t g_jpeg_diag[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 volatile uint32_t g_jpeg_swap    = 0;
 
+/* JPEG 句柄与完成标志必须是**文件级**：ISR 要用句柄、回调要置标志。
+ * ⚠ 为什么要走中断：HAL_JPEG_Decode(polling) 实测**超时**（g_img_qdiag[5]=3）且
+ *   输出缓冲拿不到数据 —— H7 的 JPEG 输出 FIFO 要靠中断（或 MDMA）搬运，
+ *   CPU 轮询等标志等不到。厂商「实验30」也是 MDMA 双缓冲 + 中断的路子。 */
+static JPEG_HandleTypeDef s_hjpeg;
+static volatile int       s_jpeg_done = 0;   /* 1 = 完成，-1 = 出错，0 = 进行中 */
+
+/* JPEG 中断入口：定义在本文件（与 SDMMC1_IRQHandler 定义在 sd_card.c 同一套路，
+ * 槽位见 src/startup_gcc.s —— IRQ121）。 */
+void JPEG_IRQHandler(void)
+{
+    HAL_JPEG_IRQHandler(&s_hjpeg);
+}
+
+void HAL_JPEG_DecodeCpltCallback(JPEG_HandleTypeDef* hjpeg)
+{
+    (void)hjpeg;
+    s_jpeg_done = 1;
+}
+
+void HAL_JPEG_ErrorCallback(JPEG_HandleTypeDef* hjpeg)
+{
+    (void)hjpeg;
+    s_jpeg_done = -1;
+}
+
 /* ---- YCbCr → RGB565（BT.601，整数定点）---- */
 static uint16_t jpeg_yuv_px(int y, int cb, int cr)
 {
@@ -963,16 +989,32 @@ static uint32_t import_jpeg(void)
     /* 时钟要在 HAL_JPEG_Init 之前开（库不会自己开 AHB3 的 JPGDECEN） */
     __HAL_RCC_JPGDECEN_CLK_ENABLE();
 
-    memset(&hj, 0, sizeof(hj));
-    hj.Instance = JPEG;
-    hs = HAL_JPEG_Init(&hj);
+    memset(&s_hjpeg, 0, sizeof(s_hjpeg));
+    s_hjpeg.Instance = JPEG;
+    hs = HAL_JPEG_Init(&s_hjpeg);
 
     if (hs == HAL_OK)
     {
-        hs = HAL_JPEG_Decode(&hj, s_jin, br, s_jyuv, s_j.yuv_size, JPEG_TIMEOUT);
+        s_jpeg_done = 0;
+        HAL_NVIC_SetPriority(JPEG_IRQn, 5u, 0u);
+        HAL_NVIC_EnableIRQ(JPEG_IRQn);
+
+        if (HAL_JPEG_Decode_IT(&s_hjpeg, s_jin, br, s_jyuv, s_j.yuv_size) == HAL_OK)
+        {
+            /* 中断里搬数据，这里只等完工（导入本来就是独占操作，阻塞无妨）。
+             * 上限 1 秒（DWT @400 MHz）：超时就当失败，绝不死等。 */
+            uint32_t t0 = DWT->CYCCNT;
+            while ((s_jpeg_done == 0) && ((DWT->CYCCNT - t0) < 400000000u))
+            {
+                /* 空转等待中断填充缓冲 */
+            }
+        }
+        HAL_NVIC_DisableIRQ(JPEG_IRQn);
+        if (s_jpeg_done <= 0) { hs = HAL_TIMEOUT; }
     }
     g_img_qdiag[5] = (uint32_t)hs;      /* HAL 返回值只作诊断，成败看数据量 */
-    (void)HAL_JPEG_DeInit(&hj);
+    g_img_qdiag[7] = (uint32_t)s_jpeg_done;
+    (void)HAL_JPEG_DeInit(&s_hjpeg);
     (void)f_close(&s_j.f);
 
     /* ⚠ HAL 收尾时**不会**为最后一块触发 DataReady：

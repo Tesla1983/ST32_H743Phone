@@ -45,7 +45,10 @@ __Vectors:
      * HAL_SD_IRQHandler，否则 HAL 的状态机不会收尾（hsd->State 永远停在 BUSY）。
      * 2026-10-08（第二次）为 USART6 开槽：ESP32 上行链路（NTP/天气）靠 RXNE 中断
      * 收字节，落 Default_Handler 会直接死循环。USART6_IRQn = 71。
-     * 拆成 49 + 1 + 21 + 1 + 78 = 150，顺序不能错：位置由 CMSIS 的 IRQn 决定。 */
+     * 2026-10-09（第三次）为 JPEG 开槽：硬件 JPEG 解码的输出 FIFO 必须靠中断搬运，
+     *   HAL_JPEG_Decode(polling) 实测**超时**（qdiag[5]=3）且输出缓冲没拿到数据，
+     *   所以改用 HAL_JPEG_Decode_IT。JPEG_IRQn = 121。
+     * 拆成 49 + 1 + 21 + 1 + 49 + 1 + 28 = 150，顺序不能错：位置由 CMSIS 的 IRQn 决定。 */
     .rept  49                           /* IRQ0..IRQ48 */
     .word  Default_Handler
     .endr
@@ -54,7 +57,11 @@ __Vectors:
     .word  Default_Handler
     .endr
     .word  USART6_IRQHandler            /* IRQ71 = USART6（见 uart_link.c） */
-    .rept  78                           /* IRQ72..IRQ149 */
+    .rept  49                           /* IRQ72..IRQ120 */
+    .word  Default_Handler
+    .endr
+    .word  JPEG_IRQHandler              /* IRQ121 = JPEG（见 img_store.c 的 import_jpeg） */
+    .rept  28                           /* IRQ122..IRQ149 */
     .word  Default_Handler
     .endr
 .size __Vectors, . - __Vectors
