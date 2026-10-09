@@ -603,6 +603,8 @@ typedef struct
     uint32_t w, h;
     uint32_t sub;          /* JPEG_SUB_* */
     uint32_t blk_h;        /* 一块的行数（420 = 16，422/444 = 8） */
+    uint32_t mcu_w;        /* 一个 MCU 的像素宽（420/422 = 16，444 = 8） */
+    uint32_t per_mcu;      /* 一个 MCU 的字节数（420 = 384，422 = 256，444 = 192） */
     uint32_t yuv_size;
     uint32_t slot_off;     /* W25 数据区偏移（相对 IMG_DATA_ADDR） */
     uint32_t written;      /* 已写入 W25 的字节数 */
@@ -615,6 +617,20 @@ static JpegCtx s_j;
 
 volatile uint32_t g_jpeg_diag[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 volatile uint32_t g_jpeg_swap    = 0;
+volatile uint32_t g_jpeg_dbg     = 0;
+
+/* 中断路径追踪（2026-10-09）—— 一次烧录 3.5 分钟，所以一次把该看的都记下来：
+ * [0] 进 JPEG_IRQHandler 的次数      [1] GetDataCallback 次数
+ * [2] DataReadyCallback 次数         [3] ISR 里见到的 SR 位（累积）
+ * [4] 等待循环里见到的 SR 位（累积）  [5] hjpeg.State
+ * [6] hjpeg.ErrorCode                [7] Init 返回 | (Decode_IT 返回 << 8) */
+volatile uint32_t g_jpeg_trace[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+/* ⚠ g_jpeg_dbg=1 时的**首块 YUV 快照**：色度平面的排列只能靠板上实测的
+ * 原始字节来定（猜一次错一次，一次烧录 3.5 分钟）。脚本用 nm 找符号地址后
+ * 直接整块读走，与主机侧的 YCbCr 参考对账。产品路径不碰它。 */
+__attribute__((section(".bss_img"), aligned(32)))
+static uint8_t s_jyuv_snap[JPEG_YUV_MAX];
 
 /* JPEG 句柄与完成标志必须是**文件级**：ISR 要用句柄、回调要置标志。
  * ⚠ 为什么要走中断：HAL_JPEG_Decode(polling) 实测**超时**（g_img_qdiag[5]=3）且
@@ -627,6 +643,8 @@ static volatile int       s_jpeg_done = 0;   /* 1 = 完成，-1 = 出错，0 = �
  * 槽位见 src/startup_gcc.s —— IRQ121）。 */
 void JPEG_IRQHandler(void)
 {
+    g_jpeg_trace[0]++;                 /* 进 ISR 的次数 */
+    g_jpeg_trace[3] |= JPEG->SR;       /* ISR 里见到的状态位（累积） */
     HAL_JPEG_IRQHandler(&s_hjpeg);
 }
 
@@ -693,8 +711,59 @@ static int jpeg_emit(const uint8_t* src, uint32_t nbytes)
     return 0;
 }
 
+/* ---- 色度上采样 ----
+ * 为什么不能直接用最近邻：libjpeg（以及 Pillow 背后的解码器）默认做的是
+ * "fancy upsampling"（三角形滤波，权重 3/4 : 1/4）。固件若取最近邻，颜色突变处
+ * 会差出 20~40 —— 2026-10-09 实测：整幅平均误差 5.55，但**平坦区平均只有 2.81
+ * 且零超差**，超差像素 100% 落在非平坦区 ⇒ 差异完全来自上采样方式。
+ * ⇒ 这里照 libjpeg 的权重做，边界夹取到块内（跨 MCU 那一行/列的邻居取不到，
+ *   夹取带来的误差只出现在每 16 行/列一次的边界上，肉眼不可见）。
+ */
+static int chroma_at(const uint8_t* yuv, int base, int cy, int cx)
+{
+    if (cy < 0) { cy = 0; } else if (cy > 7) { cy = 7; }
+    if (cx < 0) { cx = 0; } else if (cx > 7) { cx = 7; }
+    return (int)yuv[base + cy * 8 + cx];
+}
+
+/* 水平 2:1：偶数像素 (3·近 + 1·左 + 2)/4，奇数像素 (3·近 + 1·右 + 1)/4 */
+static int chroma_h(const uint8_t* yuv, int base, int cy, int x)
+{
+    int i = (x % 16) / 2;
+    int a, b;
+    if ((x & 1) == 0)
+    {
+        a = chroma_at(yuv, base, cy, i - 1);
+        b = chroma_at(yuv, base, cy, i);
+        return (3 * b + a + 2) >> 2;
+    }
+    a = chroma_at(yuv, base, cy, i);
+    b = chroma_at(yuv, base, cy, i + 1);
+    return (3 * a + b + 1) >> 2;
+}
+
+/* 4:2:0：先水平再垂直，垂直同样用 (3/4,1/4) */
+static int chroma_up2(const uint8_t* yuv, int base, int cy, int cx, int r, int x)
+{
+    int v0 = chroma_h(yuv, base, cy, x);
+    (void)cx;
+    if ((r & 1) == 0)
+    {
+        int vm = chroma_h(yuv, base, cy - 1, x);
+        return (3 * v0 + vm + 2) >> 2;
+    }
+    int vp = chroma_h(yuv, base, cy + 1, x);
+    return (3 * v0 + vp + 1) >> 2;
+}
+
 /* 一块 YUV → 若干行 RGB565 → 流式写 W25。
- * 平面布局（厂商「实验30」实测）：Y 在前，然后 Cb，然后 Cr。 */
+ *
+ * ★ 布局是**按 MCU 交错**的，不是"Y 平面 / Cb 平面 / Cr 平面"三段（2026-10-09
+ *   板上实测：32×16 纯红 4:2:0 图，硬件吐出 768 字节 = 2 个 MCU × 384）：
+ *     MCU_i = [ Y 4 块 256 B ][ Cb 64 B ][ Cr 64 B ]
+ *   Y 的 4 块在 MCU 内按 raster 排：左上、右上、左下、右下。
+ *   Cb/Cr 各一个 8×8 块，覆盖整个 MCU（4:2:0 是 16×16 ⇒ 每 2×2 取一个）。
+ *   ⇒ 取像素要先定位它落在哪个 MCU，再在 MCU 内定位块。 */
 static int jpeg_block_to_rgb(const uint8_t* yuv)
 {
     uint32_t w     = s_j.w;
@@ -702,21 +771,21 @@ static int jpeg_block_to_rgb(const uint8_t* yuv)
     uint32_t r;
     uint8_t  line[2u * JPEG_MAX_W];
 
-    /* 第一块：把三个平面的首字节记下来 —— 用来在**板上实测**确认 Y/Cb/Cr 的
-     * 排列顺序（与主机侧 Pillow 的 YCbCr 参考比对即可定序，不用猜）。 */
+    /* 第一块：留一份原始字节（g_jpeg_dbg=1）供脚本对账，并记录 MCU 几何。 */
     if (s_j.row == 0u)
     {
-        uint32_t ylen = w * s_j.blk_h;
-        uint32_t clen = (w / 2u) * ((s_j.sub == JPEG_SUB_420) ? (s_j.blk_h / 2u)
-                                                              : s_j.blk_h);
-        if (s_j.sub == JPEG_SUB_444) { clen = w * s_j.blk_h; }
-        g_jpeg_diag[0] = yuv[0];                       /* 第 1 个平面首字节 */
-        g_jpeg_diag[1] = yuv[ylen];                    /* 第 2 个平面首字节 */
-        g_jpeg_diag[2] = yuv[ylen + clen];             /* 第 3 个平面首字节 */
-        g_jpeg_diag[3] = yuv[1];                       /* Y 的第 2 个字节（对照） */
-        g_jpeg_diag[4] = ylen;
-        g_jpeg_diag[5] = clen;
+        g_jpeg_diag[0] = yuv[0];                       /* MCU0 的 Y 首字节 */
+        g_jpeg_diag[1] = yuv[s_j.per_mcu - 128u];      /* MCU0 的 Cb 首字节 */
+        g_jpeg_diag[2] = yuv[s_j.per_mcu - 64u];       /* MCU0 的 Cr 首字节 */
+        g_jpeg_diag[3] = yuv[1];
+        g_jpeg_diag[4] = s_j.yuv_size;
+        g_jpeg_diag[5] = s_j.per_mcu;
         g_jpeg_diag[6] = s_j.sub;
+
+        if (g_jpeg_dbg != 0u)
+        {
+            memcpy(s_jyuv_snap, yuv, s_j.yuv_size);
+        }
     }
 
     for (r = 0u; r < rows; r++)
@@ -728,35 +797,54 @@ static int jpeg_block_to_rgb(const uint8_t* yuv)
         {
             int      yy, cb, cr;
             uint16_t v;
+            uint32_t mx   = x / s_j.mcu_w;               /* 第几个 MCU（横向） */
+            uint32_t base = mx * s_j.per_mcu;
+            uint32_t yo, co;
 
-            yy = yuv[r * w + x];
-
-            /* 色度平面的顺序由 g_jpeg_swap 决定：0 = (Cb, Cr)，1 = (Cr, Cb)。
-             * 定序依据是板上读到的 g_jpeg_diag 与主机侧 YCbCr 参考的比对。 */
             if (s_j.sub == JPEG_SUB_420)
             {
-                /* Cb/Cr 各占 (w/2) × (blk_h/2) */
-                uint32_t cw = w / 2u;
-                uint32_t c1 = w * s_j.blk_h + (r / 2u) * cw + (x / 2u);
-                uint32_t c2 = w * s_j.blk_h + cw * (s_j.blk_h / 2u) + (r / 2u) * cw + (x / 2u);
-                if (g_jpeg_swap != 0u) { cr = yuv[c1]; cb = yuv[c2]; }
-                else                   { cb = yuv[c1]; cr = yuv[c2]; }
+                /* Y：4 个块，by = 上下、bx = 左右，每块 8×8 */
+                uint32_t bx = (x % 16u) / 8u;
+                uint32_t by = r / 8u;
+                yo = base + (by * 2u + bx) * 64u + (r % 8u) * 8u + (x % 8u);
+                co = base + 256u;                /* Cb 块起始（Cr = +64） */
             }
             else if (s_j.sub == JPEG_SUB_422)
             {
-                uint32_t cw = w / 2u;
-                uint32_t c1 = w * s_j.blk_h + r * cw + (x / 2u);
-                uint32_t c2 = w * s_j.blk_h + cw * s_j.blk_h + r * cw + (x / 2u);
-                if (g_jpeg_swap != 0u) { cr = yuv[c1]; cb = yuv[c2]; }
-                else                   { cb = yuv[c1]; cr = yuv[c2]; }
+                /* Y：2 个块左右并排，每块 8×8；MCU 是 16 宽 × 8 高 */
+                uint32_t bx = (x % 16u) / 8u;
+                yo = base + bx * 64u + r * 8u + (x % 8u);
+                co = base + 128u;                /* Cb 块起始（Cr = +64） */
             }
-            else    /* 4:4:4：三个平面同样大小 */
+            else    /* 4:4:4：MCU 就是 8×8，三分量同样大小 */
             {
-                uint32_t c1 = w * s_j.blk_h + r * w + x;
-                uint32_t c2 = 2u * w * s_j.blk_h + r * w + x;
-                if (g_jpeg_swap != 0u) { cr = yuv[c1]; cb = yuv[c2]; }
-                else                   { cb = yuv[c1]; cr = yuv[c2]; }
+                yo = base + r * 8u + (x % 8u);
+                co = base + 64u + r * 8u + (x % 8u);
             }
+
+            yy = yuv[yo];
+
+            /* 色度上采样：4:2:0 水平+垂直各 2:1，4:2:2 只水平，4:4:4 不需要。
+             * 实测顺序是 Cb 在前、Cr 在后（32×16 纯红：偏移 256 起是 85=Cb、
+             * 320 起是 255=Cr）；万一遇到相反的工具链，用 g_jpeg_swap 翻。 */
+            if (s_j.sub == JPEG_SUB_420)
+            {
+                int cx = (int)((x % 16u) / 2u);
+                int cy = (int)(r / 2u);
+                cb = chroma_up2(yuv, (int)co,      cy, cx, (int)r, (int)x);
+                cr = chroma_up2(yuv, (int)co + 64, cy, cx, (int)r, (int)x);
+            }
+            else if (s_j.sub == JPEG_SUB_422)
+            {
+                cb = chroma_h(yuv, (int)co,      (int)r, (int)x);
+                cr = chroma_h(yuv, (int)co + 64, (int)r, (int)x);
+            }
+            else
+            {
+                cb = (int)yuv[co];
+                cr = (int)yuv[co + 64u];
+            }
+            if (g_jpeg_swap != 0u) { int t = cb; cb = cr; cr = t; }
 
             v = jpeg_yuv_px(yy, cb, cr);
             line[2u * x]     = (uint8_t)(v & 0xFFu);
@@ -769,6 +857,52 @@ static int jpeg_block_to_rgb(const uint8_t* yuv)
     return 0;
 }
 
+/* 从卡上读一"份"输入，并保证交给 HAL 的长度是 **4 的倍数且一个字节不丢**。
+ *
+ * ⚠⚠ 这是本模块最要命的一条坑（2026-10-09 实测定位，花了三版才抓到）：
+ *   HAL_JPEG_Decode_IT / HAL_JPEG_ConfigInputBuffer 内部都会做
+ *       InDataLength - (InDataLength % 4)
+ *   —— 被截掉的 1~3 字节**直接丢弃，不会留到下一次**。
+ *   639 字节的 JPEG 被截成 636，丢掉的正好压着 EOI 结束标记 ⇒ 解码器永远
+ *   等不到结束：实测 ISR 进了 22 次、GetData 回调 1 次、**DataReady 一次都没有**、
+ *   句柄停在 HAL_JPEG_STATE_BUSY_DECODING(4) 直到超时。表现出来就是"画面全灰"
+ *   而字节数还恰好对得上（因为那 1024 字节是收尾那次用垃圾数据补出来的）。
+ *
+ * ⇒ 解法：不足一个字的尾巴**不能丢**。分两种情形：
+ *     · 还没读到文件尾（缓冲被读满）⇒ 用 f_lseek 把尾巴退回去，下次读取时
+ *       它自然排在最前面，一个字节不丢，也不需要拼接缓冲；
+ *     · 已经读到文件尾（尾部凑不满一个字）⇒ **补零凑到 4 的倍数**送进去。
+ *       补在 EOI 之后的字节解码器不认，安全。⚠ 这一支不能也去 lseek 回退：
+ *       退回去之后下次还是同一个尾巴，永远凑不满一个字 ⇒ 那几个字节就永远
+ *       送不进去了（2026-10-09 第二版就是这么又卡住的）。 */
+static uint32_t jpeg_read_aligned(void)
+{
+    UINT    br  = 0u;
+    uint32_t rem;
+    FRESULT fr;
+
+    fr = f_read(&s_j.f, s_jin, JPEG_IN_BUF, &br);
+    g_img_fs_rc = (uint32_t)fr;
+    if (fr != FR_OK) { br = 0u; }
+
+    rem = ((uint32_t)br) % 4u;
+    if (rem != 0u)
+    {
+        uint32_t need = 4u - rem;
+        if (((uint32_t)br + need) <= JPEG_IN_BUF)
+        {
+            memset(s_jin + br, 0, need);      /* 文件尾：补零凑够一个字 */
+            br += need;
+        }
+        else
+        {
+            (void)f_lseek(&s_j.f, f_tell(&s_j.f) - (FSIZE_t)rem);
+            br -= rem;
+        }
+    }
+    return (uint32_t)br;
+}
+
 /* ---- HAL_JPEG 的两个回调（弱定义，本文件实现即覆盖）----
  * ⚠ 它们是**全局符号**：整个固件只能有一份，也只有本模块在用 JPEG。 */
 
@@ -778,6 +912,7 @@ void HAL_JPEG_GetDataCallback(JPEG_HandleTypeDef* hjpeg, uint32_t NbDecodedData)
     FRESULT fr;
 
     (void)NbDecodedData;
+    g_jpeg_trace[1]++;
 
     if (s_j.eof)
     {
@@ -786,9 +921,8 @@ void HAL_JPEG_GetDataCallback(JPEG_HandleTypeDef* hjpeg, uint32_t NbDecodedData)
         return;
     }
 
-    fr = f_read(&s_j.f, s_jin, JPEG_IN_BUF, &br);
-    g_img_fs_rc = (uint32_t)fr;
-    if ((fr != FR_OK) || (br == 0u))
+    br = jpeg_read_aligned();          /* 4 字节对齐、不丢尾（见函数头注释） */
+    if (br == 0u)
     {
         s_j.eof = 1;
         HAL_JPEG_ConfigInputBuffer(hjpeg, s_jin, 0u);
@@ -801,7 +935,10 @@ void HAL_JPEG_DataReadyCallback(JPEG_HandleTypeDef* hjpeg, uint8_t* pDataOut,
                                 uint32_t OutDataLength)
 {
     (void)pDataOut;
-    (void)OutDataLength;
+
+    g_img_qdiag[6]++;                                   /* 块计数 */
+    g_jpeg_trace[2]++;
+    if (s_j.row == 0u) { g_jpeg_diag[7] = OutDataLength; }  /* 首块实际产出 */
 
     if (jpeg_block_to_rgb(s_jyuv) != 0)
     {
@@ -893,9 +1030,8 @@ static uint32_t import_jpeg(void)
 
     /* ---- 2) 读开头一段解析头 ---- */
     g_img_step = STEP_HDR;
-    fr = f_read(&s_j.f, s_jin, JPEG_IN_BUF, &br);
-    g_img_fs_rc = (uint32_t)fr;
-    if ((fr != FR_OK) || (br < 64u))
+    br = jpeg_read_aligned();          /* 同样要对齐：HAL 会截掉不足 4 的尾巴 */
+    if ((g_img_fs_rc != 0u) || (br < 64u))
     {
         (void)f_close(&s_j.f);
         return RC_READ_HDR;
@@ -918,16 +1054,30 @@ static uint32_t import_jpeg(void)
     s_j.w = out_w;
     s_j.h = out_h;
 
+    /* ★ 一块的大小要按 **MCU 对齐后的宽度** 算，不是图像宽度（2026-10-09 实测）：
+     * 32×16 的 4:2:0 图只有 2 个 MCU（16×16 各一个），硬件吐出 768 字节，布局是
+     *   MCU0: Y 4 块(256) + Cb(64) + Cr(64) = 384   MCU1: 同
+     * 若宽不是 16 的倍数（如 284 → 18 个 MCU = 288 像素），按 24×w 算会**算小**，
+     * 缓冲一满 HAL 就回调，剩下的还留在 FIFO ⇒ 块边界错位、画面花。 */
     if (s_j.sub == JPEG_SUB_422)
     {
         s_j.blk_h    = 8u;
-        s_j.yuv_size = 16u * out_w;
+        s_j.mcu_w    = 16u;
+        s_j.per_mcu  = 256u;                 /* Y 2 块(128) + Cb(64) + Cr(64) */
+    }
+    else if (s_j.sub == JPEG_SUB_420)
+    {
+        s_j.blk_h    = 16u;
+        s_j.mcu_w    = 16u;
+        s_j.per_mcu  = 384u;                 /* Y 4 块(256) + Cb(64) + Cr(64) */
     }
     else
     {
-        s_j.blk_h    = (s_j.sub == JPEG_SUB_420) ? 16u : 8u;
-        s_j.yuv_size = 24u * out_w;
+        s_j.blk_h    = 8u;
+        s_j.mcu_w    = 8u;
+        s_j.per_mcu  = 192u;                 /* Y(64) + Cb(64) + Cr(64) */
     }
+    s_j.yuv_size = ((out_w + s_j.mcu_w - 1u) / s_j.mcu_w) * s_j.per_mcu;
     if (s_j.yuv_size > JPEG_YUV_MAX)
     {
         (void)f_close(&s_j.f);
@@ -993,25 +1143,38 @@ static uint32_t import_jpeg(void)
     s_hjpeg.Instance = JPEG;
     hs = HAL_JPEG_Init(&s_hjpeg);
 
+    g_jpeg_trace[7] = (uint32_t)hs;      /* 低 8 位 = HAL_JPEG_Init 的返回值 */
+
     if (hs == HAL_OK)
     {
+        uint32_t sr_acc = 0u, cr_acc = 0u;
+        HAL_StatusTypeDef dit;
+
         s_jpeg_done = 0;
         HAL_NVIC_SetPriority(JPEG_IRQn, 5u, 0u);
         HAL_NVIC_EnableIRQ(JPEG_IRQn);
 
-        if (HAL_JPEG_Decode_IT(&s_hjpeg, s_jin, br, s_jyuv, s_j.yuv_size) == HAL_OK)
+        dit = HAL_JPEG_Decode_IT(&s_hjpeg, s_jin, br, s_jyuv, s_j.yuv_size);
+        g_jpeg_trace[7] |= ((uint32_t)dit << 8);
+
+        if (dit == HAL_OK)
         {
             /* 中断里搬数据，这里只等完工（导入本来就是独占操作，阻塞无妨）。
              * 上限 1 秒（DWT @400 MHz）：超时就当失败，绝不死等。 */
             uint32_t t0 = DWT->CYCCNT;
             while ((s_jpeg_done == 0) && ((DWT->CYCCNT - t0) < 400000000u))
             {
-                /* 空转等待中断填充缓冲 */
+                sr_acc |= JPEG->SR;
+                cr_acc |= JPEG->CR;
             }
         }
+        g_jpeg_trace[4] = sr_acc;
+        g_img_qdiag[0]  = cr_acc;
         HAL_NVIC_DisableIRQ(JPEG_IRQn);
         if (s_jpeg_done <= 0) { hs = HAL_TIMEOUT; }
     }
+    g_jpeg_trace[5] = (uint32_t)s_hjpeg.State;
+    g_jpeg_trace[6] = (uint32_t)s_hjpeg.ErrorCode;
     g_img_qdiag[5] = (uint32_t)hs;      /* HAL 返回值只作诊断，成败看数据量 */
     g_img_qdiag[7] = (uint32_t)s_jpeg_done;
     (void)HAL_JPEG_DeInit(&s_hjpeg);

@@ -159,6 +159,8 @@ extern volatile uint32_t g_scan_kind;    /* 上次扫的是哪个分类：1=照�
  *   烧一次固件（一次 3.5 分钟）。做成开关后，读到 diag 就能当场定序、当场验证。 */
 extern volatile uint32_t g_jpeg_diag[8];
 extern volatile uint32_t g_jpeg_swap;
+extern volatile uint32_t g_jpeg_dbg;    /* 1 = 留一份首块 YUV 快照供脚本 dump（内部符号，用 nm 找地址） */
+extern volatile uint32_t g_jpeg_trace[8];/* 中断路径追踪：见 img_store.c 里的注释（ISR/回调次数 + SR/CR 位） */
 
 /* 笔记读写的诊断量（SWD 直读，判据用） */
 extern volatile int32_t  g_note_rc;      /* 0 = 成功；<0 见 img_store.c 的返回码 */

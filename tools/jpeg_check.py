@@ -102,34 +102,69 @@ def run_import(path):
     return False
 
 
+def flat_mask(px_list, w, h, thr=8):
+    """标出"局部平坦"的像素：3x3 邻域内参考值变化都 <= thr。
+
+    为什么分这个：固件的色度上采样是**最近邻**，而 libjpeg 默认是 fancy（三角形滤波）
+    插值 —— 两者只在**颜色突变处**才有差别。平坦区若误差很小、超差像素全在边缘，
+    就说明解码与色彩是对的，剩下的差异是上采样方式不同（可接受），而不是错位。
+    """
+    flat = bytearray(w * h)
+    for y in range(h):
+        for x in range(w):
+            i = y * w + x
+            c = px_list[i]
+            ok = 1
+            for dy in (-1, 0, 1):
+                yy = y + dy
+                if yy < 0 or yy >= h:
+                    continue
+                for dx in (-1, 0, 1):
+                    p = px_list[yy * w + (x + dx)]
+                    if (abs(p[0] - c[0]) > thr or abs(p[1] - c[1]) > thr
+                            or abs(p[2] - c[2]) > thr):
+                        ok = 0
+                        break
+                if not ok:
+                    break
+            flat[i] = ok
+    return flat
+
+
 def compare(w, h, tol):
-    """XIP 读回 vs 主机侧 Pillow 解码，统计误差。"""
+    """XIP 读回 vs 主机侧 Pillow 解码，统计误差（并单列平坦区）。"""
     ref = Image.open(TMP_JPG).convert("RGB")
-    rw, rh = ref.size
-    px = ref.load()
+    px_list = list(ref.getdata())
 
     with open(TMP_XIP, "rb") as f:
         raw = f.read(w * h * 2)
 
+    flat = flat_mask(px_list, w, h)
     bad = 0
     total = 0
-    for y in range(h):
-        for x in range(w):
-            v = struct.unpack_from("<H", raw, (y * w + x) * 2)[0]
-            r5 = (v >> 11) & 0x1F
-            g6 = (v >> 5) & 0x3F
-            b5 = v & 0x1F
-            dr = (r5 << 3) & 0xFF
-            dg = (g6 << 2) & 0xFF
-            db = (b5 << 3) & 0xFF
-            er = abs(dr - px[x, y][0])
-            eg = abs(dg - px[x, y][1])
-            eb = abs(db - px[x, y][2])
-            total += er + eg + eb
+    flat_total = 0
+    flat_n = 0
+    flat_bad = 0
+    for i in range(w * h):
+        v = struct.unpack_from("<H", raw, i * 2)[0]
+        dr = ((v >> 11) & 0x1F) << 3
+        dg = ((v >> 5) & 0x3F) << 2
+        db = (v & 0x1F) << 3
+        c = px_list[i]
+        er = abs(dr - c[0])
+        eg = abs(dg - c[1])
+        eb = abs(db - c[2])
+        total += er + eg + eb
+        if max(er, eg, eb) > tol:
+            bad += 1
+        if flat[i]:
+            flat_total += er + eg + eb
+            flat_n += 1
             if max(er, eg, eb) > tol:
-                bad += 1
+                flat_bad += 1
     n = w * h
-    return total / (n * 3.0), bad, n
+    favg = (flat_total / (flat_n * 3.0)) if flat_n else 0.0
+    return total / (n * 3.0), bad, n, favg, flat_n, flat_bad
 
 
 def one_case(tag, w, h, tol, expect_ok=True):
@@ -170,10 +205,17 @@ def one_case(tag, w, h, tol, expect_ok=True):
     print("  索引 slot=%d magic=0x%04X flags=%d off=%d" % (slot, magic, flags, off))
     data_addr = 0x90000000 + 0x00100000 + 4096          # IMG_DATA_ADDR
     ic.read_mem_to_file(data_addr + off, ob, TMP_XIP)
-    avg, bad, n = compare(w, h, tol)
+    avg, bad, n, favg, fn, fbad = compare(w, h, tol)
     print("  XIP 读回 %d 像素：平均每通道误差 %.2f，超差像素 %d / %d（容差 %d）"
           % (n, avg, bad, n, tol))
-    ok = (avg < 12.0) and (bad * 100 // n < 5)
+    print("    其中**平坦区** %d 像素：平均误差 %.2f，超差 %d"
+          % (fn, favg, fbad))
+    # 判据分两层：
+    #   · 平坦区平均误差 < 3  ⇒ 解码与色彩转换本身是对的（JPEG 有损 + RGB565 量化
+    #     之后，跨解码器比较也就这个量级）；
+    #   · 全图超差比例 < 5%  ⇒ 剩下的差异只出现在颜色突变处，那是"最近邻 vs
+    #     libjpeg fancy 上采样"的固有差别，不是错位（错位会让平坦区同样出错）。
+    ok = (favg < 3.0) and (bad * 100 // n < 5) and (avg < 12.0)
     print("  %s" % ("OK" if ok else "FAIL"))
     return ok
 
