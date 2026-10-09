@@ -4,7 +4,7 @@
  *
  * 接收为什么用「中断 + 环形缓冲 + 主循环重组」而不是 DMA+IDLE：
  *   对端一帧只有 40~60 字节、10 秒一帧，**速率根本不是瓶颈**；
- *   而 USART6 的 DMA 要走 DMAMUX + 又要多占一路流控，为了这点数据量不值得。
+ *   而 UART4 的 DMA 要走 DMAMUX + 又要多占一路流控，为了这点数据量不值得。
  *   中断只做"读 RDR 塞环形缓冲"这一件事（几十个周期），解析全部放在主循环。
  * =========================================================================== */
 
@@ -18,7 +18,14 @@
 
 /* 环形缓冲：512 是 2 的幂，可用 & 取模。
  * 一帧 ~60 字节，主循环每拍都会抽干，实际占用远小于容量。 */
-#define RING_SIZE   512u
+/* ⚠ 环形缓冲长度账（2026-10-10 实测踩过，别再改小）：
+ *   921600 bps ⇒ 112 500 字节/秒。主循环一帧最坏约 10.9 ms 不来 poll
+ *   （渲染 + 触摸 + SD 轮询），这段时间线上能涌进 **约 1226 字节**；
+ *   $!BD 的裸负载本身就有 **2048 字节**（对端 CMD_BODY_CAP），加头帧约 2078。
+ *   原来只给 512 ⇒ 收 $!BD 时 drop 掉 1045 字节，症状是「超时、len=0」，
+ *   而 ORE 只涨 1 ⇒ 不是中断被屏蔽，纯粹是缓冲装不下。
+ *   ⇒ 取 4096：同时覆盖上述两种最坏情况，代价是 .bss 多 3.5 KB（SRAM1 够）。 */
+#define RING_SIZE   4096u
 #define RING_MASK   (RING_SIZE - 1u)
 
 static UART_HandleTypeDef s_hu;
@@ -126,6 +133,9 @@ volatile uint32_t g_cmd_bd_len;
 volatile uint32_t g_cmd_bd_crc_bad;
 volatile uint32_t g_cmd_bd_timeout;
 volatile uint32_t g_cmd_bd_toobig;
+/* 二进制模式超时时的「声明长度 / 实收长度」（2026-10-10 加，用于定位 P2）。 */
+volatile uint32_t g_cmd_bd_want;
+volatile uint32_t g_cmd_bd_got;
 volatile uint8_t  g_cmd_body[UART_LINK_BODY_CAP];
 volatile uint32_t g_cmd_body_len;
 volatile uint32_t g_cmd_req;
@@ -517,22 +527,22 @@ static void run_selftest(void)
 int uart_link_init(uint32_t baud)
 {
     /* GPIO 与外设时钟**必须自己开**：厂商 usart.c 里的 HAL_UART_MspInit 只认 USART1，
-     * 给 USART6 调 HAL_UART_Init 时它一个脚都不会配（详见 uart_link.h 顶部）。 */
-    __HAL_RCC_GPIOC_CLK_ENABLE();
-    __HAL_RCC_USART6_CLK_ENABLE();
+     * 给 UART4 调 HAL_UART_Init 时它一个脚都不会配（详见 uart_link.h 顶部）。 */
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_UART4_CLK_ENABLE();
 
     GPIO_InitTypeDef g;
-    g.Pin       = GPIO_PIN_6;                 /* PC6 = USART6_TX */
+    g.Pin       = GPIO_PIN_9;                 /* PB9 = UART4_TX（→ 对端命令口 RX） */
     g.Mode      = GPIO_MODE_AF_PP;
     g.Pull      = GPIO_PULLUP;
     g.Speed     = GPIO_SPEED_FREQ_HIGH;
-    g.Alternate = GPIO_AF7_USART6;
-    HAL_GPIO_Init(GPIOC, &g);
+    g.Alternate = GPIO_AF8_UART4;             /* ⚠ PB8/PB9 的 UART4 是 AF8，不是 AF7 */
+    HAL_GPIO_Init(GPIOB, &g);
 
-    g.Pin       = GPIO_PIN_7;                 /* PC7 = USART6_RX */
-    HAL_GPIO_Init(GPIOC, &g);
+    g.Pin       = GPIO_PIN_8;                 /* PB8 = UART4_RX（← 对端帧口 TX） */
+    HAL_GPIO_Init(GPIOB, &g);
 
-    s_hu.Instance        = USART6;
+    s_hu.Instance        = UART4;
     s_hu.Init.BaudRate   = baud;
     s_hu.Init.WordLength = UART_WORDLENGTH_8B;
     s_hu.Init.StopBits   = UART_STOPBITS_1;
@@ -550,11 +560,11 @@ int uart_link_init(uint32_t baud)
     /* 开 RXNE 中断。⚠ 不开 HAL 的 IT 接收（HAL_UART_Receive_IT），
      * 因为收完的回调被厂商代码占了（见头文件说明）—— 这里只开中断位，
      * 字节由我们自己的 ISR 直接读。 */
-    USART6->CR1 |= USART_CR1_RXNEIE_RXFNEIE;
-    USART6->CR3 |= USART_CR3_EIE;             /* 帧/噪声/溢出错误也要报，用来查波特率 */
+    UART4->CR1 |= USART_CR1_RXNEIE_RXFNEIE;
+    UART4->CR3 |= USART_CR3_EIE;              /* 帧/噪声/溢出错误也要报，用来查波特率 */
 
-    HAL_NVIC_SetPriority(USART6_IRQn, 2, 0);  /* 比 SDMMC1(见 sd_card.c) 更急一点 */
-    HAL_NVIC_EnableIRQ(USART6_IRQn);
+    HAL_NVIC_SetPriority(UART4_IRQn, 2, 0);   /* 比 SDMMC1(见 sd_card.c) 更急一点 */
+    HAL_NVIC_EnableIRQ(UART4_IRQn);           /* UART4_IRQn = 52（见 startup_gcc.s） */
 
     g_uart_baud  = baud;
     g_uart_rc    = 0;
@@ -571,7 +581,16 @@ int uart_link_init(uint32_t baud)
 
 int uart_link_cmd(const char* type, const char* body)
 {
-    char out[64];
+    /* ⚠ 缓冲长度账（2026-10-10 修过一个真 bug，别再改小）：
+     *   帧长 = 1($) + len(type) + [1(,) + len(body)] + 5(*HH\r\n\0)
+     *   $?PING          → 1+5+5      = 11
+     *   $?WEA           → 1+4+5      = 10
+     *   $?WGET,1,<URL>  → 1+5+1+1+1+len(URL)+5
+     *   测试 URL 55 字符 ⇒ **69 字节**；原来 out[64] 时 cmd_frame() 在
+     *   k >= cap-6(=58) 处返回 -1 ⇒ **命令静默不发**，症状是 g_cmd_tx 不涨、
+     *   对端 hex 里压根没有这一帧、P2 恒 FAIL。
+     *   ⇒ 取 256：允许 URL 最长 242 字符，够用；栈上 256 B 对主循环无压力。 */
+    char out[256];
     int  n = cmd_frame(out, (int)sizeof(out), type, body);
     if (n <= 0)
         return -1;
@@ -697,9 +716,9 @@ static void cmd_tick(uint32_t now_ms)
 
 /* ====================== 中断 ====================== */
 
-void USART6_IRQHandler(void)
+void UART4_IRQHandler(void)
 {
-    USART_TypeDef* u = USART6;
+    USART_TypeDef* u = UART4;
     uint32_t guard = 0;
 
     /* 迭代上限：真出现"标志清不掉"的意外时宁可退出中断让主循环继续跑，
@@ -816,6 +835,11 @@ void uart_link_poll(uint32_t now_ms)
     if (s_bin_need != 0u && (now_ms - s_bin_t0) > BIN_TIMEOUT_MS)
     {
         g_cmd_bd_timeout++;
+        /* 2026-10-10 加的诊断量：超时时把「声明要多少 / 实际收到多少」记下来。
+         * 没有这两个数就只能看到 len=0 + 超时=1，分不清是
+         * 「对端少发」「本板丢字节」「声明长度本身错」哪一种。 */
+        g_cmd_bd_want = s_bin_need;
+        g_cmd_bd_got  = s_bin_got;
         s_bin_need = 0u;
     }
 
@@ -831,11 +855,11 @@ int uart_link_send(const char* text)
     int n = 0;
     for (const char* p = text; *p != 0; ++p)
     {
-        while ((USART6->ISR & USART_ISR_TXE_TXFNF) == 0u) { }
-        USART6->TDR = (uint8_t)*p;
+        while ((UART4->ISR & USART_ISR_TXE_TXFNF) == 0u) { }
+        UART4->TDR = (uint8_t)*p;
         ++n;
     }
-    while ((USART6->ISR & USART_ISR_TC) == 0u) { }
+    while ((UART4->ISR & USART_ISR_TC) == 0u) { }
     return n;
 }
 

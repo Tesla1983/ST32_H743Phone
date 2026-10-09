@@ -1,5 +1,7 @@
 # ---------- 构建产物 ----------
 build/
+# build_prev* = 干净重建时给旧构建目录让位改名留下的，同样是构建产物
+build_prev*/
 cmake-build-*/
 CMakeCache.txt
 CMakeFiles/

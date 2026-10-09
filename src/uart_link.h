@@ -1,9 +1,15 @@
 /* ===========================================================================
- * ESP32 ↔ STM32H743 串口链路（USART6 / PC6-TX / PC7-RX，**921600** 8N1）
+ * ESP32 ↔ STM32H743 串口链路（**UART4 / PB9-TX / PB8-RX**，**921600** 8N1）
+ *
+ * ⚠ 2026-10-09 换外设：原先是 USART6(PC6/PC7)。PC6 那根命令线始终不通，
+ *   双向发波验证过「PC6 与对端无电气连接」，而 **USART6 在 LQFP100 上只有
+ *   PC6/PC7 一组**（PG14/PG9 该封装没有）⇒ 换脚只能换外设，改到 UART4。
+ *   PB9/PB8 官方功能是摄像头 SCCB 的 SDA/SCL，摄像头未插即空闲。
+ *   （PC7 在排针上紧邻 PC6，故此前"PC6 不在排针"的判断已证伪——真正原因是接错位置。）
  *
  * 接线：
- *   PC6 (USART6_TX) → 对端帧口的 RX
- *   PC7 (USART6_RX) ← 对端帧口的 TX
+ *   PB9 (UART4_TX) → 对端帧口的 RX
+ *   PB8 (UART4_RX) ← 对端帧口的 TX
  *   GND ↔ GND
  *
  * ⚠ 2026-10-09 实测更正：对端**帧口默认是 UART0 = GPIO1(TX)/GPIO3(RX)**，
@@ -54,7 +60,7 @@
  *     之后**按长度收**恰好 len 字节 —— 负载里含 '$' 或换行都不会乱。
  *     本模块由此多出一个"二进制模式"：进入后字节不再参与行重组。
  *
- *   ⚠ 发送方向要接一根线：PC6(USART6_TX) → 对端命令口的 RX。
+ *   ⚠ 发送方向要接一根线：PB9(UART4_TX) → 对端命令口的 RX。
  *     默认推荐接到 **GPIO16**（对端 UART2 的 RX，纯 GPIO）；
  *     **不要**接到 GPIO3 —— 那是开发板上标 "RX" 的脚，已被板载 CH340 的 TX
  *     驱动着，两个推挽驱动同一条线会形成直通电流。
@@ -65,23 +71,24 @@
  * 1. **不能用 HAL 的 HAL_UART_Receive_IT()**。
  *    厂商 third_party/SYSTEM/usart/usart.c 强定义了 `HAL_UART_RxCpltCallback()`
  *    和 `HAL_UART_MspInit()` —— 这俩是**全局唯一**符号，不是 per-instance 的：
- *      - MspInit 里 `if (huart->Instance == USART_UX)`（= USART1）⇒ 给 USART6 调
+ *      - MspInit 里 `if (huart->Instance == USART_UX)`（= USART1）⇒ 给 UART4 调
  *        HAL_UART_Init 时**时钟和 GPIO 一个都不会配**，波特率也算错；
  *      - RxCpltCallback 同样只认 USART1 ⇒ 开 IT 接收的话，收完一字节没人重启
  *        下一轮，链路一帧之后就死。
  *    ⇒ 本模块：GPIO/时钟/波特率**自己配**（不走 MspInit）；
  *      接收**自己写 ISR 直接读 RDR**（不走 HAL_UART_IRQHandler / 回调）。
  *
- * 2. **USART6 挂在 APB2**，时钟源默认 D2PCLK2 = PCLK2 = 100 MHz
- *    （厂商 sys.c：SYSCLK 400M / HCLK 200M / APB2 = 100M）。HAL 的
- *    UART_GETCLOCKSOURCE 认 USART6（stm32h7xx_hal_uart_ex.h:340），未用 RCCEx
- *    改过源时取的就是 PCLK2 ⇒ 波特率算得对。
+ * 2. **UART4 挂在 APB1**，时钟源默认 D2PCLK1 = PCLK1 = 100 MHz
+ *    （厂商 sys.c：SYSCLK 400M / HCLK 200M / APB1 = APB2 = 100M，两个都是 /2，
+ *    所以换成 UART4 之后波特率分频与原来 USART6 完全相同）。HAL 的
+ *    UART_GETCLOCKSOURCE 认 UART4（stm32h7xx_hal_uart_ex.h:286），未用 RCCEx
+ *    改过源时取的就是 PCLK1 ⇒ 波特率算得对。
  *    2026-10-09 提到 921600：整数分频 BRR=109 ⇒ 实际 917 431（−0.45%），
  *    对端 80 MHz + 小数分频（<0.02%）⇒ 合计约 0.46%，在 8N1/16 倍采样容差内。
  *
  * 3. **中断向量要手工开槽**。启动文件原来是 `.rept 150` 全落 Default_Handler
- *    （死循环）。USART6_IRQn = 71，要把 150 拆成 49 + 1 + 21 + 1 + 78
- *    （2026-10-08 已为 SDMMC1/IRQ49 开过一次槽，这是第二次）。
+ *    （死循环）。**UART4_IRQn = 52**，150 现拆成 49 + 1 + 2 + 1 + 18 + 1 + 49 + 1 + 28
+ *    （已为 SDMMC1/IRQ49、USART6/IRQ71（停用保留）、JPEG/IRQ121 开过槽）。
  *
  * 判据（SWD 直接读，不需要屏幕也不需要串口助手）：
  *   g_uart_rc       = 0       初始化成功
@@ -170,6 +177,8 @@ extern volatile uint32_t g_cmd_bd_len;       /* 最后一次收到的负载长�
 extern volatile uint32_t g_cmd_bd_crc_bad;   /* CRC 校验失败次数 */
 extern volatile uint32_t g_cmd_bd_timeout;   /* 等负载超时（长度对不上）次数 */
 extern volatile uint32_t g_cmd_bd_toobig;    /* 长度超过本板缓冲，直接丢弃 */
+extern volatile uint32_t g_cmd_bd_want;      /* 上次超时：对端声明的负载字节数 */
+extern volatile uint32_t g_cmd_bd_got;       /* 上次超时：本板实际收到的字节数 */
 extern volatile uint8_t  g_cmd_body[UART_LINK_BODY_CAP];  /* 最近一次收到的负载 */
 extern volatile uint32_t g_cmd_body_len;
 

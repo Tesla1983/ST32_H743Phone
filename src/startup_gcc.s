@@ -48,15 +48,23 @@ __Vectors:
      * 2026-10-09（第三次）为 JPEG 开槽：硬件 JPEG 解码的输出 FIFO 必须靠中断搬运，
      *   HAL_JPEG_Decode(polling) 实测**超时**（qdiag[5]=3）且输出缓冲没拿到数据，
      *   所以改用 HAL_JPEG_Decode_IT。JPEG_IRQn = 121。
-     * 拆成 49 + 1 + 21 + 1 + 49 + 1 + 28 = 150，顺序不能错：位置由 CMSIS 的 IRQn 决定。 */
+     * 2026-10-09（第四次）：上行链路从 USART6(PC6/PC7) 换到 **UART4(PB9/PB8)** ——
+     *   PC6 那根命令线始终不通（双向发波验证过与对端无电气连接），而 USART6 在
+     *   LQFP100 上只有 PC6/PC7 一组，⇒ 换脚只能换外设。UART4_IRQn = 52。
+     *   USART6 槽位保留（已停用，弱别名兜底）。
+     * 拆成 49 + 1 + 2 + 1 + 18 + 1 + 49 + 1 + 28 = 150，顺序不能错：位置由 CMSIS 的 IRQn 决定。 */
     .rept  49                           /* IRQ0..IRQ48 */
     .word  Default_Handler
     .endr
     .word  SDMMC1_IRQHandler            /* IRQ49 = SDMMC1（见 sd_card.c） */
-    .rept  21                           /* IRQ50..IRQ70 */
+    .rept  2                            /* IRQ50..IRQ51 */
     .word  Default_Handler
     .endr
-    .word  USART6_IRQHandler            /* IRQ71 = USART6（见 uart_link.c） */
+    .word  UART4_IRQHandler             /* IRQ52 = UART4（上行链路，见 uart_link.c） */
+    .rept  18                           /* IRQ53..IRQ70 */
+    .word  Default_Handler
+    .endr
+    .word  USART6_IRQHandler            /* IRQ71 = USART6（已改 UART4，槽位保留备用） */
     .rept  49                           /* IRQ72..IRQ120 */
     .word  Default_Handler
     .endr
@@ -131,6 +139,10 @@ Default_Handler:
 .weak SDMMC1_IRQHandler
 .thumb_set SDMMC1_IRQHandler, Default_Handler
 
-/* USART6（IRQ71）：强定义在 src/uart_link.c，同样给弱别名兜底。 */
+/* UART4（IRQ52）：强定义在 src/uart_link.c，同样给弱别名兜底。 */
+.weak UART4_IRQHandler
+.thumb_set UART4_IRQHandler, Default_Handler
+
+/* USART6（IRQ71）：上行链路已改用 UART4，此槽位保留备用（弱别名兜底）。 */
 .weak USART6_IRQHandler
 .thumb_set USART6_IRQHandler, Default_Handler

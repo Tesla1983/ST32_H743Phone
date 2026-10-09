@@ -120,6 +120,7 @@ def snapshot():
             "g_cmd_weather_req", "g_cmd_weather_ack", "g_cmd_weather_ok",
             "g_cmd_phase", "g_cmd_bd_pkts", "g_cmd_bd_len", "g_cmd_bd_crc_bad",
             "g_cmd_bd_timeout", "g_cmd_bd_toobig",
+            "g_cmd_bd_want", "g_cmd_bd_got",
             "g_uart_rx_bytes", "g_net_wd_pkts"]
     return {k: rd1(k) for k in keys}
 
@@ -209,6 +210,10 @@ def main():
               % (s3["g_cmd_bd_pkts"], s3["g_cmd_bd_len"],
                  s3["g_cmd_bd_crc_bad"], s3["g_cmd_bd_timeout"],
                  s3["g_cmd_bd_toobig"]))
+        if s3["g_cmd_bd_timeout"] > s0["g_cmd_bd_timeout"]:
+            print("  ⚠ 超时明细：对端声明要 %d 字节，本板实收 %d 字节（差 %d）"
+                  % (s3["g_cmd_bd_want"], s3["g_cmd_bd_got"],
+                     s3["g_cmd_bd_want"] - s3["g_cmd_bd_got"]))
         ok = False
         if s3["g_cmd_bd_pkts"] > s0["g_cmd_bd_pkts"] and s3["g_cmd_bd_len"] > 0 \
                 and s3["g_cmd_bd_crc_bad"] == s0["g_cmd_bd_crc_bad"]:
