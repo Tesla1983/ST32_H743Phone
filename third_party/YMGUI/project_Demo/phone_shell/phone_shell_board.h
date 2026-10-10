@@ -60,6 +60,21 @@ int         BoardGallery_Info(int slot, unsigned int *off, unsigned int *len,
                               unsigned int *w, unsigned int *h);
 const void *BoardGallery_Pixels(int slot);                  /* NULL = 该槽位无图 */
 
+/* 删除第 slot 张（2026-10-11）。
+ * 返回：0 = 成功；1 = 图库忙（导入中，拒绝）；2 = 槽位非法；3 = flash 写失败。
+ * next_valid：成功时写入"下一张该显示的槽位"，图库删空了则写 -1（可传 NULL）。
+ *
+ * ⚠ UI 必须改用返回值里的 next_valid 当新下标，不能沿用旧下标：
+ *   槽位索引是**物理槽号**不是"第几张"，删掉中间一张后会出现空洞，
+ *   继续按旧下标取图会取到空槽（画面空白）。槽位总数是图库内部实现，
+ *   这一层负责"找下一张"，UI 只管显示。 */
+int         BoardGallery_Delete(int slot, int *next_valid);
+
+/* 从 from 开始（含 from，回绕一圈）找下一个**有效**槽位；没有返回 -1。
+ * ⚠ "下一张"必须用它，不能用 (index+1) % total：槽位号是物理槽号、不是"第几张"，
+ *   一旦有人删过中间的图，索引就会出现空洞，取模算法会落在空槽上（画面空白）。 */
+int         BoardGallery_Next(int from);
+
 /* ---- 文件管理器：照片 / 笔记分类的真实文件（2026-10-09）----
  * 同一套分层（不让 phone_shell 认识 FatFs）。
  *

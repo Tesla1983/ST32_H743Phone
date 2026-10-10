@@ -19,12 +19,20 @@
 typedef struct
 {
 	GYOBJ gallery_panel, gallery_caption;
+	GYOBJ btn_del;          /* 删除按钮（要改它的文字/底色做二次确认） */
+	GYOBJ hint;             /* 图片下方那行提示（复用它显示"再点一次…"） */
 	int gallery_index;
 	int gallery_total;
+	int del_arm;            /* 1 = 删除已按过一次，等二次确认 */
 } AppState;
 static AppState state;
 
 static void on_gallery(GYOBJ btn);
+static void on_delete(GYOBJ btn);
+
+/* 删除按钮的两种外观（二次确认用：点一次变红并改字，再点才真删） */
+#define DEL_BTN_IDLE  RGB(147, 112, 136)
+#define DEL_BTN_ARMED RGB(200, 76, 76)
 
 /* ---- 有真图时的面板绘制 ---- */
 static void gallery_draw_photo(GYOBJ obj, GYSURFACE surface, const GYrect* area)
@@ -86,10 +94,80 @@ static void refresh_caption(void)
 	}
 }
 
+/* 跳到 from 及其之后的第一个有效槽位；一个都没有就置 0。 */
+static void next_of(int from)
+{
+	int s = BoardGallery_Next(from);
+	state.gallery_index = (s < 0) ? 0 : s;
+}
+
+/* 把删除按钮恢复成常态（未按下）。切图、删完、删失败都要调它。 */
+static void delete_disarm(void)
+{
+	if (state.del_arm == 0) { return; }
+	state.del_arm = 0;
+	PhoneUI_button_set(state.btn_del, "删除");
+	YMGUI_Obj_SetBgColor(state.btn_del, DEL_BTN_IDLE);
+	PhoneUI_text_set(state.hint, "示例风景 / Yaomi 相册");
+}
+
+static void on_delete(GYOBJ btn)
+{
+	(void)btn;
+	int next = -1;
+	int rc;
+
+	if (state.gallery_total <= 0) { return; }   /* 示例图模式：没有可删的真图 */
+
+	/* ---- 第一次按：只进入确认态，不动数据 ---- */
+	if (state.del_arm == 0)
+	{
+		state.del_arm = 1;
+		PhoneUI_button_set(state.btn_del, "确认删除?");
+		YMGUI_Obj_SetBgColor(state.btn_del, DEL_BTN_ARMED);
+		PhoneUI_text_set(state.hint, "再点一次删除当前这张");
+		return;
+	}
+
+	/* ---- 第二次按：真删 ----
+	 * ⚠ 必须用 BoardGallery_Delete 回传的 next 当新下标，不能沿用旧下标：
+	 *   槽位号是物理槽号，删掉中间一张后索引会出现空洞。 */
+	rc = BoardGallery_Delete(state.gallery_index, &next);
+	state.del_arm = 0;
+	PhoneUI_button_set(state.btn_del, "删除");
+	YMGUI_Obj_SetBgColor(state.btn_del, DEL_BTN_IDLE);
+
+	if (rc != 0)
+	{
+		PhoneUI_text_set(state.hint, rc == 1 ? "图库忙，稍后再试" : "删除失败");
+		return;
+	}
+
+	state.gallery_total = BoardGallery_Count();
+	if (next < 0 || state.gallery_total <= 0)
+	{
+		/* 删空了：退回原来的示例色块 */
+		state.gallery_total = 0;
+		state.gallery_index = 0;
+		state.gallery_panel->draw_cb = PhoneUI_gallery_draw;
+		PhoneUI_text_set(state.gallery_caption, "01 / 珊瑚");
+		PhoneUI_text_set(state.hint, "示例风景 / Yaomi 相册");
+	}
+	else
+	{
+		state.gallery_index = next;
+		refresh_caption();
+		PhoneUI_text_set(state.hint, "示例风景 / Yaomi 相册");
+	}
+	YMGUI_Obj_Invalidate(state.gallery_panel);
+}
+
 static void on_gallery(GYOBJ btn)
 {
 	(void)btn;
 	state.gallery_total = BoardGallery_Count();
+
+	delete_disarm();                    /* 切图 = 放弃删除，顺手解除确认态 */
 
 	if (state.gallery_total <= 0)
 	{
@@ -106,7 +184,9 @@ static void on_gallery(GYOBJ btn)
 		return;
 	}
 
-	state.gallery_index = (state.gallery_index + 1) % state.gallery_total;
+	/* ⚠ 不能用 (index+1) % total：删过图之后槽位会有空洞，取模会落在空槽上
+	 *   （表现为画面空白）。交给 BoardGallery_Next 跳过空洞。 */
+	next_of(state.gallery_index + 1);
 	refresh_caption();
 	YMGUI_Obj_Invalidate(state.gallery_panel);
 }
@@ -124,8 +204,10 @@ static void app_create(GYOBJ view)
 	                               : PhoneUI_gallery_draw;
 	state.gallery_panel->event_cb = NULL;
 	state.gallery_caption = PhoneUI_left_label(view, 22, 307, 276, "01 / 珊瑚", INK, 3);
-	PhoneUI_left_label(view, 23, 345, 275, "示例风景 / Yaomi 相册", MUTED, 2);
-	PhoneUI_button(view, 18, 373, 284, 34, "下一张风景   >", on_gallery, RGB(147, 112, 136));
+	state.hint = PhoneUI_left_label(view, 23, 345, 275, "示例风景 / Yaomi 相册", MUTED, 2);
+	/* 底部一行拆成两个：左"下一张"、右"删除"（各 138 宽 + 8 间距 = 284，与原单行等宽） */
+	PhoneUI_button(view, 18, 373, 138, 34, "下一张 >", on_gallery, RGB(147, 112, 136));
+	state.btn_del = PhoneUI_button(view, 164, 373, 138, 34, "删除", on_delete, DEL_BTN_IDLE);
 
 	if (state.gallery_total > 0)
 	{

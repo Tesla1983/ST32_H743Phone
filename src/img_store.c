@@ -24,23 +24,9 @@
 int BoardNote_Save(int i, const char* text);
 int BoardNote_Load(int i, char* out, int n);
 
-/* ---- 失败返回码（g_img_rc）---- */
-#define RC_FS_MOUNT    1u
-#define RC_OPEN        2u
-#define RC_READ_HDR    3u
-#define RC_NOT_BMP     4u
-#define RC_BPP         5u
-#define RC_COMPRESS    6u
-#define RC_TOO_WIDE    7u
-#define RC_NO_SPACE    8u
-#define RC_NO_SLOT     9u
-#define RC_QSPI        10u
-#define RC_PARAM       11u
-#define RC_READ_ROW    12u
-#define RC_WRITE_FILE  13u
-#define RC_CLOSE       14u
-#define RC_JPEG_DEC    15u   /* JPEG：HAL_JPEG_Decode 没返回 HAL_OK */
-#define RC_JPEG_SHORT  16u   /* JPEG：解码出的字节数与头里声明的宽高不一致（多半是截断文件） */
+/* ---- 失败返回码（g_img_rc）----
+ * ⚠ 2026-10-11 搬到 img_store.h：bt_recv.c 要把导入失败翻译成人能读的中文
+ *   （UI 不能再说"已进相册"），两边必须用同一套数字，抄一份必然走偏。 */
 
 /* ---- 步骤编号（g_img_step）---- */
 #define STEP_MOUNT   1u
@@ -89,6 +75,13 @@ volatile uint32_t g_img_mk       = 0;
 volatile uint32_t g_img_mk_len   = 0;
 volatile uint32_t g_img_mk_rc    = 0xFFFFFFFFu;
 volatile uint32_t g_img_mk_total = 0;
+
+/* 删除的 SWD 手工触发（验收脚本用，见 img_store.h 的说明）。
+ * 为什么要有：删除在 UI 上是按钮，脚本没法点；没有这个入口就只能靠人点着测，
+ * 一旦出问题分不清是"底层删除没生效"还是"按钮没接上"。 */
+volatile uint32_t g_img_del_req  = 0xFFFFFFFFu;   /* 0xFFFFFFFF = 无请求；否则 = 要删的槽位 */
+volatile int      g_img_del_rc   = -1;            /* 0 成功；1 忙；3 flash 写失败 */
+volatile int      g_img_del_next = -1;            /* 删完后下一个有效槽位 */
 
 volatile uint32_t g_img_qdiag[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 volatile uint32_t g_img_board_count = 0xFFFFFFFFu;
@@ -177,6 +170,50 @@ const void *img_store_pixels(uint32_t slot)
 
     if (img_store_slot_info(slot, &off, NULL, NULL, NULL) != 0) { return NULL; }
     return (const void *)XIP_PTR(IMG_DATA_ADDR + off);
+}
+
+int img_store_next_valid(int from)
+{
+    uint32_t i;
+    uint32_t s;
+
+    if (from < 0) { from = 0; }
+    s = (uint32_t)from % IMG_MAX_SLOTS;
+
+    for (i = 0u; i < IMG_MAX_SLOTS; i++)
+    {
+        const uint8_t *e = XIP_PTR(IMG_IDX_ADDR + s * IMG_ENTRY_BYTES);
+        if ((rd16(e) == IMG_MAGIC) && ((rd16(e + 2u) & IMG_FLAG_VALID) != 0u))
+        {
+            return (int)s;
+        }
+        s++;
+        if (s >= IMG_MAX_SLOTS) { s = 0u; }
+    }
+    return -1;
+}
+
+int img_store_delete(uint32_t slot)
+{
+    uint8_t e[IMG_ENTRY_BYTES];
+    int     q;
+
+    if (slot >= IMG_MAX_SLOTS) { return 1; }
+
+    /* 幂等：条目本来就是空的也照写一遍（写 0 无害），所以只做越界检查，
+     * 不先读一次 —— 顺带避开"XIP 读之后紧接着 qspi_write"这个已知雷区
+     * （见 used_bytes() 上方的注释：大量 AHB 读后立刻写会让 qspi_write 超时）。 */
+    memset(e, 0, sizeof(e));
+    q = qspi_write(e, IMG_IDX_ADDR + slot * IMG_ENTRY_BYTES, IMG_ENTRY_BYTES);
+
+    /* ★★ 写完必须**立刻**恢复内存映射 ★★
+     * qspi_write 内部会退出映射且**不自己恢复**；在 indirect 模式下读 XIP 窗口
+     * 会触发**精确 BusFault**（2026-10-08 实测：CFSR=0x8200、BFAR=0x90010000，
+     * 正是索引区的 XIP 地址）。写索引那条路径（STEP_INDEX）也是这么处理的。 */
+    (void)qspi_enter_mmap();
+
+    if (q != QSPI_OK) { return 2; }
+    return 0;
 }
 
 static uint32_t idx_used_in(const uint8_t *base);   /* 定义在下面（导入路径专用） */
@@ -1433,6 +1470,25 @@ void img_store_poll(void)
     uint32_t mode = g_img_test;
     uint32_t c0;
 
+    /* ---- SWD 手工触发删除（必须在最前面：下面 mode==0 就直接 return 了）----
+     * 与导入互斥，忙时直接拒绝（和 BoardGallery_Delete 的守卫一致）。
+     * ⚠ 这里调底层 img_store_delete 而不是 BoardGallery_Delete：
+     *   本文件没有 include phone_shell_board.h，那个函数在文件更后面才定义。 */
+    if (g_img_del_req != 0xFFFFFFFFu)
+    {
+        uint32_t s = g_img_del_req;
+        g_img_del_req = 0xFFFFFFFFu;
+
+        if (g_img_busy != 0u) {
+            g_img_del_rc = 1;                                  /* 导入中：拒绝 */
+        } else if (img_store_delete(s) != 0) {
+            g_img_del_rc = 3;                                  /* flash 写失败 */
+        } else {
+            g_img_del_rc   = 0;
+            g_img_del_next = img_store_next_valid((int)s);
+        }
+    }
+
     if (mode == 0u) { return; }
     g_img_test = 0u;
 
@@ -1979,6 +2035,31 @@ const void *BoardGallery_Pixels(int slot)
 {
     if (g_img_busy != 0u) { return NULL; }
     return img_store_pixels((uint32_t)slot);
+}
+
+/* 删除第 slot 张。
+ * 返回：0 = 成功；1 = 导入中（忙，拒绝）；2 = 槽位非法；3 = flash 写失败。
+ * next_valid：成功时填入"下一个该显示的槽位"，图库已空则填 -1（可为 NULL）。
+ *
+ * ⚠ 为什么要回传 next_valid：槽位索引**不是**"第几张"—— 删掉中间一张后索引
+ *   会出现空洞，UI 若继续按旧下标取图就会取到空槽（表现为画面空白）。
+ *   而槽位上限 IMG_MAX_SLOTS 属于图库内部实现，phone_shell 不该知道，
+ *   所以由这一层负责"找下一张"，UI 只管显示。 */
+int BoardGallery_Next(int from)
+{
+    if (g_img_busy != 0u) { return -1; }
+    return img_store_next_valid(from);
+}
+
+int BoardGallery_Delete(int slot, int *next_valid)
+{
+    if (g_img_busy != 0u) { return 1; }
+    if (slot < 0)         { return 2; }
+
+    if (img_store_delete((uint32_t)slot) != 0) { return 3; }
+
+    if (next_valid) { *next_valid = img_store_next_valid(slot); }
+    return 0;
 }
 
 /* 写文件夹具：不走 busy（写卡不涉及 XIP，UI 可以继续跑） */

@@ -71,7 +71,27 @@
 
 extern volatile uint32_t g_img_busy;        /* ★1 = 独占期，主循环必须跳过渲染/触摸 */
 extern volatile uint32_t g_img_test;        /* 1=导入 BMP  2=XIP 冲突探针  3=清空图库 */
-extern volatile uint32_t g_img_rc;          /* 0=成功；非 0 见 img_store.c 的 RC_* */
+extern volatile uint32_t g_img_rc;          /* 0=成功；非 0 见下面的 RC_* */
+
+/* ---- 失败返回码（g_img_rc）----
+ * 2026-10-11 从 img_store.c 搬到这里：bt_recv.c 的 UI 文案要按它翻译，
+ * 两边共用一份，抄一份必然走偏。 */
+#define RC_FS_MOUNT    1u
+#define RC_OPEN        2u
+#define RC_READ_HDR    3u
+#define RC_NOT_BMP     4u
+#define RC_BPP         5u
+#define RC_COMPRESS    6u
+#define RC_TOO_WIDE    7u
+#define RC_NO_SPACE    8u
+#define RC_NO_SLOT     9u
+#define RC_QSPI        10u
+#define RC_PARAM       11u
+#define RC_READ_ROW    12u
+#define RC_WRITE_FILE  13u
+#define RC_CLOSE       14u
+#define RC_JPEG_DEC    15u   /* JPEG：HAL_JPEG_Decode 没返回 HAL_OK */
+#define RC_JPEG_SHORT  16u   /* JPEG：解码出的字节数与头里声明的宽高不一致（多半是截断文件） */
 extern volatile uint32_t g_img_step;        /* 失败时看它卡在哪一步 */
 extern volatile uint32_t g_img_slot;        /* 分配到的槽位 */
 extern volatile uint32_t g_img_scale;       /* 抽样倍率：1=原尺寸 2=1/2 4=1/4 */
@@ -202,5 +222,30 @@ int  img_store_slot_info(uint32_t slot, uint32_t *off, uint32_t *len,
                          uint32_t *w, uint32_t *h);
 /* 返回该槽位像素在 XIP 窗口里的地址；无图返回 0 */
 const void *img_store_pixels(uint32_t slot);
+
+/* 删除（使失效）一个槽位。返回 0 = 成功，1 = 槽位越界，2 = flash 写失败。
+ *
+ * 做法：把该槽位的整条 16 字节索引**写 0**。有效性判据是
+ *   rd16(e) == IMG_MAGIC && (rd16(e+2) & IMG_FLAG_VALID)
+ * （见 img_store_count / img_store_slot_info），写 0 之后两条都不成立
+ * ⇒ 该槽位立即失效，且会被下一次导入当作空位复用（分配空位用的是同一判据）。
+ *
+ * ⚠ 不擦数据区，这是**有意**的取舍：图库的空间账是"所有有效条目里
+ *   max(off+len)"（idx_used_in），条目删掉后那块数据虽然还占着 flash，
+ *   但没有条目指向它、也不会被新数据覆盖（新数据从 max(off+len) 之后分配）
+ *   ⇒ 不会出错，只是暂时不回收。真正回收要做紧凑整理（搬移后续所有图片），
+ *   代价大且需长时间关映射，对"最多 256 张、总量 2 MB"的相册不划算。 */
+int  img_store_delete(uint32_t slot);
+
+/* 从 from 开始找下一个有效槽位（含 from 自身，回绕一圈）；没有返回 -1。 */
+int  img_store_next_valid(int from);
+
+/* 删除的 SWD 手工触发（验收脚本用，与 UI 上的删除按钮走同一套底层）：
+ *   写 0..IMG_MAX_SLOTS-1 到 g_img_del_req ⇒ 下一拍删除该槽位，
+ *   结果看 g_img_del_rc（0 成功 / 1 忙 / 3 flash 写失败）与 g_img_del_next。
+ *   0xFFFFFFFF 表示"无请求"（初值）。 */
+extern volatile uint32_t g_img_del_req;
+extern volatile int      g_img_del_rc;
+extern volatile int      g_img_del_next;
 
 #endif /* IMG_STORE_H */
