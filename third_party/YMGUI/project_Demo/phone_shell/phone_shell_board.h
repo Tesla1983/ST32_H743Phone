@@ -92,6 +92,31 @@ int  BoardNote_Load(int i, char* out, int n);
 /* 写正文：i >= 0 覆盖第 i 条，i < 0 新建一个文件。返回写入后的索引；<0 = 失败 */
 int  BoardNote_Save(int i, const char* text);
 
+/* ---- 蓝牙收文件（P5，2026-10-10）----
+ * 链路：手机 --(经典蓝牙 SPP)--> ESP32 --(SPI 从机)--> STM32 --(FatFs)--> TF 卡
+ *                                                       --> 图库导入 --> 相册可见
+ *
+ * 这一层存在的理由与 BoardPic_* 完全一样：phone_shell 不许 include src/bt_recv.h。
+ * 实现是纯转发（src/bt_recv.c 末尾），逻辑都在 src/bt_recv.c 上半部分。
+ *
+ * ⚠ **文件的落地与"进没进相册"是两件事**：收完先写 /YMGUI/PIC 下的 .bmp，
+ *   然后由 img_store 异步导入图库；导入期间读 XIP 会触发 BusFault，
+ *   所以导入是异步的（见 src/img_store.h）。UI 里"接收完成"只代表写盘成功。
+ * ⚠ 收的是什么文件、多大，由**对端**在 OPEN 阶段告知（手机发的文件头），
+ *   不是本板决定的 —— 所以 BoardBt_Total() 在拿到文件头之前是 0，
+ *   这时进度条要画"不定长"态，别拿 0/0 算百分比。 */
+int         BoardBt_Start(void);      /* 开始接收：开 BT 无线 + 起 SPP 服务端 + 开会话。
+                                       * 0 = 已发起；-1 = 已有会话在跑；-2 = 链路无对端 */
+int         BoardBt_Abort(void);      /* 中止并删掉半截文件；0 = 已中止，-1 = 本来没有会话 */
+int         BoardBt_Busy(void);       /* 1 = 会话在跑（UI 该显示进度条而不是"开始"按钮）*/
+int         BoardBt_State(void);      /* BT_RECV_IDLE/WAIT/RECV/DONE/ERROR = 0/1/2/3/4 */
+int         BoardBt_Progress(void);   /* 0..100；**-1 = 总长还未知**（画不定长态）*/
+uint32_t    BoardBt_Bytes(void);      /* 已写进 TF 的字节数 */
+uint32_t    BoardBt_Total(void);      /* 对端声明的总字节数；0 = 未知 */
+const char* BoardBt_Name(void);       /* 落地的文件名（不含目录）；无 = "" */
+int         BoardBt_LastRc(void);     /* 最近一次会话结果码：0 = 成功，<0 = 失败阶段 */
+const char* BoardBt_StatusText(void); /* 可直接画的一行中文状态 */
+
 /* ---- ESP32 上行链路：NTP 时间 + 天气（2026-10-08）----
  * 声明实际在 src/uart_link.h（那里有完整的协议与踩坑说明），这里只是转一手，
  * 让 phone_shell 不用直接 include src 下的头。

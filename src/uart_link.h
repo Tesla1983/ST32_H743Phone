@@ -224,9 +224,42 @@ extern volatile uint32_t g_cmd_bd_want;      /* 上次超时：对端声明的�
 extern volatile uint32_t g_cmd_bd_got;       /* 上次超时：本板实际收到的字节数 */
 extern volatile uint8_t  g_cmd_body[UART_LINK_BODY_CAP];  /* 最近一次收到的负载 */
 extern volatile uint32_t g_cmd_body_len;
+/* ★2026-10-10（P4）**负载收齐**的完成计数（只在 s_bin_got >= s_bin_need 时 +1）。
+ * ⚠ 为什么不能拿 g_cmd_bd_pkts 当"块到了"的判据：那个是**头帧**计数，
+ *   头帧到了负载还在路上（2 KB 要 35 笔 SPI 事务）。拿它判会读到半块数据。
+ *   也不能拿 g_cmd_body_len：它在收齐前一直保留**上一块**的值，看起来也"非 0"。 */
+extern volatile uint32_t g_cmd_bd_done;
+/* ★2026-10-10（P4）**最近一块负载的 CRC 结论**：1 = 通过，0 = 不过。
+ * ⚠ 只能和 g_cmd_bd_done **配对读**（同一拍里读，先把 done 存下来再读本值）：
+ *   g_cmd_bd_crc_bad 是个**累计计数**，它涨了说明"历史上坏过"，
+ *   但分不清坏的是刚到的这一块还是十块以前那一块 —— 而重传要的正是"这一块坏没坏"。 */
+extern volatile int      g_cmd_bd_last_ok;
+
+/* ---- 蓝牙文件接收（P3/P4，2026-10-10）----
+ * 对端（ESP32）在文件会话里推的状态帧 `$BT,<state>,<name>,<size>,<recv>`，
+ * 与命令响应 `$!RS,BTF,<rc>`。解析层只负责"把字段收下来"，动作全在 src/bt_recv.c。
+ *   state: 0=空闲 1=等待对端连接 2=接收中 3=完成 4=错误 */
+extern volatile int      g_net_btf_state;
+extern volatile uint8_t  g_net_btf_name[48];
+extern volatile uint32_t g_net_btf_size;
+extern volatile uint32_t g_net_btf_recv;
+extern volatile uint32_t g_net_bt_pkts;     /* 收到的 $BT 帧数 */
+extern volatile int      g_cmd_btf_rc;      /* 最近一条 $!RS,BTF,<rc> 的 rc */
+extern volatile uint32_t g_cmd_btf_rs;      /* 收到的 $!RS,BTF 条数 */
+
+/* 手工触发（脚本用）：1 = 自测接收（对端合成 BMP 走全链路）
+ *                   2 = 中止；写后固件自动清 0。
+ * ⚠ 这两个尺寸是 P4 验收用的"约 100 KB"档：224×152 的 24 位 BMP
+ *   = 54 + 672×152 = 102 198 字节（一行 672 字节，正好 4 字节对齐，无需补位）。
+ *   写 0 则用同一组默认值。 */
+extern volatile uint32_t g_bt_recv_req;
+extern volatile uint32_t g_bt_recv_w;       /* 自测图像宽（0 ⇒ 224） */
+extern volatile uint32_t g_bt_recv_h;       /* 自测图像高（0 ⇒ 152） */
 
 /* 手工触发（脚本用）：写 1 = 发一次 $?PING；写 2 = 发一次 $?WEA；
- * 写 3 = 发一次 $?WGET 取 httpbin 的 1 KB 测试数据。固件发完自动清 0。 */
+ * 写 3 = 发一次 $?WGET 取 httpbin 的 1 KB 测试数据；
+ * 写 4/5 = 蓝牙开/关；写 7/8 = WiFi 关/开。固件发完自动清 0。
+ * （定义与分发都在 src/uart_link.c 的 cmd_tick()。） */
 extern volatile uint32_t g_cmd_req;
 
 /* ---- 自检（没有对端也能验证「解析 → 换算 → 显示」这条链）----

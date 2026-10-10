@@ -1670,6 +1670,18 @@ int img_scan_import(int i, const char* dir)
     return 0;
 }
 
+/* 按完整路径排队导入（不查扫描表）。见 img_store.h 的说明。
+ * ⚠ 唯一的新增风险是"路径由调用方给"，所以这里要挡掉明显不合法的输入。 */
+int img_import_path(const char* full)
+{
+    if (full == NULL || full[0] == 0) return -1;
+    if (full[0] != '/')              return -1;      /* 只收绝对路径，避免拼错目录 */
+    if (g_img_test != 0u || g_img_busy != 0u) return -2;
+    copy_str(g_img_path, (int)IMG_PATH_MAX, full);
+    g_img_test = 1u;
+    return 0;
+}
+
 /* ===========================================================================
  * board 层接口（phone_shell 的相册 app 用，见 phone_shell_board.h 的说明）
  * =========================================================================== */

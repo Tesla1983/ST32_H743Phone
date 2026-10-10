@@ -49,6 +49,12 @@ volatile int      g_spi_last_code  = -2;      /* -2=还没跑过 */
 volatile uint32_t g_spi_err      = 0;
 volatile int      g_spi_err_code = 0;
 
+/* burst：一拍最多连跑几笔事务（0/1 ⇒ 退回"每 5 ms 一笔"的老节奏）。
+ * 见 spi_link_poll 里的长度账：2 KB 的一块要 35 笔，只按 5 ms 一拍跑是 12 KB/s，
+ * 顶上不去；连跑 8 笔 ≈ 2.7 ms/拍，帧期从 ~11 ms 涨到 ~14 ms，用户看不出来。
+ * 做成运行期可写是为了能**不改固件**地把它调小回退（SWD 写一下即可）。 */
+volatile uint32_t g_spi_burst    = 8;
+
 static uint32_t presc_to_hal(int p)
 {
     switch (p)
@@ -64,10 +70,10 @@ static uint32_t presc_to_hal(int p)
     }
 }
 
-static void tiny_delay(void)
-{
-    for (volatile int i = 0; i < 40; i++) { }
-}
+/* ⚠ 原来这里有个 tiny_delay()（40 次空转 ≈ 0.3 µs），CS 抬升后就靠它。
+ *   2026-10-10 第四轮发现它**比 CS 高电平所需的最小宽度还短**，已换成 cs_gap()，
+ *   函数本身随之删除（留着会被 -Wunused-function 抓到）。下面两处注释里的
+ *   "tiny_delay" 是历史记录，指的是这个已删除的函数。 */
 
 /* CS 建立/保持延时。
  *
@@ -80,6 +86,29 @@ static void tiny_delay(void)
 static void cs_delay(void)
 {
     for (volatile int i = 0; i < 800; i++) { }   /* ≈ 6~8 µs @400 MHz，> 10 个位周期 */
+}
+
+/* CS **抬升**之后的间隔（连续事务之间）。
+ *
+ * ⚠ 为什么必须单独有这个（2026-10-10 第四轮）：原来 CS 抬升后只跟一个
+ *   tiny_delay（40 次空转 ≈ 0.3 µs），而 burst 模式下下一笔事务紧接着就把 CS
+ *   又拉低 —— 留给从机的"CS 高电平"只有 0.3 µs ≈ 72 个 240 MHz 周期，
+ *   再经 GPIO 矩阵，余量太小。ESP32 从机要认出 CS 上升沿才结束本笔、装配下一笔；
+ *   识别不到就会：① 报 trans_len = 0 的"空事务"；② 把相邻两笔并成一笔
+ *   （trans_len = 1024 而非 512，第 2 笔的命令被挤到缓冲区之外丢掉）。
+ *   实测佐证：主机侧 **g_spi_err 恒 0（HAL 从未失败）**、从机 command 区截断 0，
+ *   但"收下命令"比主机发的少 ~10% ⇒ 只能出在 CS 时序上。
+ *   ⇒ 抬升后等 ≈3 µs（≈ 1.5625 MHz 下 5 个位周期），代价 8 笔/burst × 3 µs
+ *     = 24 µs/拍，相对 ~11 ms 的帧期可忽略。 */
+/* 默认 1200 ≈ 9 µs：够从机认出 CS 上升沿，又只占 burst 8 笔的 72 µs/拍。
+ * 扫档实测 3 / 9 / 22 / 60 µs 四档里 22 µs 那一档 GET 连续失联最轻，
+ * 但单轮噪声大、不足以区分 9 与 22（差 104 µs/拍）⇒ 取中间偏保守的 9 µs。 */
+volatile uint32_t g_spi_cs_gap = 1200u;  /* 空转次数；≈ n/133 µs @400 MHz */
+
+static void cs_gap(void)
+{
+    uint32_t n = g_spi_cs_gap;
+    for (volatile uint32_t i = 0; i < n; i++) { }
 }
 
 static void spi_gpio_init(void)
@@ -203,64 +232,116 @@ void spi_link_poll(uint32_t now_ms)
     static uint8_t  tx[XFER];
     static uint8_t  rx[XFER];
     uint32_t        avail, n, i, dlen;
+    uint32_t        budget;
     int             rc;
 
     if (g_spi_init_rc != 0)
         return;
-    if ((now_ms - s_last) < 5u)     /* ~5 ms 节拍：足够追上下行，又不占满总线 */
-        return;
-    s_last = now_ms;
+
+    /* ---- 本拍要不要干活？两种情形 ----
+     *   ① 从机说"有数据"（ready 高），或命令环里还有东西要发 ⇒ 有事，走 burst；
+     *   ② 都没有 ⇒ 只是空闲心跳，维持 ~5 ms 一拍（用于把 $?RD 这类命令发出去、
+     *      以及从机 ready 还没拉起来时也能把状态帧取回来）。
+     * ⚠ 空闲心跳不能删：ready 是"从机出站队列非空"，而队列里刚被取空的那一刻
+     *   到下一次 ready 拉高之间没有信号，全靠主机周期轮询兜住。 */
+    if ((g_spi_burst == 0u) || (g_spi_burst == 1u))
+    {
+        /* burst 被关掉（g_spi_burst=0）或 =1 ⇒ 退回"每 5 ms 一笔"的老节奏 */
+        if ((now_ms - s_last) < 5u)
+            return;
+        s_last  = now_ms;
+        budget  = 1u;
+    }
+    else
+    {
+        int busy = (HAL_GPIO_ReadPin(SPI_RDY_PORT, SPI_RDY_PIN) == GPIO_PIN_SET) ? 1 : 0;
+        if (((s_cmd_head - s_cmd_tail) & CMD_RING_MASK) != 0u)
+            busy = 1;
+        if (!busy)
+        {
+            if ((now_ms - s_last) < 5u)
+                return;
+            s_last = now_ms;
+            budget = 1u;
+        }
+        else
+        {
+            s_last = now_ms;        /* 有活的这一拍把心跳也刷新掉 */
+            budget = g_spi_burst;
+        }
+    }
 
     if ((int)g_spi_presc != s_cur_presc)
         (void)spi_apply((int)g_spi_presc);
 
-    /* ---- 组主发缓冲：把命令环前段搬进 [3..]，其余填 0 ---- */
-    memset(tx, 0, XFER);
-    avail = (s_cmd_head - s_cmd_tail) & CMD_RING_MASK;
-    if (avail > 0u)
+    /* ---- 跑 budget 笔事务（有活时连跑，把 61 字节/笔的搬运速率顶上去）----
+     * 为什么需要 burst：一笔事务只搬 61 字节，一次文件块 2 KB 要 35 笔。
+     * 只按 5 ms 一拍跑 ⇒ 12 KB/s，100 KB 要 8 秒以上，而且期间从机出站队列
+     * 一直压着几千字节（ready 恒高）却只能慢慢漏。连跑几笔后整条链路的
+     * "搬运带宽"才跟得上写卡。
+     * ⚠ 上限必须存在：本函数跑在渲染前的主循环里，burst 太长会把帧时间拉长。
+     *   8 笔 × 约 0.34 ms(/64) ≈ 2.7 ms，帧期 ~11→14 ms（约 70 FPS），可以接受。 */
+    for (uint32_t k = 0; k < budget; k++)
     {
-        n = (avail > (XFER - 3u)) ? (XFER - 3u) : avail;
-        tx[0] = 0x01u;
-        tx[1] = (uint8_t)(n & 0xFFu);
-        tx[2] = (uint8_t)((n >> 8) & 0xFFu);
-        for (i = 0u; i < n; i++)
+        /* ---- 组主发缓冲：把命令环前段搬进 [3..]，其余填 0 ---- */
+        memset(tx, 0, XFER);
+        avail = (s_cmd_head - s_cmd_tail) & CMD_RING_MASK;
+        if (avail > 0u)
         {
-            tx[3u + i] = s_cmd_ring[s_cmd_tail];
-            s_cmd_tail = (s_cmd_tail + 1u) & CMD_RING_MASK;
+            n = (avail > (XFER - 3u)) ? (XFER - 3u) : avail;
+            tx[0] = 0x01u;
+            tx[1] = (uint8_t)(n & 0xFFu);
+            tx[2] = (uint8_t)((n >> 8) & 0xFFu);
+            for (i = 0u; i < n; i++)
+            {
+                tx[3u + i] = s_cmd_ring[s_cmd_tail];
+                s_cmd_tail = (s_cmd_tail + 1u) & CMD_RING_MASK;
+            }
         }
-    }
 
-    /* ---- 一次全双工事务 ---- */
-    HAL_GPIO_WritePin(SPI_CS_PORT, SPI_CS_PIN, GPIO_PIN_RESET);
-    cs_delay();
-    rc = (HAL_SPI_TransmitReceive(&s_hspi, tx, rx, XFER, 200u) == HAL_OK) ? 0 : -1;
-    cs_delay();
-    HAL_GPIO_WritePin(SPI_CS_PORT, SPI_CS_PIN, GPIO_PIN_SET);
-    tiny_delay();
+        /* ---- 一次全双工事务 ---- */
+        HAL_GPIO_WritePin(SPI_CS_PORT, SPI_CS_PIN, GPIO_PIN_RESET);
+        cs_delay();
+        rc = (HAL_SPI_TransmitReceive(&s_hspi, tx, rx, XFER, 200u) == HAL_OK) ? 0 : -1;
+        cs_delay();
+        HAL_GPIO_WritePin(SPI_CS_PORT, SPI_CS_PIN, GPIO_PIN_SET);
+        cs_gap();               /* ⚠ 不能退回 tiny_delay：从机要认出 CS 上升沿，见 cs_gap 注释 */
 
-    g_spi_tx_n++;
-    if (rc != 0)
-    {
-        g_spi_last_code = -1;
-        /* 记录失败（追"空事务"来源）：HAL 状态放在 hspi.ErrorCode / State 里 */
-        if (g_spi_err == 0u)
-            g_spi_err_code = (int)s_hspi.ErrorCode;
-        g_spi_err++;
-        return;
-    }
+        g_spi_tx_n++;
+        if (rc != 0)
+        {
+            g_spi_last_code = -1;
+            /* 记录失败（追"空事务"来源）：HAL 状态放在 hspi.ErrorCode / State 里 */
+            if (g_spi_err == 0u)
+                g_spi_err_code = (int)s_hspi.ErrorCode;
+            g_spi_err++;
+            return;                 /* ⚠ 出错立刻收手：连跑会把一个超时放大成 N 个 */
+        }
 
-    g_spi_irq_level = (HAL_GPIO_ReadPin(SPI_RDY_PORT, SPI_RDY_PIN) == GPIO_PIN_SET) ? 1u : 0u;
+        g_spi_irq_level = (HAL_GPIO_ReadPin(SPI_RDY_PORT, SPI_RDY_PIN) == GPIO_PIN_SET) ? 1u : 0u;
 
-    /* ---- 解从机下行：data_len 权威，忽略填充 ---- */
-    dlen = (uint32_t)(rx[1] | (rx[2] << 8));
-    if (dlen > 0u && dlen <= (XFER - 3u))
-    {
-        uart_link_feed(rx + 3u, dlen);
-        g_spi_rx_bytes += dlen;
-        g_spi_last_code = 0;
-    }
-    else
-    {
-        g_spi_last_code = 1;        /* 空事务（从机出站队列正好空） */
+        /* ---- 解从机下行：data_len 权威，忽略填充 ---- */
+        dlen = (uint32_t)(rx[1] | (rx[2] << 8));
+        if (dlen > 0u && dlen <= (XFER - 3u))
+        {
+            uart_link_feed(rx + 3u, dlen);
+            g_spi_rx_bytes += dlen;
+            g_spi_last_code = 0;
+        }
+        else
+        {
+            g_spi_last_code = 1;    /* 空事务（从机出站队列正好空） */
+        }
+
+        /* ---- 还有活就继续连跑，没活就收手（省掉无谓的空事务）---- */
+        {
+            int more = (HAL_GPIO_ReadPin(SPI_RDY_PORT, SPI_RDY_PIN) == GPIO_PIN_SET) ? 1 : 0;
+            if (((s_cmd_head - s_cmd_tail) & CMD_RING_MASK) != 0u)
+                more = 1;
+            if (dlen > 0u)
+                more = 1;           /* 刚收到数据 ⇒ 队列里多半还有，继续追 */
+            if (!more)
+                break;
+        }
     }
 }

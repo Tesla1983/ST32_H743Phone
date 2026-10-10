@@ -82,5 +82,11 @@ extern volatile int      g_spi_last_code;  /* 最近一次事务结果：0=有�
  * 若本计数恒 0 而从机仍报空事务 ⇒ 是 CS 侧电气/时序问题，不在 HAL 这一层。 */
 extern volatile uint32_t g_spi_err;
 extern volatile int      g_spi_err_code;
+/* 一拍最多连跑几笔事务（2026-10-10 P4 加，为文件传输提速）。
+ * 0 或 1 ⇒ 退回"每 5 ms 一笔"的老节奏（12 KB/s，够跑命令/状态帧）；
+ * 默认 8 ⇒ 有活时（ready 高 / 命令环非空 / 上一笔有数据）连跑，≈2.7 ms/拍。
+ * 运行期可写：SWD 写个 1 就能在不重烧固件的前提下回退。 */
+extern volatile uint32_t g_spi_burst;
+extern volatile uint32_t g_spi_cs_gap;   /* 连续事务之间 CS 高电平的空转次数（≈ n/133 µs）。 */
 
 #endif /* SPI_LINK_H */

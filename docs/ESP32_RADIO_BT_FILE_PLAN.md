@@ -18,20 +18,44 @@
 
 ---
 
-## 0.5 实施进度（截至 2026-10-10 第二轮）
+## 0.5 实施进度（**全部完成**，2026-10-10 第三轮收尾）
 
 | 阶段 | 状态 | 关键结论 |
 |---|---|---|
 | **P0 使能 BT** | ✅ 完成 | ⚠ **偏离原计划**：原计划「双模 BTDM + SPP」，实测 `iram0_0_seg overflowed by 3912 bytes`（Bluedroid+WiFi 抢 IRAM）。改为 **经典蓝牙单模** `CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=y` + `CONFIG_BT_BLE_ENABLED=n`（sdkconfig 与 defaults 两处同改）。构建通过，bin `0x13d780`，app 分区余 **38%** |
 | **P1 `bt_radio.c`** | ✅ 完成 | `bt_radio_enable()` 用官方宏 `BTDM_CONTROLLER_MODE_EFF`（单模时 = `ESP_BT_MODE_CLASSIC_BT`），**不再硬编码 `ESP_BT_MODE_BTDM`**（与单模构建冲突）；`bt_radio_disable()` 仍只 disable+deinit、**绝不 `esp_bt_mem_release()`**，内存保留以支持运行时反复开关 |
 | **P2 SPI 无线电控制** | ✅ 代码完成 + 两工程构建通过 | 命令 `$?RADIO,<目标>,<ON/OFF>`（STM32→ESP32）+ 状态帧 `$RD,<wifi>,<bt>`（ESP32→STM32，开机与每次 `$?RADIO`/`$?RD` 后回报）；ESP32 `wifi_sta_enable/disable` + `bt_radio_enable/disable` 已接命令机；STM32 `uart_link.c` 解析 `$RD` 并暴露 `BoardNet_SetWifi/SetBt/RadioWifiOn/RadioBtOn/QueryRadio`；设置页新增**蓝牙卡** + WiFi 开关改真命令 + 开关由 `$RD` 回流刷新（app_tick 比对 `g_net_rd_pkts`） |
-| P3 SPP 收文件 | ⬜ 未开始 | 见 §5 |
-| P4 SPI 批量文件协议 + TF 写 | ⬜ 未开始 | |
-| P5 STM32 UI 接收流程 | ⬜ 未开始 | |
-| P6 收尾提交 | ⬜ 未开始 | |
+| **P3 SPP 收文件** | ✅ 完成 | ESP32 `main/bt_spp.c`（经典 SPP 服务端，收字节流）+ `main/bt_file.c/.h`（文件会话管道：`OPEN`/`GET,<seq>`/`ABORT`/`TEST`，2 KB 一块 + CRC16，留"最后发出去那块"的副本供重传）。协议真源 = `main/bt_file.h` 顶部。**P4/P5 全程用它做自测源**（`$?BTF,TEST,<w>,<h>` 让对端合成 BMP，走与手机完全相同的下游管道）⇒ 验收不依赖真手机 |
+| **P4 SPI 批量 + TF 写** | ✅ 完成（板验收 B0–B6 全 PASS） | `src/bt_recv.c/.h`（新）+ `uart_link.c` 解析 `$BT`/`$!RS,BTF`/`$!BD`。**100 KB 从 2 分钟降到 9~20 s**（固件自记 15 136 ms / 20 416 ms ⇒ 6.6 / 4.9 KB/s）。详见 §7 的两条真根因 |
+| **P5 STM32 UI** | ✅ 完成（U1/U2/U3 全 PASS） | 文件管理器第 4 分类由「下载」改成**「蓝牙接收」**（`apps/files.c`）：进度条（`YMGUI_Bar`，建在 y=291）+ 开始/中止按钮 + 状态文字；`phone_shell_board.h` 加 `BoardBt_*` 转发。抓屏实测：空闲 0 像素 / 接收中 114-272（42%，"136/399 KB（43%）"）/ 完成满格 + "已收 bt_test.bmp（399 KB）" |
+| **P6 收尾** | ✅ 完成 | 新增 `tools/bt_file_check.py`（P4 数据验收，B0–B6）与 `tools/bt_ui_shot.py`（P5 抓屏验收）；`ci/firmware_reference.sha256` 更新到**第十九版**（bin `bec473fa…` / elf `271500a5…`，`verify_board_image.py` 全量读回 1 643 648 B 逐字节一致）；两仓已提交 |
 
-> **部署状态（2026-10-10 第二轮）**：ESP32 已构建并烧录到 COM10（bin `0x13d780`，app 分区余 38%）；
-> STM32 已构建并烧录（FLASH 1 637 452 B / 78.08%）。两侧均已在真机跑通，实测见下。
+> **部署状态（2026-10-10 第三轮，全部落地）**：ESP32 bin `0x13fb80`（app 分区余 38%）已烧 COM10；
+> STM32 **FLASH 1 643 648 B（78.37%）** 已烧并 reset。两侧均已在真机跑通，实测见下。
+
+### ★ 第三轮新增：P4/P5 的真根因与残余问题（摘要，细节见代码注释）
+
+**根因①：ESP32 从机的"有效事务深度"不由 `queue_size` 决定，而由"每完成一笔、任务补排一笔"维持。**
+IDF 的 `spi_intr()` 只在 `trans_queue` 非空时才给硬件装配下一笔；掏空即 `cur_trans=NULL`
+—— 此后主机那一笔事务**连中断都不产生**，对从机**完全不可见**（`s_rx_n` 不涨、`空事务` 也不涨）。
+而解析一条 `$?BTF,GET` 要读文件块 + 往 16 KB 出站环灌 2 KB，是**毫秒级**的。
+原顺序（先解析、后补排）让硬件整段裸露 ⇒ 约 **1/3 的 GET 凭空消失**
+（STM32 侧表现为"GET 无应答、白等 2 s 再重发"，正是 100 KB 要跑 22~44 s 的真因）。
+⇒ 修法：把"memcpy 拷出 rx → `slave_fill_queue(k)` 补排"提到解析之前，解析改用栈上副本。
+⚠ 配套坑：`out` 就是 `&s_trans[k]`，而补排里 `memset` 了它 ⇒ **`trans_len` 必须在补排之前读**，
+否则每一笔都被当成 0 bit 的空事务（实测症状：`空事务 8192 / 收下命令 0`，整条链路哑掉）。
+
+**根因②：GET 超时必须分两档，单档把两种情形混在一起了。**
+· 一个下行字节都没有 ⇒ GET 丢了 → 300 ms 就重发；
+· 有字节在下行 ⇒ 块正在搬，**绝不能重发**（对端会把同一块再灌一遍，界进按长度组装的
+  负载中间 ⇒ 那一块必 CRC 坏）。
+实测：单档 2000 ms ⇒ 22~44 s；单档 500 ms ⇒ 13~16 s 但每轮多 1 个坏块；**两档 ⇒ 9~20 s 且坏块 0**。
+
+**⚠ 残留（未解决，如实记录）**：GET 仍有 6%~20% 需重发一次。已逐一排除 ——
+等待窗口（1500/3000 ms 一样丢）、SCK 速率（3.125 MHz **更差**、0.781 MHz 更慢，
+1.5625 MHz 最优 ⇒ 不是越快越好）、CS 抬升宽度（3/9/22/60 µs 无趋势）、
+从机补排顺序（已修，把丢命令从 38% 降到 ~15%）。
+⇒ 结论：属**杜邦线 SPI 链路的固有抖动**；代价已压到每笔 300 ms（原 2000 ms）。
 
 ### 真机实测结论（SWD 直读 + COM10 日志，2026-10-10 16:30–16:55）
 
@@ -223,6 +247,17 @@ esp_bluedroid_init();  esp_bluedroid_enable();
 - **P4 SPI 批量文件协议 + STM32 TF 写**：`?FILE OPEN/SEND/DONE` + 分块 + 提速；STM32 写 TF。验收：发 100 KB 文件，TF 读回 CRC 一致、相册可见。
 - **P5 STM32 UI**：「接收文件」流程 + 进度条 + 接相册。验收：抓屏脚本确认。
 - **P6 收尾**：验证脚本 + 提交两仓（ESP32 改动不影响 STM32 CI 哈希；仅当 STM32 侧有代码改动时才更新 `ci/firmware_reference.sha256`）。
+
+> **P3–P6 全部完成（2026-10-10 第三轮）**，验收命令与结果：
+> · P4 数据：`tools/bt_file_check.py --snap 0 --wait 30 --burst 8` ⇒ B0–B6 全 PASS（连跑两轮）
+> · P5 视觉：`tools/bt_ui_shot.py` ⇒ U1/U2/U3 全 PASS，产物 `build/bt_ui_{1,2,3}_*.png`
+> · 出货形态核验：`tools/verify_board_image.py build/ymgui-h743.bin` ⇒ 1 643 648 B 逐字节一致
+>
+> ⚠ `bt_file_check.py` 有一条**测量纪律**（写在文件头，别省）：它的快照是"一次读整段
+> DTCM（37 KB）"，实测**一次要 ~6 s**。期间主循环被拖慢一个数量级、还会把主机侧的命令
+> 吃掉（SWD 停核几秒 = CS 一直低 ⇒ 从机把相邻两笔并成一笔）。
+> ⇒ **判"通不通"一律先跑 `--snap 0`（触发后完全不碰 SWD，事后读一次）**；
+> 耗时只看固件自记的 `g_bt_ms`，不看脚本墙钟。
 
 ---
 

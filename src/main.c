@@ -59,6 +59,7 @@
 #include "uart_link.h"
 #include "rtc_clock.h"
 #include "spi_link.h"
+#include "bt_recv.h"
 #include "app_config.h"
 
 /* ---- 供 SWD 直接读的指示量（地址用 arm-none-eabi-nm 查）----
@@ -851,6 +852,12 @@ int main(void)
          * 主发命令、从回数据，下行字节喂给 uart_link_feed 走同一套解析。
          * 轮询 @≥1.5 MHz 只有几十微秒，不影响 60 Hz 帧节拍。 */
         spi_link_poll(uptime_ms);
+
+        /* 蓝牙文件接收会话（P4，见 src/bt_recv.h）：
+         * 按序号拉块 → 校验 CRC → 写 TF → 收尾导入图库。
+         * ⚠ 必须排在 uart_link_poll / spi_link_poll **之后** ——
+         *   它读的是本拍刚解析出来的 $!BD 收齐标志与 $!RS,BTF / $BT 状态帧。 */
+        bt_recv_poll(uptime_ms);
 
         if (g_ctx_rc == 1 && g_img_busy == 0u)
         {

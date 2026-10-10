@@ -183,6 +183,13 @@ int  img_scan_mkdir(const char* dir);
  * 返回 0 = 已排队；<0 = 索引越界 / 上一轮还没跑完。 */
 int  img_scan_import(int i, const char* dir);
 
+/* 按**完整路径**排队导入（不查扫描表）。
+ * 为什么要它：蓝牙文件接收（src/bt_recv.c）把文件直接写进 /YMGUI/PIC 之后
+ * 要立刻让它"相册可见"，而那时扫描表里还没有这一条（表是"进分类时扫一次"的
+ * 快照）。重新扫一遍目录当然也行，但那是多余的几十毫秒 I/O。
+ * 返回 0 = 已排队；<0 = 路径非法 / 上一轮还没跑完（g_img_test 非 0）。 */
+int  img_import_path(const char* full);
+
 /* 主循环挂载点（写 g_img_test 触发，跑完自动清 0） */
 void img_store_poll(void);
 

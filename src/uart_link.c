@@ -152,6 +152,24 @@ volatile uint8_t  g_cmd_body[UART_LINK_BODY_CAP];
 volatile uint32_t g_cmd_body_len;
 volatile uint32_t g_cmd_req;
 
+/* ★2026-10-10（P4）负载**收齐**计数与"本块 CRC 结论"。见 uart_link.h 的说明：
+ * 头帧计数不能当"块到了"的判据（负载还在 35 笔 SPI 事务的路上）。 */
+volatile uint32_t g_cmd_bd_done;
+volatile int      g_cmd_bd_last_ok;
+
+/* ---- 蓝牙文件接收（P3/P4，2026-10-10）----
+ * 解析层只负责把字段收下来；动作（拉块、写 TF、导入图库）在 src/bt_recv.c。 */
+volatile int      g_net_btf_state;
+volatile uint8_t  g_net_btf_name[48];
+volatile uint32_t g_net_btf_size;
+volatile uint32_t g_net_btf_recv;
+volatile uint32_t g_net_bt_pkts;
+volatile int      g_cmd_btf_rc;
+volatile uint32_t g_cmd_btf_rs;
+volatile uint32_t g_bt_recv_req;
+volatile uint32_t g_bt_recv_w;
+volatile uint32_t g_bt_recv_h;
+
 /* ---- 逐城天气诊断量（2026-10-10）---- */
 volatile uint32_t g_city_req;
 volatile uint32_t g_city_ok;
@@ -595,6 +613,28 @@ static int parse_frame(const uint8_t* line, uint32_t len)
         return 0;
     }
 
+    /* ---- 蓝牙文件会话状态：$BT,<state>,<name>,<size>,<recv> ----
+     * ⚠ 放在 $!RS 之前判：'B' 与 '!' 不会混，但顺序上先判推送帧更直观。
+     * ⚠ name 字段对端用单个 '-' 表示"还没有名字"，这里**原样收下**，
+     *   由 bt_recv.c 决定怎么用（解析层不做业务判断）。 */
+    if (nf >= 5 && f[0][0] == 'B' && f[0][1] == 'T' && f[0][2] == 0)
+    {
+        g_net_btf_state = to_int(f[1]);
+        g_net_btf_size  = to_u32(f[3]);
+        g_net_btf_recv  = to_u32(f[4]);
+
+        uint32_t i = 0;
+        const char* t = f[2];
+        while (t[i] != 0 && i + 1u < (uint32_t)sizeof(g_net_btf_name))
+        {
+            g_net_btf_name[i] = (uint8_t)t[i];
+            ++i;
+        }
+        g_net_btf_name[i] = 0;
+        g_net_bt_pkts++;
+        return 0;
+    }
+
     /* ---- 命令响应：$!RS,<CMD>,<rc>[,<附加>] ---- */
     if (nf >= 3 && f[0][0] == '!' && f[0][1] == 'R' && f[0][2] == 'S')
     {
@@ -604,6 +644,13 @@ static int parse_frame(const uint8_t* line, uint32_t len)
         {
             if (to_int(f[2]) > 0)
                 g_cmd_weather_ack++;
+        }
+        else if (f[1][0] == 'B' && f[1][1] == 'T' && f[1][2] == 'F')
+        {
+            /* ★P4 蓝牙文件会话：rc 1=已受理/有数据 0=暂时没数据 -1=序号越界。
+             * 这里只把 rc 收下来并计数，语义解释在 src/bt_recv.c。 */
+            g_cmd_btf_rc = to_int(f[2]);
+            g_cmd_btf_rs++;
         }
         return 0;
     }
@@ -1120,9 +1167,14 @@ static void feed_byte(uint8_t c)
             uint16_t cc = crc16(g_cmd_body, s_bin_need);
             g_cmd_bd_len   = s_bin_need;
             g_cmd_body_len = s_bin_need;
-            s_bin_need     = 0u;
+            /* ★P4：CRC 结论**必须在收齐这一拍**落下来 —— 上层（bt_recv）靠
+             * "done 变了 + last_ok" 判这一块能不能写卡。g_cmd_bd_crc_bad 是累计
+             * 计数，分不清坏的是哪一块，不能拿它当判据。 */
+            g_cmd_bd_last_ok = (cc == s_bin_crc) ? 1 : 0;
             if (cc != s_bin_crc)
                 g_cmd_bd_crc_bad++;
+            s_bin_need     = 0u;
+            g_cmd_bd_done++;          /* 置在最后：上层看到它涨时，上面这些都已就绪 */
         }
         return;
     }
