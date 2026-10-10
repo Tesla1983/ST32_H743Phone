@@ -608,5 +608,60 @@
 #   重试只是兜底。根治要让主机每事务固定出 64 字节。
 #
 # FLASH 1 637 860 B（78.10%），比第十六版 +1 424 B。
-fb7fb84b176166965adee46e952ca5b4830a40d7d4c0ffbc39e20b12173b01fd  ymgui-h743.bin
-6de35912da6a2bf12a166f0e07eed10210fb12b40b3e3bdd4f5d72f8af7bfc98  ymgui-h743.elf
+# --- 第十七版（无线电开关）：已被第十八版取代 ---
+# fb7fb84b176166965adee46e952ca5b4830a40d7d4c0ffbc39e20b12173b01fd  ymgui-h743.bin
+# 6de35912da6a2bf12a166f0e07eed10210fb12b40b3e3bdd4f5d72f8af7bfc98  ymgui-h743.elf
+
+# ============================================================================
+# 第十八版（2026-10-10）· SPI 丢帧根治 + WiFi/蓝牙开关接入下拉抽屉
+# ============================================================================
+# 为什么变（按「更新时机」的 a：有意为之的功能改动；工具链 14.3.rel1 未变）：
+#
+# 一、**SPI 事务丢帧的根因根治**（用户要求"先修 SPI 对齐再往下走"）
+#   根因（全程实测定位，不是推理）：
+#     1. 从机 `out->trans_len` 正常就是 512 bit（%32==0）⇒ 声明长度无问题，异常是**偶发**；
+#     2. 打"带命令事务"的 rx hex 抓到证据：命令**完整无损**
+#        （`01 12 00 $?RADIO,BT,ON*79\r\n`）⇒ 正常路径全对；
+#     3. 异常事务 `trans_len` = **0**（主机拉了 CS 却没出时钟），另有少量"非 0 非 32 倍数"
+#        （尾部丢位）。两者都让 rx 尾部保留事务前的 memset(0) 值
+#        ⇒ **命令帧尾部变 0x00** ⇒ XOR 尾丢失 ⇒ 对端静默丢弃 ⇒ "拨开关没反应"。
+#   修法（ESP32 main/spi_link.c 三处 + STM32 src/spi_link.c 一处）：
+#     ① **预排队 2 笔**（SLAVE_PRIME）：原写法"排一笔→等结果→处理→再排"中间有空窗，
+#        主机 5 ms 轮询不看从机状态照发 ⇒ 空窗那一拍被截断。预排队后任何时刻硬件都有货；
+#        队列深度 3→4。
+#     ② **热循环里禁打日志**：每笔 ESP_LOGW 走 UART 是阻塞的，本身就是空窗来源
+#        （加诊断后坏帧反而变多）。改为只异常时打点且限 8 条；周期汇总 1024→8192 笔。
+#     ③ 判据从"必须整笔收满 512 bit"改成 **"命令区完整即喂"**：
+#        SPI 收的 bit 一定从头连续 ⇒ `trans_len >= (3+cmdlen)*8` 就喂；
+#        命令区本身被截断才丢弃（等主机重试）。尾部填充位丢了无害。
+#     ④ 主机侧 CS 建立/保持延时 `tiny_delay`（~0.3 µs，**比位周期 640 ns 还短**）
+#        → `cs_delay`（~6–8 µs，>10 位周期）；新增 `g_spi_err`/`g_spi_err_code`。
+#   实测效果：截断告警 **16 → 1 条 / 90 s**；**命令区截断 0**（16384 笔事务统计）、
+#     空事务 23（0.14%，ESP32 从机硬件自身偶发，不携带命令）、尾部截断 6；
+#     主机 `g_spi_err = 0`（19899 笔事务，HAL 从未失败）⇒ 空事务不是主机没出时钟。
+#
+# 二、**WiFi / 蓝牙开关接入下拉抽屉（控制中心）的实际按钮**
+#   · phone_quick_builtin.c：新增 `builtin_active(id)` —— WIFI/BLUETOOTH 读
+#     `BoardNet_RadioWifiOn/RadioBtOn`（**$RD 回流**，-1 未同步当关），其余项仍本地；
+#     `toggle()` 这两项改发 `BoardNet_SetWifi/SetBt`；
+#     `FEATURE` 宏的 active 也走 `builtin_active`（否则瓦片仍显示本地假状态）。
+#   · phone_shell.c：`PhoneHost_SetWifi` 改真命令、`PhoneHost_GetWifi` 读真实态
+#     —— 原来在板级构建里是**静默空操作**（只摆了样子）。
+#   · phone_shade.c：`PhoneShade_Inspect` 新增 `"wifi"` 条目（自检要按名字取）。
+#   · 刷新天然成立：`PhoneShade_Update` 每拍轮询 `active()`，值变即置脏 ⇒ $RD 一到瓦片就变。
+#   · ⚠ phone_selftest.inc 的两条旧断言必须改：原断言"点一下 PhoneHost_GetWifi() 就变"
+#     要等 ESP32 回帧，而板级自检必须能离线跑。改成确定性判据：
+#     ① 点瓦片 ⇒ g_cmd_tx 增加（命令真发出）；② 写 g_net_radio_*/g_net_rd_pkts
+#     ⇒ PhoneShade_Inspect("wifi"/"bluetooth") 跟随（瓦片跟随回流值）。
+#
+# 验收（全部 PASS）：
+#   · tools/radio_check.py 连跑 5/5 轮 + 前面 7/7 轮 **ALL PASS(3/3)**
+#     （$RD 回流 / BT ON / BT OFF；修前 7 轮只有 6 过）。
+#   · tools/shade_radio_check.py（新增）：
+#       S0 抽屉可开 全屏像素差 143280 · S1 WiFi g_cmd_tx +1、蓝牙 +4（真发命令）
+#       S2 WiFi/蓝牙瓦片 关↔开 像素差 3976 / 3935（颜色随 $RD 变）→ ALL PASS
+#   · tools/uart_check.py 下行回归照旧（SPI 业务链路未动协议）。
+#
+# FLASH 1 637 820 B（78.10%），比第十七版 +40 B（主要是诊断量与注释，代码净变化很小）。
+db057f03518b5f4d953e0430e840362205005cba27aafcc8f9b659be6104bafe  ymgui-h743.bin
+aedc13f27c245f12a14283807941b2b727ff7684e8e947147bc3c6755b2966a2  ymgui-h743.elf

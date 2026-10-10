@@ -2003,12 +2003,17 @@ void PhoneHost_SetBrightness(int value)
 	}
 }
 int PhoneHost_GetBrightness(void) { return display_brightness; }
+/* WiFi 开关（2026-10-10 改真）：WiFi 射频在对端 ESP32 上，所以这里**必须**
+ * 下发 $?RADIO,<ON|OFF>，不能再只改本地假状态。
+ * ⚠ 不再调 PhoneShade_SetWifi（那只是本地选项位）：抽屉的 WiFi 瓦片与设置页
+ *   的 WiFi 开关都改读 $RD 回流（BoardNet_RadioWifiOn），本地位已无意义。
+ * ⚠ 这里也不发 PhoneApps_Command(SETTINGS,"sync")：设置页自己每拍比对
+ *   g_net_rd_pkts 在状态真的变了时刷新，比"被动 sync"更可靠（不会把滚动位置弹回顶部）。 */
 void PhoneHost_SetWifi(int on)
 {
-	PhoneShade_SetWifi(on);
-	PhoneApps_Command(SETTINGS, "sync", NULL);
+	BoardNet_SetWifi(on);
 }
-int PhoneHost_GetWifi(void) { return PhoneShade_GetWifi(); }
+int PhoneHost_GetWifi(void) { return BoardNet_RadioWifiOn() > 0 ? 1 : 0; }
 
 /* ---- 壁纸 ribbon 半透明（2026-10-04 新增，设置页开关走这里）----
  *

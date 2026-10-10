@@ -77,5 +77,10 @@ extern volatile uint32_t g_spi_rx_bytes;   /* 从机下行收到并喂给解析�
 extern volatile uint32_t g_spi_tx_bytes;   /* 命令环里已发出的字节数（去往从机） */
 extern volatile uint32_t g_spi_irq_level;  /* ready(PC0) 最近电平 */
 extern volatile int      g_spi_last_code;  /* 最近一次事务结果：0=有数据收到 >0=空  <0=硬件错 */
+/* 追"从机收到 trans_len=0 空事务"用（2026-10-10）：主机 HAL 传输失败的笔数与首个失败码。
+ * 判据：本计数 > 0 ⇒ 空事务来自主机这次失败（HAL 没出时钟但 CS 已经动过）。
+ * 若本计数恒 0 而从机仍报空事务 ⇒ 是 CS 侧电气/时序问题，不在 HAL 这一层。 */
+extern volatile uint32_t g_spi_err;
+extern volatile int      g_spi_err_code;
 
 #endif /* SPI_LINK_H */

@@ -116,7 +116,9 @@ void touch_port_poll(void)
         }
 
         /* 滑动（模式 2/3）：第一拍按下起点 → 中间拍逐步移动 → 出屏前抬起。
-         * 每拍只注入一个事件，让 YMGUI 的动画在两拍之间正常推进。 */
+         * 每拍只注入一个事件，让 YMGUI 的动画在两拍之间正常推进。
+         * （竖直拖拽不在这里做：phone_shell 的 g_bdtap_* 已经支持 dx/dy 拖拽，
+         *   拉开/收起控制中心走那条路即可，避免两套等价注入。） */
         {
             int32_t dir = (g_synth_test == 2u) ? -(int32_t)SYNTH_SWIPE_DX
                                                :  (int32_t)SYNTH_SWIPE_DX;

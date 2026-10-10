@@ -448,6 +448,10 @@ intptr_t PhoneShade_Inspect(const char* name)
 {
 	if (!strcmp(name, "page"))
 		return quick_page;
+	/* WiFi 瓦片当前状态（1 开 / 0 关）。⚠ 来源是 $RD 回流（对端 ESP32 的真实无线
+	 * 电状态），不是本地假开关 —— 自检要验"瓦片跟随回流值"就得读它。 */
+	if (!strcmp(name, "wifi"))
+		return PhoneQuickBuiltin_State("wifi");
 	if (!strcmp(name, "flight"))
 		return PhoneQuickBuiltin_State("flight");
 	if (!strcmp(name, "data"))

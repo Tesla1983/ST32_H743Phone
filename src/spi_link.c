@@ -42,6 +42,13 @@ volatile uint32_t g_spi_tx_bytes   = 0;
 volatile uint32_t g_spi_irq_level  = 0;
 volatile int      g_spi_last_code  = -2;      /* -2=还没跑过 */
 
+/* 诊断（2026-10-10 追事务截断用）：HAL 传输失败的笔数与首个失败码。
+ * 从机实测偶尔收到 trans_len = 0 的"空事务"（CS 动了、一个时钟都没有），
+ * 而主机只要 HAL 返回 HAL_OK 就一定会出满 512 个时钟 ⇒ 空事务只能是
+ * **HAL 传输失败**这一路来的。这个计数就是判据。 */
+volatile uint32_t g_spi_err      = 0;
+volatile int      g_spi_err_code = 0;
+
 static uint32_t presc_to_hal(int p)
 {
     switch (p)
@@ -60,6 +67,19 @@ static uint32_t presc_to_hal(int p)
 static void tiny_delay(void)
 {
     for (volatile int i = 0; i < 40; i++) { }
+}
+
+/* CS 建立/保持延时。
+ *
+ * ⚠ 为什么不能只用 tiny_delay（2026-10-10）：tiny_delay 是 40 次空循环，
+ *   在 400 MHz 下约 0.3 µs —— **比一个 SPI 位周期还短**（/64 时 640 ns/位）。
+ *   CS 建立/保持时间小于一个位周期时，从机可能出现"CS 拉低后第一拍没跟上"
+ *   或"最后一拍还没采完 CS 就抬了"⇒ 事务被截断（从机 IDF 报 trans_len 不是
+ *   4 字节对齐、尾部字节丢失）。这里是纯软件延时、只占主循环几百 µs 里的几 µs，
+ *   代价可忽略，但把时序余量从"小于 1 位"提到"数倍位周期"，安全得多。 */
+static void cs_delay(void)
+{
+    for (volatile int i = 0; i < 800; i++) { }   /* ≈ 6~8 µs @400 MHz，> 10 个位周期 */
 }
 
 static void spi_gpio_init(void)
@@ -212,15 +232,20 @@ void spi_link_poll(uint32_t now_ms)
 
     /* ---- 一次全双工事务 ---- */
     HAL_GPIO_WritePin(SPI_CS_PORT, SPI_CS_PIN, GPIO_PIN_RESET);
-    tiny_delay();
+    cs_delay();
     rc = (HAL_SPI_TransmitReceive(&s_hspi, tx, rx, XFER, 200u) == HAL_OK) ? 0 : -1;
-    tiny_delay();
+    cs_delay();
     HAL_GPIO_WritePin(SPI_CS_PORT, SPI_CS_PIN, GPIO_PIN_SET);
+    tiny_delay();
 
     g_spi_tx_n++;
     if (rc != 0)
     {
         g_spi_last_code = -1;
+        /* 记录失败（追"空事务"来源）：HAL 状态放在 hspi.ErrorCode / State 里 */
+        if (g_spi_err == 0u)
+            g_spi_err_code = (int)s_hspi.ErrorCode;
+        g_spi_err++;
         return;
     }
 

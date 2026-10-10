@@ -780,16 +780,35 @@ static void selftest(void)
 	CHECK(PhoneShade_Inspect("page") == 1, "quick setting page is clamped at last page");
 	click_at(250, 72);
 	CHECK(PhoneShade_Inspect("page") == 0, "quick setting previous page restores builtins");
-	int old_wifi = PhoneHost_GetWifi();
-	click_at(45, 117);
-	CHECK(PhoneHost_GetWifi() != old_wifi, "Wi-Fi quick toggle changes shared state");
-	CHECK(YMGUI_Switch_GetOn((GYOBJ)PhoneApps_Inspect(SETTINGS, "wifi_switch", 0)) == PhoneHost_GetWifi(), "settings Wi-Fi follows control center");
+	/* ⚠ 2026-10-10：WiFi / 蓝牙瓦片从"本地假开关"改成**真命令**（$?RADIO），
+	 *   ⇒ 不能再断言"点一下状态就翻转" —— 那要等对端 ESP32 回 $RD 帧，
+	 *   而板级自检必须**在 ESP32 不在线、WiFi 任意状态下都能过**（否则 CI 变脆）。
+	 *   改成两条确定性判据：
+	 *     ① 点瓦片 ⇒ 命令真的发出去（g_cmd_tx 增加）；
+	 *     ② 瓦片显示跟随 $RD 回流（直接写 g_net_radio_wifi / g_net_radio_bt 验证）。 */
+	unsigned tx_wifi0 = g_cmd_tx;
+	click_at(45, 117);                     /* Wi-Fi 瓦片 */
+	CHECK(g_cmd_tx > tx_wifi0, "Wi-Fi quick toggle issues a real $?RADIO command");
+	g_net_rd_pkts    = 1u;                 /* >0 才让 Radio*On 返回真值（0 = 未同步） */
+	g_net_radio_wifi = 1;
+	step_time(60);
+	CHECK(PhoneShade_Inspect("wifi") == 1, "control center Wi-Fi tile follows $RD (on)");
+	g_net_radio_wifi = 0;
+	step_time(60);
+	CHECK(PhoneShade_Inspect("wifi") == 0, "control center Wi-Fi tile follows $RD (off)");
 	click_at(200, 117);
 	CHECK(PhoneShade_Inspect("flight") && !PhoneShade_Inspect("data") && !PhoneShade_Inspect("hotspot"), "flight disables data and hotspot");
 	click_at(45, 185);
 	CHECK(PhoneShade_Inspect("hotspot") && !PhoneShade_Inspect("flight"), "enabling hotspot exits flight mode");
-	click_at(275, 117);
-	CHECK(PhoneShade_Inspect("bluetooth"), "Bluetooth is toggleable locally");
+	unsigned tx_bt0 = g_cmd_tx;
+	click_at(275, 117);                    /* 蓝牙瓦片 */
+	CHECK(g_cmd_tx > tx_bt0, "Bluetooth quick toggle issues a real $?RADIO command");
+	g_net_radio_bt = 1;
+	step_time(60);
+	CHECK(PhoneShade_Inspect("bluetooth") == 1, "control center Bluetooth tile follows $RD (on)");
+	g_net_radio_bt = 0;
+	step_time(60);
+	CHECK(PhoneShade_Inspect("bluetooth") == 0, "control center Bluetooth tile follows $RD (off)");
 	CHECK(!PhoneShade_Inspect("muted"), "mute mode is off by default");
 	click_at(115, 185);
 	CHECK(PhoneShade_Inspect("muted"), "mute tile enables silent mode");
