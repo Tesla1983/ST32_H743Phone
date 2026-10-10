@@ -247,6 +247,18 @@ extern volatile uint32_t g_net_bt_pkts;     /* 收到的 $BT 帧数 */
 extern volatile int      g_cmd_btf_rc;      /* 最近一条 $!RS,BTF,<rc> 的 rc */
 extern volatile uint32_t g_cmd_btf_rs;      /* 收到的 $!RS,BTF 条数 */
 
+/* 上游 SPP 诊断镜像（对端随 $BT 一起推来的 $BS 帧）。
+ * 存在的理由：这些计数只活在 ESP32 上，而读 ESP32 串口日志必然把它复位清零，
+ * 抓不到现场；回送到本板后才能用 SWD 无损观测。
+ * 判据：opens==0 ⇒ 手机没连上 SPP；opens>0 而 rx 小 ⇒ 连上了但数据没发出来。 */
+extern volatile uint32_t g_spp_opens_m;     /* 手机连上 SPP 的次数 */
+extern volatile uint32_t g_spp_closes_m;    /* 断开次数 */
+extern volatile uint32_t g_spp_rx_m;        /* 对端从 SPP 收到的总字节 */
+extern volatile uint32_t g_spp_last_m;      /* 最近一包字节数 */
+extern volatile uint32_t g_spp_err_m;       /* 回调里非成功状态次数 */
+extern volatile int      g_spp_run_m;       /* 1 = SPP 服务端在监听 */
+extern volatile int      g_spp_conn_m;      /* 1 = 手机当前连着 */
+
 /* 手工触发（脚本用）：1 = 自测接收（对端合成 BMP 走全链路）
  *                   2 = 中止；写后固件自动清 0。
  * ⚠ 这两个尺寸是 P4 验收用的"约 100 KB"档：224×152 的 24 位 BMP

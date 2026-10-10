@@ -166,6 +166,19 @@ volatile uint32_t g_net_btf_recv;
 volatile uint32_t g_net_bt_pkts;
 volatile int      g_cmd_btf_rc;
 volatile uint32_t g_cmd_btf_rs;
+
+/* ---- 上游 SPP 诊断镜像（$BS 帧，2026-10-11）----
+ * 这几个量只活在对端 ESP32 上，而读 ESP32 串口日志**必然把它复位**，计数随之清零，
+ * 永远抓不到现场。所以让对端随 $BT 一起把它们回送过来，本板留一份镜像，
+ * 之后用 SWD 读（SWD 不动 ESP32）即可无损观测。
+ * 判据用法：opens==0 ⇒ 手机根本没连上 SPP；opens>0 而 rx 小 ⇒ 连上了但没发数据。 */
+volatile uint32_t g_spp_opens_m;    /* 手机连上 SPP 的次数 */
+volatile uint32_t g_spp_closes_m;   /* 断开次数 */
+volatile uint32_t g_spp_rx_m;       /* 对端从 SPP 收到的总字节 */
+volatile uint32_t g_spp_last_m;     /* 最近一包字节数 */
+volatile uint32_t g_spp_err_m;      /* 回调里非成功状态次数 */
+volatile int      g_spp_run_m;      /* 1 = SPP 服务端在监听 */
+volatile int      g_spp_conn_m;     /* 1 = 手机当前连着 */
 volatile uint32_t g_bt_recv_req;
 volatile uint32_t g_bt_recv_w;
 volatile uint32_t g_bt_recv_h;
@@ -632,6 +645,20 @@ static int parse_frame(const uint8_t* line, uint32_t len)
         }
         g_net_btf_name[i] = 0;
         g_net_bt_pkts++;
+        return 0;
+    }
+
+    /* ---- 上游 SPP 诊断：$BS,<opens>,<closes>,<rx>,<last>,<err>,<run>,<conn> ----
+     * ⚠ 紧跟在 $BT 之后判：两者都是 'B' 开头，靠第二个字符 'T' / 'S' 区分。 */
+    if (nf >= 8 && f[0][0] == 'B' && f[0][1] == 'S' && f[0][2] == 0)
+    {
+        g_spp_opens_m  = to_u32(f[1]);
+        g_spp_closes_m = to_u32(f[2]);
+        g_spp_rx_m     = to_u32(f[3]);
+        g_spp_last_m   = to_u32(f[4]);
+        g_spp_err_m    = to_u32(f[5]);
+        g_spp_run_m    = to_int(f[6]);
+        g_spp_conn_m   = to_int(f[7]);
         return 0;
     }
 

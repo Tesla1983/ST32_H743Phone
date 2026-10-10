@@ -839,5 +839,34 @@
 #     但导入后**相册可见**（相册读的是 W25Q128 图库，不扫卡上后缀）。
 #
 # FLASH 1 643 896 B（78.39%），比第二十版 +128 B。
-d3d9b8a855112a7c0d455c83fbccab82f4a6fca961f7d0c6cd24c0f718cfe1ec  ymgui-h743.bin
-b3661cd428e52668c842255fa34ca5289cb57e8f6f83ede45d3e26ff1d6b8001  ymgui-h743.elf
+# d3d9b8a855112a7c0d455c83fbccab82f4a6fca961f7d0c6cd24c0f718cfe1ec  ymgui-h743.bin
+# b3661cd428e52668c842255fa34ca5289cb57e8f6f83ede45d3e26ff1d6b8001  ymgui-h743.elf
+
+# ============================================================================
+# 第二十二版（2026-10-11）—— 上游 SPP 诊断回流（$BS 帧），本次只加观测、不改业务语义
+# ----------------------------------------------------------------------------
+# 一、为什么加它
+#   手机"发送一直失败"时，既有诊断量**分不清两种故障**：
+#     opens==0 ⇒ 手机压根没连上 SPP（安全级/配对/App 用不安全 socket）
+#     opens>0 而 rx 小 ⇒ 连上了但数据没发出来
+#   而 g_spp_* 只活在 ESP32 上，读 ESP32 串口日志**必然复位**并清零这些计数，
+#   永远抓不到现场 ⇒ 只能回送到本板，之后用 SWD 读（SWD 不动 ESP32）。
+#
+# 二、改动
+#   对端 main/uplink_cmd.c：btf_status_broadcast() 推 $BT 之后附带推一帧
+#     $BS,<opens>,<closes>,<rx>,<last>,<err>,<run>,<conn>
+#     （run = SPP 服务端是否在监听，conn = 手机当前是否连着）
+#   本仓库 src/uart_link.c/.h：解析 $BS → g_spp_*_m 镜像量。
+#     ⚠ 紧跟 $BT 之后判：两者都是 'B' 开头，靠第二个字符 'T'/'S' 区分。
+#
+# 三、验收（已验）
+#   STM32：SWD 触发 g_bt_recv_req=1 跑 TEST 会话（224×152 BMP）⇒
+#     g_bt_bytes=102710 / g_bt_chunks=50 / g_bt_err=0 / g_bt_imp_rc=0（导入成功）
+#     / g_net_bt_pkts=51（$BT 在推 ⇒ 同一处推的 $BS 必然也在推）
+#     ⇒ 下游管道（ESP32→SPI→STM32→落卡→导入相册）**完全健康**，仪表链路活。
+#   ⚠ 这同时证明问题在**上游**（手机→ESP32 SPP），不在本板。
+#   未验：手机实连 SPP 的 opens/rx 数值（需真手机）。
+#
+# FLASH 1 644 256 B（78.40%），比第二十一版 +360 B。
+4753838bbfda10ef9dd0623932065ff1c5c685705485857dcf3832dc3dda013e  ymgui-h743.bin
+41db686bb9e06e81f6ca528774ec60547f2dd47081c1d2bb7dd5884eda0d0d4a  ymgui-h743.elf
