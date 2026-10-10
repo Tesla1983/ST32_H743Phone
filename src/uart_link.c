@@ -9,6 +9,7 @@
  * =========================================================================== */
 
 #include "uart_link.h"
+#include "spi_link.h"           /* SPI 激活时命令改走 SPI 命令环（uart_link_cmd 用） */
 
 #include "stm32h7xx_hal.h"
 #include "rtc_clock.h"          /* $DT 到达时校准板载 RTC */
@@ -106,6 +107,7 @@ volatile uint32_t g_net_wf_pkts;
 volatile uint32_t g_net_wx_pkts;
 volatile uint32_t g_net_xor_fail;
 volatile uint32_t g_net_bad_pkts;
+volatile uint32_t g_net_rx_bytes;        /* 下行总字节（UART+SPI 合一），命令握手判据用 */
 
 volatile uint32_t g_uart_selftest;
 
@@ -703,7 +705,12 @@ int uart_link_cmd(const char* type, const char* body)
     if (n <= 0)
         return -1;
     g_cmd_tx++;
-    (void)uart_link_send(out);      /* 阻塞轮询，短帧 <20 字节 ⇒ ~0.2 ms @921600 */
+    /* SPI 已接管业务链路时，命令改走 SPI 命令环（由 spi_link_poll 在事务里发出）；
+     * 否则退回 UART 阻塞发送（UART 线没接时就是静默失败，与历史行为一致）。 */
+    if (spi_link_active())
+        (void)spi_link_cmd_enqueue(out);
+    else
+        (void)uart_link_send(out);  /* 阻塞轮询，短帧 <20 字节 ⇒ ~0.2 ms @921600 */
     return n;
 }
 
@@ -743,8 +750,10 @@ static void cmd_tick(uint32_t now_ms)
 
     case CMD_PH_LINK:
         /* 先确认"收"方向通了（线上有字节），再试"发" —— 收都不通时
-         * 发的方向多半也没接，这时发命令只是白占阻塞时间。 */
-        if (g_uart_rx_bytes != 0u)
+         * 发的方向多半也没接，这时发命令只是白占阻塞时间。
+         * ⚠ 2026-10-10 SPI 升格后改成看 g_net_rx_bytes（UART+SPI 合一），
+         *   否则 SPI 接管、UART 线已拆时这条判据永远为 0、命令永不发出。 */
+        if (g_net_rx_bytes != 0u)
         {
             s_cmd_phase = CMD_PH_PING;
             s_cmd_t0    = now_ms;
@@ -937,6 +946,69 @@ void UART4_IRQHandler(void)
 
 /* ====================== 主循环 ====================== */
 
+/* ---- 逐字节喂给解析层（UART 与 SPI 共用这一份状态机）----
+ * 抽出来是因为 SPI 业务链路也要走同一套行重组 / $!BD 二进制模式 / parse_frame，
+ * 不能让两套解析逻辑分叉。传输层（UART 中断 or SPI 事务）只负责把字节送进来。 */
+static void feed_byte(uint8_t c)
+{
+    g_uart_last_ms = s_now_ms;
+    g_net_rx_bytes++;                   /* UART + SPI 合一的下行总字节 */
+
+    /* 二进制模式（$!BD 的裸负载）：**按长度收**，不看内容、不参与行重组。 */
+    if (s_bin_need != 0u)
+    {
+        g_cmd_body[s_bin_got++] = c;
+        if (s_bin_got >= s_bin_need)
+        {
+            uint16_t cc = crc16(g_cmd_body, s_bin_need);
+            g_cmd_bd_len   = s_bin_need;
+            g_cmd_body_len = s_bin_need;
+            s_bin_need     = 0u;
+            if (cc != s_bin_crc)
+                g_cmd_bd_crc_bad++;
+        }
+        return;
+    }
+
+    if (c == (uint8_t)'\n')
+    {
+        if (s_line_n > 0u)
+        {
+            g_uart_frames++;
+            /* 存一份原文留证：看清对端到底发了什么，再改解析器。 */
+            uint32_t n = s_line_n;
+            if (n > UART_LINK_LINE_MAX - 1u)
+                n = UART_LINK_LINE_MAX - 1u;
+            for (uint32_t i = 0; i < n; ++i)
+                g_uart_line[i] = s_line[i];
+            g_uart_line[n] = 0;
+            g_uart_line_len = n;
+
+            (void)parse_frame(s_line, s_line_n);
+        }
+        s_line_n = 0u;
+    }
+    else if (c == (uint8_t)'\r')
+    {
+        /* 直接丢弃：'\r\n' 结尾的帧由 '\n' 收尾，'\r' 不进缓冲 */
+    }
+    else
+    {
+        if (s_line_n < UART_LINK_LINE_MAX - 1u)
+            s_line[s_line_n++] = c;
+        else
+            s_line_n = 0u;              /* 超长：整行作废，等下一帧 */
+    }
+}
+
+void uart_link_feed(const uint8_t* buf, uint32_t len)
+{
+    for (uint32_t i = 0; i < len; i++)
+    {
+        feed_byte(buf[i]);
+    }
+}
+
 void uart_link_poll(uint32_t now_ms)
 {
     s_now_ms = now_ms;
@@ -951,54 +1023,8 @@ void uart_link_poll(uint32_t now_ms)
     {
         uint8_t c = s_ring[s_tail];
         s_tail = (s_tail + 1u) & RING_MASK;
-        g_uart_last_ms = now_ms;
-
-        /* 二进制模式（$!BD 的裸负载）：**按长度收**，不看内容、不参与行重组。
-         * 这样负载里含 '$' / '\r' / '\n' 也不会把解析搞乱。 */
-        if (s_bin_need != 0u)
-        {
-            g_cmd_body[s_bin_got++] = c;
-            if (s_bin_got >= s_bin_need)
-            {
-                uint16_t cc = crc16(g_cmd_body, s_bin_need);
-                g_cmd_bd_len   = s_bin_need;
-                g_cmd_body_len = s_bin_need;
-                s_bin_need     = 0u;
-                if (cc != s_bin_crc)
-                    g_cmd_bd_crc_bad++;
-            }
-            continue;
-        }
-
-        if (c == (uint8_t)'\n')
-        {
-            if (s_line_n > 0u)
-            {
-                g_uart_frames++;
-                /* 存一份原文留证：看清对端到底发了什么，再改解析器。 */
-                uint32_t n = s_line_n;
-                if (n > UART_LINK_LINE_MAX - 1u)
-                    n = UART_LINK_LINE_MAX - 1u;
-                for (uint32_t i = 0; i < n; ++i)
-                    g_uart_line[i] = s_line[i];
-                g_uart_line[n] = 0;
-                g_uart_line_len = n;
-
-                (void)parse_frame(s_line, s_line_n);
-            }
-            s_line_n = 0u;
-        }
-        else if (c == (uint8_t)'\r')
-        {
-            /* 直接丢弃：'\r\n' 结尾的帧由 '\n' 收尾，'\r' 不进缓冲 */
-        }
-        else
-        {
-            if (s_line_n < UART_LINK_LINE_MAX - 1u)
-                s_line[s_line_n++] = c;
-            else
-                s_line_n = 0u;          /* 超长：整行作废，等下一帧 */
-        }
+        g_uart_rx_bytes++;              /* UART 专属计数（SPI 的不计这里） */
+        feed_byte(c);
     }
 
     /* 二进制模式超时兜底：负载少发几个字节时，没有这个会一直吞掉后续的

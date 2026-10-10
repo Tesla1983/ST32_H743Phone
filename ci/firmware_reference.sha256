@@ -512,5 +512,42 @@
 #      产物时间戳晚于最后一次源码改动，否则会把旧哈希当新的写进 CI。
 #
 # FLASH 1 633 724 B（77.90%），比第十四版 +752 B。
-af7b530ba746c98c4f182aae444936c89e6424e750d91c67b34d033684563bb4  ymgui-h743.bin
-565c25a8c1d7b09aef2dcb405f8fab1ac55058022b51363df3fefdeca0786c3f  ymgui-h743.elf
+# --- 第十五版（状态栏回退 4 格信号柱 + 左侧 WiFi 图标）：已被第十六版取代 ---
+# af7b530ba746c98c4f182aae444936c89e6424e750d91c67b34d033684563bb4  ymgui-h743.bin
+# 565c25a8c1d7b09aef2dcb405f8fab1ac55058022b51363df3fefdeca0786c3f  ymgui-h743.elf
+
+# ============================================================================
+# 第十六版（2026-10-10）· SPI 升格为业务上行链路，替换 UART4 帧口
+# ============================================================================
+# 为什么变（按「更新时机」的 a：有意为之的功能改动；工具链 14.3.rel1 未变）：
+#   UART4 的 RX 线（PB8 ← 对端 GPIO1）物理断开且已拆除 ⇒ 把 SPI1 主从链路
+#   从「自检通道」升格为**真正的业务上行链路**，替换 UART 帧口。
+#   UART 代码（uart_link.c）完整保留作回退，物理线已拆。
+#
+# 改动：
+#   1. 新增 src/spi_link.c/.h（SPI1 主 PA5 SCK / PA7 MOSI / PB4 MISO / PC5 CS /
+#      PC0 ready 输入 ↔ ESP32 VSPI 从 GPIO18/23/19/4/21）：64 字节全双工业务事务，
+#      主发 [op][cmd_len][命令...]、从回 [status][data_len][数据...][0xFF 填充]
+#      （data_len 权威）；主 ~5 ms 轮询发起，流水线延迟靠高频轮询收敛。
+#   2. src/uart_link.c/.h 解耦：抽出公共 uart_link_feed(buf,len)（行重组 / $!BD
+#      二进制长度模式 / parse_frame 全共用），spi_link_poll() 把从机下行字节喂进它；
+#      uart_link_cmd() 在 spi_link_active() 时改走 spi_link_cmd_enqueue()；
+#      新增 g_net_rx_bytes（UART+SPI 合一下行字节），CMD_PH_LINK 判据改看它。
+#   3. src/main.c：spi_link_poll() 接入主循环；新增 g_spi_* 诊断量。
+#   4. CMakeLists.txt：src/spi_link.c 编入。
+#
+# 验收（全部 PASS）：
+#   · 数据/握手：tools/spi_biz_check.py --ping --watch 12 ⇒ PH0/PH1/PH2 全 PASS
+#      （g_spi_init_rc=0；下行字节 +86、$DT+2、$WD+1；g_cmd_tx=7 / g_cmd_rx=1，
+#       强制 PING 回 $!RS 握手后状态机自动进逐城天气扫描）。
+#   · WiFi 图标：tools/wifi_shot.py 六态全 PASS —— bright 严格递增 [9,18,29,44]、
+#      未知/断开 bright=0、断开 red=26 / 未知 red=0（两态可区分）；
+#      真实态 $WF 帧 230、up=1、rssi=-71、ip=192.168.1.2（数据走 SPI 照常到）。
+#   · 天气 app：tools/weather_shot.py 三城真实数据全到（杭州 22.0 多云 /
+#      上海 26.2 多云 / 成都 18.6 小雨），城市区域按 3 循环 PASS。
+#   · 回归：dma_check 用例② 仍 0；A2 ramp/gram=0；g_fault 全 0；IME 2/2；
+#      满负载整帧 ~10.9 ms / ~91 FPS（复位后干净态）。
+#
+# FLASH 1 636 436 B（78.03%），比第十五版 +2 712 B。
+ecaddc96d2766d4c2ebc3763008679e87a13a2ee0d364d5c60d899a36d72d922  ymgui-h743.bin
+a99b9cd4554c76076a252f1347613addad764377a4787f0bfaba5912c07b6b52  ymgui-h743.elf

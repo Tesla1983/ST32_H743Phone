@@ -58,6 +58,7 @@
 #include "img_store.h"
 #include "uart_link.h"
 #include "rtc_clock.h"
+#include "spi_link.h"
 #include "app_config.h"
 
 /* ---- 供 SWD 直接读的指示量（地址用 arm-none-eabi-nm 查）----
@@ -747,6 +748,15 @@ int main(void)
      *   实测判据：稳定期 g_uart_err_fe / ne 增量为 0（见 tools/uart_check.py）。 */
     (void)uart_link_init(921600u);
 
+    /* ---- SPI1 主 ↔ ESP32（VSPI 从）**业务链路**（2026-10-10 升格）----
+     * 替代 UART4 上行：ESP32 的时间/天气帧（$DT/$WD/$WF/$WX）与命令响应
+     * （$!RS/$!BD）改走 SPI，STM32 的命令（$?PING/$?WEA/$?WGET）也走 SPI。
+     * 默认 /64 ≈ 1.56 MHz（杜邦线先求稳）。
+     * ⚠ 没接对端 / 对端没跑从机**不影响任何其他功能**：失败只记 g_spi_init_rc；
+     *   判据看 g_spi_init_rc==0、g_spi_rx_bytes 涨、g_net_dt_pkts/g_net_wd_pkts 涨。
+     *   接线与协议见 src/spi_link.h 顶部。判据脚本：tools/spi_biz_check.py。 */
+    (void)spi_link_init(64u);
+
     /* ---- 板载 RTC（LSE 32.768 kHz，原理图 Y1 / PC14-PC15）2026-10-09 ----
      * 解决"每次复位都要等首帧 $DT 才有时间与日期"：VDD 不断时备份域保持，
      * 复位后 RTC 直接给出正确时间（$DT 到达后再校准一次）。
@@ -836,6 +846,11 @@ int main(void)
          * 不碰 QSPI、不碰屏幕，放哪都行；挨着放只是为了让顺序一眼看清。 */
         uptime_ms += ms;
         uart_link_poll(uptime_ms);
+
+        /* SPI 业务链路：每 ~5 ms 一次 64 字节全双工事务（内部节流）。
+         * 主发命令、从回数据，下行字节喂给 uart_link_feed 走同一套解析。
+         * 轮询 @≥1.5 MHz 只有几十微秒，不影响 60 Hz 帧节拍。 */
+        spi_link_poll(uptime_ms);
 
         if (g_ctx_rc == 1 && g_img_busy == 0u)
         {

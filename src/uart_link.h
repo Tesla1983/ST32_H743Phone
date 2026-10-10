@@ -237,6 +237,14 @@ int  uart_link_init(uint32_t baud);        /* 返回 0 成功 */
 void uart_link_poll(uint32_t now_ms);      /* 主循环每拍调一次 */
 int  uart_link_send(const char* text);     /* 发送（回显/握手用），返回发出字节数 */
 
+/* SPI 业务链路把收到的字节喂进来（与 UART 走同一套行重组 / $!BD 二进制模式 /
+ * parse_frame，传输层与解析层靠这个函数解耦）。 */
+void uart_link_feed(const uint8_t* buf, uint32_t len);
+
+/* 下行收到的总字节数（UART + SPI 合一），命令握手"收方向通了"判据用，
+ * 避免 SPI 接管后还盯着 g_uart_rx_bytes（那只在 UART 有字节时涨）。 */
+extern volatile uint32_t g_net_rx_bytes;
+
 /* 发一条命令帧 $?<type>[,<body>]*HH\r\n（body 为 NULL 或空串时不带逗号）。
  * 返回发出的字节数；<0 = 参数非法或缓冲不足。
  * ⚠ 发送是**阻塞轮询**（115200 下每字节 ~87 µs，921600 下 ~11 µs），命令帧都很短，

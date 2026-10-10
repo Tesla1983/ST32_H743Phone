@@ -236,6 +236,11 @@ set(APP_SRC
 	# ⚠ 不能走 HAL 的 IT 接收 —— 厂商 usart.c 占着 HAL_UART_RxCpltCallback 与
 	#   HAL_UART_MspInit 两个全局符号，详见 src/uart_link.h 顶部。
 	src/uart_link.c
+	# SPI1 主 ↔ ESP32（VSPI 从）链路自检（2026-10-10）：PA5/PA7/PB4(AF5) + PC5(CS) + PC0(ready)。
+	# ⚠ 只用于实测这条 SPI 通不通、杜邦线能跑多快；**不参与业务**
+	#   （业务仍走 UART4 的 $DT/$WD/$WX）。失败只记 g_spi_init_rc，不影响任何其他功能。
+	#   详见 src/spi_link.h 顶部（协议、判据、PB4 的 H7 特殊性都在那儿）。
+	src/spi_link.c
 	# 板载 RTC（2026-10-09）：LSE 32.768 kHz（原理图 Y1，PC14/PC15）→ RTC。
 	# 解决"每次复位都要等 ESP32 首帧 $DT 才有时间/日期"的结构性缺陷：
 	# VDD 不断时备份域保持，重启后立即有正确时间。⚠ 板子**没有后备电池**
@@ -374,6 +379,9 @@ set(HAL_SRC
 	${TP}/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_pwr_ex.c
 	${TP}/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_sram.c
 	${TP}/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_uart.c
+	# SPI1 主（2026-10-10）：SPI ↔ ESP32 链路自检用。hal_conf.h 里 HAL_SPI_MODULE_ENABLED
+	# 早就开着（:81），但源文件此前没编进来 —— 只用到轮询收发，不需要 DMA/中断配套。
+	${TP}/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_spi.c
 	${TP}/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_dma.c
 	${TP}/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_dma_ex.c
 	${TP}/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_flash.c
