@@ -591,6 +591,44 @@ static int path_is_jpeg(const char* p)
     return 0;
 }
 
+/* 按**文件内容**的魔数判断是真 JPEG 还是 BMP。
+ * 返回  1 = JPEG；0 = BMP；-1 = 读不出来/认不出（调用方应回退到看扩展名）。
+ *
+ * ⚠ 为什么不再只看扩展名（2026-10-10 实测：蓝牙收到的图进不了相册）：
+ *   蓝牙那条路上，手机用通用串口助手发的是**裸字节流**，没有本工程的
+ *   `YMFILE,<名>,<大小>` 头 ⇒ 对端把名字强制成 `btrecv.bin`，原始的
+ *   `.jpg` / `.bmp` 后缀**全丢了**。只看扩展名的话，`.bin` 一律走 import_bmp，
+ *   里面装的 JPEG 就被 import_bmp 用"不是 BM 签名"拒掉（RC_NOT_BMP）。
+ *   ⇒ 改成按内容判：JPEG 的 SOI 是 FF D8，BMP 是 'BM'。
+ *
+ * ⚠ 必须用**独立的 FIL**：import_bmp / import_jpeg 自己要用全局 s_fil，
+ *   这里若也用 s_fil 会把它们的文件句柄冲掉（本函数在它们**之前**调用）。
+ *
+ * ⚠ 只在这里读 2 字节然后立刻关掉，不持有句柄、不改动 g_img_step ——
+ *   真正的导入随后由 import_bmp/import_jpeg 各自重新打开。
+ */
+static int sniff_image_kind(const char* p)
+{
+    FIL     f;
+    UINT    br = 0;
+    FRESULT fr;
+    uint8_t sig[2];
+
+    if (p == NULL || p[0] == 0) { return -1; }
+    if (fatfs_ensure_mounted() != 0) { return -1; }
+
+    fr = f_open(&f, p, FA_READ);
+    if (fr != FR_OK) { return -1; }
+
+    fr = f_read(&f, sig, sizeof(sig), &br);
+    (void)f_close(&f);
+    if ((fr != FR_OK) || (br != sizeof(sig))) { return -1; }
+
+    if ((sig[0] == 0xFFu) && (sig[1] == 0xD8u)) { return 1; }   /* JPEG SOI  */
+    if ((sig[0] == 'B')  && (sig[1] == 'M'))    { return 0; }   /* BMP 'BM'  */
+    return -1;                                                  /* 其它：交给扩展名兜底 */
+}
+
 __attribute__((section(".bss_img"), aligned(32)))
 static uint8_t s_jin[JPEG_IN_BUF];           /* 输入：从卡顺序读进来的 JPEG 字节流 */
 __attribute__((section(".bss_img"), aligned(32)))
@@ -1393,9 +1431,21 @@ void img_store_poll(void)
 
     if (mode == 1u)
     {
-        /* 按扩展名分流：.jpg/.jpeg 走硬件解码，其余按 BMP 处理。
-         * 这样 tools/img_check.py 原有的 BMP 流程完全不受影响。 */
-        g_img_rc = (path_is_jpeg(g_img_path) != 0) ? import_jpeg() : import_bmp();
+        /* 导入分流：**优先按内容魔数**判 JPEG / BMP，嗅不出来才回退到扩展名。
+         *
+         * ⚠ 为什么改成嗅探优先（2026-10-10）：蓝牙裸流收到的文件扩展名是 `.bin`
+         *   （原始后缀在对端就被丢了，见 sniff_image_kind 的说明）——只看扩展名
+         *   的话，这种文件一律被当成 BMP、里面的 JPEG 必然导入失败。
+         *
+         * ⚠ 回退到扩展名这一支**必须保留**：嗅探只在"文件能打开且至少 2 字节"
+         *   时才有结论，读不了时（比如卡没挂上）要退回老行为，
+         *   这样 tools/img_check.py 原有的 BMP 流程完全不受影响。 */
+        {
+            int kind    = sniff_image_kind(g_img_path);
+            int is_jpeg = (kind < 0) ? (path_is_jpeg(g_img_path) != 0) : (kind == 1);
+
+            g_img_rc = is_jpeg ? import_jpeg() : import_bmp();
+        }
     }
     else if (mode == 2u)
     {
