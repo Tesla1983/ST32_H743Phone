@@ -950,5 +950,80 @@
 #   未验：改发 .jpg 后能否成功进相册（需用户操作）。
 #
 # FLASH 1 644 840 B（78.41%），比第二十三版 +48 B。
-f4f604ff61b756ed1ee35944928c7bd21e6290f73d91ddf8de4d10462c1decda  ymgui-h743.bin
-a6abbcece97ef872c1c096c389ceaaf66faf3fbc2fa605baa7df3d959257c57e  ymgui-h743.elf
+# f4f604ff61b756ed1ee35944928c7bd21e6290f73d91ddf8de4d10462c1decda  ymgui-h743.bin
+# a6abbcece97ef872c1c096c389ceaaf66faf3fbc2fa605baa7df3d959257c57e  ymgui-h743.elf
+
+# ============================================================================
+# 第二十五版（2026-10-11）—— 相册删除按钮（用户已确认设计稿后定稿）
+# ----------------------------------------------------------------------------
+# 一、底层：图库此前**只有查询、没有删除**（BoardGallery_* 只有 Count/Info/Pixels）
+#   src/img_store.c/.h 新增：
+#     · img_store_delete(slot)   —— 把该槽位 16 B 索引条目**写 0**
+#     · img_store_next_valid(from)—— 从 from 起（回绕）找下一个有效槽位
+#     · BoardGallery_Delete(slot, *next_valid)
+#     · BoardGallery_Next(from)
+#   ⚠ 为什么删除 = 写 0：有效性判据是 rd16(e)==IMG_MAGIC && (rd16(e+2)&IMG_FLAG_VALID)，
+#     写 0 后两条都不成立 ⇒ 立即失效，且会被下次导入当作空位复用（分配空位同一判据）。
+#   ⚠ 写完必须 qspi_enter_mmap()：qspi_write 退出映射后**不自恢复**，
+#     indirect 模式下读 XIP 会触发精确 BusFault（2026-10-08 实测 CFSR=0x8200）。
+#   ⚠ 不擦数据区（有意取舍）：空间账是 max(off+len)，删掉条目后那段数据不会被覆盖，
+#     只是暂不回收；紧凑整理代价大、对 256 张/2 MB 的相册不划算。
+#
+# 二、UI：third_party/.../apps/gallery.c
+#   底部单行 284×34 拆成两个 138 宽按钮：「下一张 >」+「删除」。
+#   防误删：点「删除」→ 变红并显示「确认删除?」+ 提示「再点一次删除当前这张」；
+#     再点才真删；点「下一张」即解除确认态。
+#   ⚠ 顺手修了"下一张"的取模算法：原 (index+1)%total 在**删过图之后**会落在空槽上
+#     （槽位号是物理槽号、不是"第几张"，删中间一张就出现空洞）⇒ 改用 BoardGallery_Next。
+#
+# 三、验收（已验，SWD 触发 g_img_del_req，无需人手点按钮）
+#   写 g_img_del_req=0 删 slot 0 ⇒ g_img_del_rc=0、g_img_del_next=1；
+#   XIP 直读：slot 0 条目全 0（已失效），slot 1 条目 47 49 01 00 00 30 00 00 … 一字未变
+#     ⇒ 未误伤相邻槽位；删除后 XIP 仍可读 ⇒ 映射已正确恢复。
+#   ⚠ 副作用：这次自验**真的删掉了图库里 slot 0 那张图**（96×64），已告知用户。
+#
+# FLASH 1 645 560 B（78.44%），比第二十四版 +720 B。
+# --- 第二十五版（相册删除按钮）：已被第二十六版取代 ---
+# 455b7a4ebbbbab826f179badd8b99598cd849f81a39d541c0100d0e81f02d39a  ymgui-h743.bin
+# b91607f96233cbe55bb354f04f7694347f1c714ceace10236d6663cf18a5443a  ymgui-h743.elf
+
+# ============================================================================
+# 第二十六版（2026-10-11）—— UI 不再说谎：导入结果由真正的执行者说话
+# ----------------------------------------------------------------------------
+# 一、问题（板上实证，症状骗人）
+#   收完字节 ≠ 图进了相册。`src/bt_recv.c` 的 `g_bt_imp_rc` 只是"有没有排上队"，
+#   真正导入是 `img_store_poll()` 异步做的、结果在 `g_img_rc`。实测：
+#     g_bt_rc=0（收齐）、g_bt_imp_rc=0（排队成功），但 g_img_rc=4/8（导入失败），
+#   而 apps/files.c 在 DONE 时无条件写「已排队导入图库，去相册看」⇒ **一句谎话**。
+#
+# 二、改动
+#   src/bt_recv.c
+#     · 新增 s_imp_wait / s_imp_done / s_imp_rc + 导出 g_bt_imp_final：
+#       DONE 后持续观察 `g_img_test==0 && g_img_busy==0`，两者同时归零才把 g_img_rc
+#       锁定（只看 busy 会在"已排队还没轮到"那一拍读到上一轮的陈旧 rc）。
+#     · bt_recv_status_text() 的 DONE 分三段：排队失败 / 正在导入图库… / 出结果。
+#     · 新增 imp_result_text()：把 RC_* 翻成人话
+#       （4⇒"格式不支持（仅 BMP/JPG）"、8⇒"图库空间不足"、15/16⇒JPEG 失败…）。
+#       ⚠ **只返回静态字面量** —— files.c 用**指针相等**做变化检测，
+#         动态拼串（同 buffer 换内容、指针不变）会让界面永远不刷新。
+#   src/img_store.h —— RC_* 宏从 .c 搬到 .h（两边共用一份，抄一份必然走偏）。
+#   apps/files.c —— DONE 支去掉那句无条件的话；按钮文案改
+#     「（收完自动导入，仅支持 BMP/JPG）」。
+#
+# 三、验收（`python tools/bt_imp_text_check.py`，新增脚本）
+#   A 数据：自测会话 224×152 跑完 ⇒ g_bt_rc=0 / g_bt_imp_rc=0 /
+#     **g_bt_imp_final=8**（与 g_img_rc 一致）= 锁定逻辑正确。
+#     ⚠ 本轮不是"成功"而是暴露了真状态：图库 31 张已占满 2 MB
+#       ⇒ 连合法 BMP 也导不进（g_img_step=5 = STEP_ALLOC）。
+#   B 视觉（build/bt_ui_ok_zoom.png / bt_ui_fail_zoom.png）：
+#     说明区实拍到「状态：图库空间不足」与（把 s_imp_rc 改成 4 后）
+#     「状态：格式不支持（仅 BMP/JPG）」，两处都**不再**出现"去相册看"。
+#
+# 四、本次同时确认的遗留（未修，待用户定夺）
+#   分配器 `idx_used_in()` 的空间账 = **max(off+len) 只统计有效条目**
+#   ⇒ 删除**中间**一张不会回收空间（删最后一张才会）；且图片区不擦除（有意取舍）。
+#   后果：相册删除按钮目前**不能真正腾出空间**给新图。
+#
+# FLASH 1 646 136 B（78.49%），比第二十五版 +576 B。
+815c9394e47fe8d2c26775b8fb169203dd5c7d1d0d792c14dc1d9bad2be48ffe  ymgui-h743.bin
+ef77d6b9c621fca946a54dddd9d6141979cf9bb30c5916b34429a6511f90e312  ymgui-h743.elf

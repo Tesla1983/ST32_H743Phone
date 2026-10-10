@@ -194,7 +194,7 @@ static void bt_buttons_set(void)
 {
 	PhoneUI_button_set(state.file_rows[0], BoardBt_Busy() ? "中止接收" : "开始接收");
 	PhoneUI_button_set(state.file_rows[1], "（手机端用蓝牙发送文件）");
-	PhoneUI_button_set(state.file_rows[2], "（收完自动进相册）");
+	PhoneUI_button_set(state.file_rows[2], "（收完自动导入，仅支持 BMP/JPG）");
 	PhoneUI_button_set(state.file_rows[3], "返回上一级");
 }
 
@@ -211,10 +211,16 @@ static void bt_view_refresh(void)
 
 	bt_buttons_set();
 
-	/* 状态归类 —— 文案必须与实际能力一致（不拿 0℃ 冒充"没取到"那套纪律） */
+	/* 状态归类 —— 文案必须与实际能力一致（不拿 0℃ 冒充"没取到"那套纪律）
+	 *
+	 * ⚠ 2026-10-11：DONE 这一支原来还附加一句"已排队导入图库，去相册看"，
+	 *   那句话是**无条件**的，而"排上队"根本不等于"导进去了"（实测 PNG 就是
+	 *   排队成功、导入失败，UI 却叫用户去相册看 ⇒ 谎话）。
+	 *   现在结果全部由 bt_recv_status_text() 负责（它按 g_img_rc 说话），
+	 *   这里只陈述事实：收了多少字节、叫什么名字。 */
 	if (st == BTUI_DONE)
 		snprintf(text, sizeof(text),
-			"状态：%s\n已收 %s（%u KB）\n已排队导入图库，去相册看。",
+			"状态：%s\n已收 %s（%u KB）",
 			txt, name[0] ? name : "文件",
 			(unsigned)((got + 511u) / 1024u));
 	else if (st == BTUI_ERROR)

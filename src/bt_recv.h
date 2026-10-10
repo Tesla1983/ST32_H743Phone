@@ -108,7 +108,9 @@ extern volatile int      g_bt_rc;        /* 最近一次会话的结果码，0 =
 extern volatile uint32_t g_bt_err;       /* 出错阶段（BTE_*，定位失败点）*/
 extern volatile uint32_t g_bt_fs_rc;     /* 最后一个 FRESULT */
 extern volatile uint32_t g_bt_wr;        /* 最近一块 f_write 实际写出的字节数 */
-extern volatile uint32_t g_bt_imp_rc;    /* 收尾"导入图库"的返回码，0 = 已排队 */
+extern volatile uint32_t g_bt_imp_rc;    /* 收尾"导入图库"的返回码，0 = **已排队**（不代表成功）*/
+extern volatile uint32_t g_bt_imp_final; /* ★导入最终结果：0 = 真进相册；非 0 = img_store 的 RC_*；
+                                          *   0xFFFFFFFF = 还没出结论。UI 的成功文案只看它。 */
 extern volatile uint32_t g_bt_spi_tx;    /* 本次会话新开的 SPI 事务数（算实际吞吐：字节/事务）*/
 extern volatile uint32_t g_bt_get_ack_ms;/* GET 应答等待上限（ms），运行期可写，用于扫档 */
 extern volatile uint32_t g_bt_wait_max_ms;/* "一字节未到"阶段的总时长上限（ms），可写 */

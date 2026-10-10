@@ -79,6 +79,24 @@ static uint32_t s_req_test;
 static uint32_t s_req_w;
 static uint32_t s_req_h;
 
+/* ---- 导入结果跟踪（2026-10-11）----
+ *
+ * ⚠ 为什么需要它：`finish_ok()` 里的 `img_import_path()` 只是**排队**（置
+ *   g_img_test=1），真正的导入由 `img_store_poll()` 异步做，结果写在 `g_img_rc`。
+ *   而 `g_bt_imp_rc` 记的只是"排队成功与否"——它等于 0 **不代表图进去了**。
+ *   实测教训：两次发的都是 PNG，仪表上 `g_bt_imp_rc=0`（排队成功）而
+ *   `g_img_rc=4`(RC_NOT_BMP)（导入失败），UI 却照旧写"已排队导入图库，
+ *   去相册看" ⇒ 用户看到的是一句谎话。
+ *
+ * 于是这里做一次**结果锁定**：DONE 之后持续观察 `g_img_test`/`g_img_busy`，
+ * 两者同时归零的那一刻说明这一轮导入真的跑完了，把 `g_img_rc` 锁进
+ * `s_imp_rc`（并镜像到 `g_bt_imp_final` 供 SWD 判）。
+ * ⚠ 必须在 `g_img_test==0 && g_img_busy==0` **同时**成立时才取 —— 只看 busy
+ *   会在"已排队但还没轮到"的那一拍读到上一轮的陈旧 rc。 */
+static uint32_t s_imp_wait;   /* 1 = 已排队，等结果 */
+static uint32_t s_imp_done;   /* 1 = 结果已锁定 */
+static uint32_t s_imp_rc;     /* 锁定下来的结果（img_store 的 RC_*，0 = 成功）*/
+
 /* 解析层计数基线：判"自上次以来有没有新东西" */
 static uint32_t s_done_base;    /* g_cmd_bd_done */
 static uint32_t s_rs_base;      /* g_cmd_btf_rs */
@@ -103,6 +121,11 @@ volatile uint32_t g_bt_err;
 volatile uint32_t g_bt_fs_rc;
 volatile uint32_t g_bt_wr;
 volatile uint32_t g_bt_imp_rc;
+/* ★导入的**最终结果**（0 = 真的进相册了；非 0 = img_store 的 RC_*）。
+ * 与 g_bt_imp_rc 的分工：g_bt_imp_rc 只表示"有没有排上队"，
+ * 这个才是"图到底进没进去"。默认 0xFFFFFFFF = 还没有结论。
+ * ⚠ UI 的成功文案只能看它，看 g_bt_imp_rc 会说谎（见 s_imp_wait 上方注释）。 */
+volatile uint32_t g_bt_imp_final = 0xFFFFFFFFu;
 volatile uint32_t g_bt_spi_tx;
 volatile uint32_t g_bt_ms;
 volatile uint32_t g_bt_get_to;
@@ -341,8 +364,12 @@ static void finish_ok(void)
     }
 
     /* 收尾：排队导入图库（异步，由 img_store_poll 的 mode 1 执行）。
-     * ⚠ 只有 .bmp/.jpg 导得进去；别的扩展名会在这里失败，rc 记进 g_bt_imp_rc。 */
+     * ⚠ 只有 .bmp/.jpg 导得进去；别的格式（实测踩到的就是 PNG）会在导入阶段失败，
+     *   失败记在 g_img_rc 而不是这里 —— 这里只是"排上队没有"。
+     *   ⇒ 排上队就开等，由 bt_recv_poll 把真结果锁进 s_imp_rc / g_bt_imp_final。 */
     g_bt_imp_rc = (uint32_t)img_import_path(s_path);
+    if (g_bt_imp_rc == 0u) s_imp_wait = 1u;
+    else                   s_imp_done = 1u;   /* 连队都没排上：结论就是"没进去" */
 
     g_bt_done++;
     g_bt_rc  = 0;
@@ -420,6 +447,10 @@ static int begin(int test, uint32_t w, uint32_t h)
     g_bt_rc     = -1;
     g_bt_wr     = 0u;
     g_bt_imp_rc = 0xFFFFFFFFu;
+    g_bt_imp_final = 0xFFFFFFFFu;
+    s_imp_wait  = 0u;
+    s_imp_done  = 0u;
+    s_imp_rc    = 0xFFFFFFFFu;
     g_bt_spi_tx = g_spi_tx_n;        /* 起点：收尾时相减算本轮事务数 */
     g_bt_ms     = 0u;                /* 起点：收尾/判死时写"本会话墙钟" */
     g_bt_get_to = 0u;
@@ -509,6 +540,20 @@ void bt_recv_poll(uint32_t now_ms)
              * 是"用户没点"还是"点了没生效"。有了这个入口，脚本能自己开会话，
              * 把 UI 这个变量彻底排除掉。 */
             (void)bt_recv_start();
+        }
+    }
+
+    /* ---- ⓪ DONE 之后还要把"导入结果"等出来（2026-10-11）----
+     * 见 s_imp_wait 上方的说明：DONE 只说明字节收全了，图进没进相册是另一回事。
+     * 这一拍只做锁定，不做别的；锁定后 UI 才有真话可说。 */
+    if (s_state == BT_RECV_DONE && s_imp_wait != 0u && s_imp_done == 0u)
+    {
+        if (g_img_test == 0u && g_img_busy == 0u)
+        {
+            s_imp_rc       = g_img_rc;
+            s_imp_wait     = 0u;
+            s_imp_done     = 1u;
+            g_bt_imp_final = g_img_rc;
         }
     }
 
@@ -752,6 +797,42 @@ int bt_recv_progress(void)
     return (int)((s_recv * 100u) / s_total);
 }
 
+/* 导入结果 → 人能读的中文。
+ *
+ * ⚠ 为什么这里要分得这么细（2026-10-11）：收完字节 ≠ 图进了相册。
+ *   实测两次发的都是 PNG —— 字节一个不少地落了卡，`g_bt_imp_rc` 也确实是 0
+ *   （"排队成功"），但导入阶段按魔数判不出 BMP/JPEG ⇒ `g_img_rc=4`，
+ *   图根本没进图库。而 UI 原来在 DONE 时一律写"已排队导入图库，去相册看"，
+ *   用户照着去相册当然看不到 ⇒ 这是一句**谎话**，不是"信息不够详细"。
+ *
+ * ⚠ **返回的一律是静态字面量**：apps/files.c 用**指针相等**做变化检测
+ *   （见它 bt_view_refresh 上方的注释）。所以这里绝不能拼动态串 ——
+ *   同一个 buffer 换了内容而指针不变，界面就永远不刷新。
+ *   想看具体数字去读 `g_bt_imp_final`（SWD 直读）。 */
+static const char* imp_result_text(uint32_t rc)
+{
+    switch (rc)
+    {
+        case 0u:              return "已存入相册";
+        case RC_NOT_BMP:      return "格式不支持（仅 BMP/JPG）";
+        case RC_BPP:          return "位深不支持";
+        case RC_COMPRESS:     return "压缩方式不支持";
+        case RC_TOO_WIDE:     return "图片尺寸过大";
+        case RC_NO_SPACE:     return "图库空间不足";
+        case RC_NO_SLOT:      return "图库槽位已满";
+        case RC_QSPI:         return "写入图库失败";
+        case RC_JPEG_DEC:     return "JPEG 解码失败";
+        case RC_JPEG_SHORT:   return "JPEG 文件不完整";
+        case RC_FS_MOUNT:
+        case RC_OPEN:
+        case RC_READ_HDR:
+        case RC_READ_ROW:     return "读文件失败（卡上文件有问题）";
+        case RC_WRITE_FILE:
+        case RC_CLOSE:        return "写文件失败";
+        default:              return "导入图库失败";
+    }
+}
+
 /* 一行状态文字。产物是**人能读的中文**，与 BoardNet_WeatherText 同一套纪律：
  * 拿不到就明说"还没有数据"，不拿 0 冒充。 */
 const char* bt_recv_status_text(void)
@@ -762,7 +843,12 @@ const char* bt_recv_status_text(void)
         case BT_RECV_WAIT:
             return s_opening ? "正在启动蓝牙…" : "等待对端发送";
         case BT_RECV_RECV:  return "正在接收";
-        case BT_RECV_DONE:  return "接收完成";
+        case BT_RECV_DONE:
+            /* 三段式：排队失败 / 还在导 / 已出结果。
+             * ⚠ 少了中间那一档就会在导入跑着的时候拿上一轮的旧 rc 当结论。 */
+            if (g_bt_imp_rc != 0u)          return "接收完成，未能导入";
+            if (s_imp_done == 0u)           return "正在导入图库…";
+            return imp_result_text(s_imp_rc);
         default:            return "接收失败";
     }
 }
