@@ -605,11 +605,11 @@ static void selftest(void)
 	click_at(290, 421);
 	step_time(50);
 	CHECK(!PhoneIME_Visible() && !strcmp(YMGUI_TextInput_GetText(dev_input), "q"), "single-line return submits without newline and hides keyboard");
-	/* ⚠ 布局改动同步点（2026-10-04 第二次）：设置页加了"半透明"卡片并改为可滚动，
-	 *   设备名输入框从 y=347 移到 407（见 apps/settings.c 顶部的七项布局表）。
+	/* ⚠ 布局改动同步点（2026-10-10）：设置页又插入了"蓝牙"卡片并整体下移 68px，
+	 *   设备名输入框从 y=407 移到 475（见 apps/settings.c 顶部的布局表）。
 	 *   它的父对象现在是滚动视口（area.y 会减去 scroll_y），但 **area.y 本身
-	 *   仍是以视口为基准的局部坐标 407**，所以这条断言的值跟着 +60。 */
-	CHECK(dev_input->area.y == 407, "obscured input geometry restored");
+	 *   仍是以视口为基准的局部坐标 475**，所以这条断言的值跟着 +68。 */
+	CHECK(dev_input->area.y == 475, "obscured input geometry restored");
 	GYOBJ transient = YMGUI_Creat_TextInput_Creat(app_views[SETTINGS], 20, 100, 200, 30, 32);
 	YMGUI_SetFocus(ctx, transient);
 	step_time(220);

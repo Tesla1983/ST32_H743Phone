@@ -2,6 +2,7 @@
 #include "phone_host.h"
 #include "phone_lang.h"
 #include "phone_ime.h"   /* PhoneIME_Visible：键盘弹起时收缩滚动视口 */
+#include "phone_shell_board.h"   /* BoardNet_*：WiFi/蓝牙无线电开关（2026-10-10） */
 
 /* ===========================================================================
  * 设置页 · 七项 + 滚动（2026-10-04 新增"半透明效果"卡片 + 滚动容器）
@@ -23,16 +24,16 @@
  * 【视口几何 —— 头部必须让出来】
  *   app 视图区 abs y=36..448（高 412）。头部两条 label 占 y=0..56
  *   （SCROLL_HEAD_H），滚动视口从 y=56 起、高 412-56=356。
- *   ⇒ clamp 上限 = content_h - 视口高 = 491-356 = **135**。
+ *   ⇒ clamp 上限 = content_h - 视口高 = 559-356 = **203**。
  *   ⚠ 视口不透明 + 开 ClipChildren，且**建在头部之后** ⇒ 会盖住头部。
  *     之前视口从 y=0 起，标题"设置/把手机调成喜欢的样子"被完全遮住
  *     （2026-10-04 板级抓屏实测：标题区一个文字像素都没有）。别再犯。
  *
  * ⚠ 改动布局必须同步 phone_shell/phone_selftest.inc 里的坐标断言
- *   （`device_name_input->area.y == 347` → 407），否则自检会失败。
+ *   （`device_name_input->area.y == 347` → 407 → 475），否则自检会失败。
  *
- * ⚠⚠ 底部三项（329 / 407 / 451）在 scroll_y=0 时**落在视口外**：
- *   视口 abs y = 36+56=92 .. 92+356=448，关机按钮 abs y = 92+451-135=408
+ * ⚠⚠ 底部三项（397 / 475 / 519）在 scroll_y=0 时**落在视口外**：
+ *   视口 abs y = 36+56=92 .. 92+356=448，关机按钮 abs y = 92+519-203=408
  *   （滚到底后）—— 也就是说**滚到底它才进视口**。
  *   **任何脚本/自检要点它，必须先滚动到底。**
  *   这也是修掉 hitRec 忽略 ClipChildren 之后"点不到"变"明确不可点"的原因。
@@ -332,7 +333,7 @@ static void scroll_apply_ime(int ime_on)
 	 * ⚠ 不能简单滚到底（板级抓屏实测：视口缩到 128 px，滚到底只能看到
 	 *   亮度滑杆下半 + 关机按钮，**用户刚点开的输入框反而在视口外**）。
 	 *   正确做法：保证焦点输入框的底边落在视口内即可。
-	 *   设备名输入框在内容 y=407、高 28 ⇒ 需要 scroll_y ≥ 407+28-128 = 307。
+	 *   设备名输入框在内容 y=475、高 28 ⇒ 需要 scroll_y ≥ 475+28-128 = 375。
 	 *   取"刚好够"而不是 clamp 上限，用户还能往上翻看别的卡片。 */
 	if (ime_on)
 	{
@@ -615,6 +616,7 @@ typedef struct
 {
 	GYOBJ header_title, header_sub;
 	GYOBJ net_title, net_status, net_switch;
+	GYOBJ bt_title, bt_status, bt_switch;     /* 蓝牙无线电（2026-10-10 新增） */
 	GYOBJ theme_title, theme_status, theme_switch;
 	GYOBJ lang_title, lang_hint, lang_zh, lang_en;
 	/* 半透明效果（2026-10-04 新增）：1 = 半透明（出厂默认） */
@@ -802,6 +804,11 @@ static void on_settings(GYOBJ btn, uint8 on)
  *   松手时才调 PhoneHost_SetBrightness() 走完整链路，落盘一次。 */
 static uint8_t s_bright_dragging = 0u;   /* 1 = 正在拖动（还没松手） */
 
+/* 记录上次见到的 $RD 帧数（2026-10-10）。app_tick 里发现它变了就重刷两个无线电
+ * 开关 —— 这样开关只在"对端回报了新状态"时才动，不会和用户的手动拨动打架
+ * （拨动后到 $RD 回来的几十毫秒里，开关保持用户意图，再由 $RD 确认/回滚）。 */
+static uint32_t s_last_rd_pkts = 0u;
+
 /* 滑杆的 changed 回调 = 拖动中（含按下瞬间）。只预览，不落盘。 */
 static void brightness_changed(GYOBJ obj, int32 value)
 {
@@ -827,7 +834,18 @@ static void brightness_commit(void)
 static void wifi_changed(GYOBJ obj, uint8 on)
 {
 	(void)obj;
-	PhoneHost_SetWifi(on);
+	/* ★2026-10-10：从"假 WiFi（PhoneHost_SetWifi）"改成真命令 ——
+	 * 经 ESP32 上行链路发 $?RADIO,WIFI,ON/OFF，由对端真正开关 WiFi STA。
+	 * 开关位置随后由 $RD 回流刷新（见 app_tick 的 s_last_rd_pkts 逻辑），
+	 * 不靠本地的"我点了什么"自缓存，避免与实际状态脱钩。 */
+	BoardNet_SetWifi(on);
+}
+
+static void bt_changed(GYOBJ obj, uint8 on)
+{
+	(void)obj;
+	/* 蓝牙无线电开关：发 $?RADIO,BT,ON/OFF（2026-10-10）。 */
+	BoardNet_SetBt(on);
 }
 
 /* 半透明开关（2026-10-04 新增）
@@ -856,6 +874,22 @@ static void app_tick(uint32 elapsed)
 	 * 本函数是设置页唯一每帧跑的钩子（见 scroll_apply_ime 的注释）。 */
 	scroll_apply_ime(PhoneIME_Visible());
 	Settings_UpdateDiag();
+
+	/* 对端回报了新的 $RD（无线电状态帧）：重刷两个开关，确认或回滚用户的拨动。
+	 * 只在帧数变化时动，避免和手动拨动打架（见 s_last_rd_pkts 注释）。 */
+	if (g_net_rd_pkts != s_last_rd_pkts)
+	{
+		s_last_rd_pkts = g_net_rd_pkts;
+		int w = BoardNet_RadioWifiOn();
+		YMGUI_Switch_SetOn(state.net_switch, (uint8)(w > 0 ? 1u : 0u));
+		int wf = BoardNet_WifiUp();
+		PhoneUI_text_set(state.net_status,
+						 T(wf > 0 ? "已连接" : (wf < 0 ? "等待同步" : "未连接")));
+		int b = BoardNet_RadioBtOn();
+		YMGUI_Switch_SetOn(state.bt_switch, (uint8)(b > 0 ? 1u : 0u));
+		PhoneUI_text_set(state.bt_status,
+						 T(b > 0 ? "已开启" : (b < 0 ? "等待同步" : "已关闭")));
+	}
 }
 
 /* 把控件状态对齐到宿主的真实值（开关/文案/滑杆）。
@@ -869,8 +903,21 @@ static void app_tick(uint32 elapsed)
  *   ⇒ 拆成两个函数：app_show 走 reset_scroll=1，sync 走 reset_scroll=0。 */
 static void settings_sync_controls(int reset_scroll)
 {
-	YMGUI_Switch_SetOn(state.net_switch, PhoneHost_GetWifi());
-	PhoneUI_text_set(state.net_status, T(PhoneHost_GetWifi() ? "Yaomi 工作室" : "未连接"));
+	/* ---- 无线：开关=无线电开/关（来自 $RD），副标题=连接/开启状态 ----
+	 * ⚠ 不再用假的 PhoneHost_GetWifi()：WiFi 无线电在对端 ESP32，$RD 才是权威。
+	 *   -1（还没收到过 $RD）= 等待同步：开关置关、副标题提示，等 $RD 回来再对齐。 */
+	int wifi_on = BoardNet_RadioWifiOn();
+	YMGUI_Switch_SetOn(state.net_switch, (uint8)(wifi_on > 0 ? 1u : 0u));
+	int wf = BoardNet_WifiUp();
+	PhoneUI_text_set(state.net_status, T(wf > 0 ? "已连接" : (wf < 0 ? "等待同步" : "未连接")));
+
+	int bt_on = BoardNet_RadioBtOn();
+	YMGUI_Switch_SetOn(state.bt_switch, (uint8)(bt_on > 0 ? 1u : 0u));
+	PhoneUI_text_set(state.bt_status, T(bt_on > 0 ? "已开启" : (bt_on < 0 ? "等待同步" : "已关闭")));
+
+	/* 记一下当前 $RD 计数，避免 app_tick 在下一帧立刻又重刷一遍（刚同步过）。 */
+	s_last_rd_pkts = g_net_rd_pkts;
+
 	YMGUI_Slider_SetValue(state.bright_slider, PhoneHost_GetBrightness());
 
 	/* 半透明：宿主侧可能被别的路径改过（如 SWD 直接写 g_ribbon_translucent 做实验），
@@ -966,15 +1013,28 @@ static void app_create(GYOBJ view)
 	/* ---- 七张卡片：坐标相对 s_scroll.view ----
 	 * 内容总高 491 > 视口 412-56=356 ⇒ 可滚动，clamp 上限 = 491-356 = 135。 */
 
+	/* ---- WiFi 无线电（2026-10-10：从假开关改成真命令）----
+	 * 开关经 ESP32 上行链路发 $?RADIO,WIFI,ON/OFF，副标题显示连接状态。
+	 * 初始 SetOn(0)：进页面时 settings_sync_controls 会用 $RD 对齐真实状态。 */
 	GYOBJ net = PhoneUI_panel(s_scroll.view, 18, 65, 284, 50, WHITE);
-	state.net_title = PhoneUI_left_label(net, 14, 4, 180, T("无线网络"), INK, 0);
-	state.net_status = PhoneUI_left_label(net, 14, 28, 180, T("Yaomi 工作室"), MUTED, 2);
+	state.net_title = PhoneUI_left_label(net, 14, 4, 180, T("WiFi"), INK, 0);
+	state.net_status = PhoneUI_left_label(net, 14, 28, 180, T("等待同步"), MUTED, 2);
 	state.net_switch = YMGUI_Creat_Switch_Creat(net, 218, 11, 48, 27);
-	YMGUI_Switch_SetOn(state.net_switch, 1);
+	YMGUI_Switch_SetOn(state.net_switch, 0);
 	state.net_switch->draw_cb = PhoneUI_switch_draw;
 	YMGUI_Switch_SetChanged(state.net_switch, wifi_changed);
 
-	GYOBJ theme = PhoneUI_panel(s_scroll.view, 18, 133, 284, 50, WHITE);
+	/* ---- 蓝牙无线电（2026-10-10 新增）----
+	 * 与 WiFi 同一套：开关发 $?RADIO,BT,ON/OFF，副标题显示已开启/已关闭。 */
+	GYOBJ bt = PhoneUI_panel(s_scroll.view, 18, 133, 284, 50, WHITE);
+	state.bt_title = PhoneUI_left_label(bt, 14, 4, 180, T("蓝牙"), INK, 0);
+	state.bt_status = PhoneUI_left_label(bt, 14, 28, 180, T("等待同步"), MUTED, 2);
+	state.bt_switch = YMGUI_Creat_Switch_Creat(bt, 218, 11, 48, 27);
+	YMGUI_Switch_SetOn(state.bt_switch, 0);
+	state.bt_switch->draw_cb = PhoneUI_switch_draw;
+	YMGUI_Switch_SetChanged(state.bt_switch, bt_changed);
+
+	GYOBJ theme = PhoneUI_panel(s_scroll.view, 18, 201, 284, 50, WHITE);
 	state.theme_title = PhoneUI_left_label(theme, 14, 4, 180, T("海蓝色壁纸"), INK, 0);
 	state.theme_status = PhoneUI_left_label(theme, 14, 28, 180, T("暮色"), MUTED, 2);
 	state.theme_switch = YMGUI_Creat_Switch_Creat(theme, 218, 11, 48, 27);
@@ -984,7 +1044,7 @@ static void app_create(GYOBJ view)
 	/* ---- 界面语言：分段控件靠右 ----
 	 * 左段"中文"40 px、右段"English"58 px、间隔 2 px，合计 100 px，
 	 * 右对齐到卡片内边距 14 px ⇒ 起点 x = 284 - 14 - 100 = 170。 */
-	GYOBJ lang = PhoneUI_panel(s_scroll.view, 18, 201, 284, 50, WHITE);
+	GYOBJ lang = PhoneUI_panel(s_scroll.view, 18, 269, 284, 50, WHITE);
 	state.lang_title = PhoneUI_left_label(lang, 14, 4, 120, T("界面语言"), INK, 0);
 	state.lang_hint  = PhoneUI_left_label(lang, 14, 28, 120, T("切换后立即生效"), MUTED, 2);
 	state.lang_zh = PhoneUI_button(lang, 170, 12, 40, 26, "", lang_pick_zh, 0);
@@ -995,7 +1055,7 @@ static void app_create(GYOBJ view)
 	/* ---- 半透明效果（2026-10-04 新增，用户定：默认开 = 半透明）----
 	 * 标题写功能名"半透明"、副标题写当前效果"透出/实色"，
 	 * 消除"开关叫半透明、打开却是不透明"的歧义。 */
-	GYOBJ rib = PhoneUI_panel(s_scroll.view, 18, 269, 284, 50, WHITE);
+	GYOBJ rib = PhoneUI_panel(s_scroll.view, 18, 337, 284, 50, WHITE);
 	state.ribbon_title  = PhoneUI_left_label(rib, 14, 4, 120, T("半透明"), INK, 0);
 	state.ribbon_status = PhoneUI_left_label(rib, 14, 28, 120, T("透出"), MUTED, 2);
 	state.ribbon_switch = YMGUI_Creat_Switch_Creat(rib, 218, 11, 48, 27);
@@ -1006,7 +1066,7 @@ static void app_create(GYOBJ view)
 	state.ribbon_switch->draw_cb = PhoneUI_switch_draw;
 	YMGUI_Switch_SetChanged(state.ribbon_switch, ribbon_changed);
 
-	GYOBJ bright = PhoneUI_panel(s_scroll.view, 18, 329, 284, 62, WHITE);
+	GYOBJ bright = PhoneUI_panel(s_scroll.view, 18, 397, 284, 62, WHITE);
 	state.bright_title = PhoneUI_left_label(bright, 14, 4, 244, T("预览亮度"), INK, 0);
 	state.bright_slider = YMGUI_Creat_Slider_Creat(bright, 14, 32, 256, 24);
 	/* 范围与"出厂默认 50"配套：下限取 1 而不是 0 —— brightness=0 会让
@@ -1020,16 +1080,17 @@ static void app_create(GYOBJ view)
 	state.bright_slider->draw_cb = PhoneUI_slider_draw;
 	YMGUI_Slider_SetChanged(state.bright_slider, brightness_changed);
 
-	state.device_name_input = YMGUI_Creat_TextInput_Creat(s_scroll.view, 24, 407, 272, 28, 95);
+	state.device_name_input = YMGUI_Creat_TextInput_Creat(s_scroll.view, 24, 475, 272, 28, 95);
 	state.device_name_input->draw_cb = PhoneUI_phone_input_draw;
 	YMGUI_TextInput_SetText(state.device_name_input, "Yaomi Phone");
 
-	state.power_button = PhoneUI_button(s_scroll.view, 18, 451, 284, 40, T("关机..."),
+	state.power_button = PhoneUI_button(s_scroll.view, 18, 519, 284, 40, T("关机..."),
 										 on_power, RGB(198, 91, 114));
 
-	/* 内容总高 = 最后一个元素底边（关机按钮 451+40 = 491）。
-	 * ⚠ 以后再加卡片必须同步改这里，否则最后一项被裁掉且看不出原因。 */
-	s_scroll.content_h = 451 + 40;
+	/* 内容总高 = 最后一个元素底边（关机按钮 519+40 = 559）。
+	 * ⚠ 以后再加卡片必须同步改这里，否则最后一项被裁掉且看不出原因。
+	 *   2026-10-10 新增"蓝牙"卡片并把后续卡片下移 68px（蓝牙卡 50 + 间隔 18）。 */
+	s_scroll.content_h = 519 + 40;
 	g_diag_scroll_content = s_scroll.content_h;
 	/* 诊断量用的探针指针必须在 scroll_place_bar 之前设好 ——
 	 * 它在函数里就现算这两个控件的绝对坐标。 */
@@ -1059,12 +1120,13 @@ static void app_create(GYOBJ view)
 	 * （YMGUI_Obj.h:17 只有 GY_OBJ_Button，Switch 复用通用 Obj），
 	 * 故按对象指针反查索引补标。 */
 	{
-		static GYOBJ sw_mark[3];
+		static GYOBJ sw_mark[4];
 		int i, k;
 		sw_mark[0] = state.net_switch;
 		sw_mark[1] = state.theme_switch;
 		sw_mark[2] = state.ribbon_switch;
-		for (i = 0; i < 3; ++i)
+		sw_mark[3] = state.bt_switch;
+		for (i = 0; i < 4; ++i)
 		{
 			for (k = 0; k < s_wrap_n; ++k)
 			{
@@ -1109,6 +1171,12 @@ static intptr_t app_inspect(const char* name, int index)
 		return (intptr_t)state.power_button;
 	if (!strcmp(name, "wifi_status"))
 		return (intptr_t)state.net_status;
+	/* 蓝牙无线电卡（2026-10-10 新增）：供回归测试点击开关、
+	 * 断言副标题状态。inspect 名字必须和自检脚本里取的名字一致。 */
+	if (!strcmp(name, "bt_switch"))
+		return (intptr_t)state.bt_switch;
+	if (!strcmp(name, "bt_status"))
+		return (intptr_t)state.bt_status;
 	if (!strcmp(name, "settings_status"))
 		return (intptr_t)state.theme_status;
 	/* 新增：语言卡片，供回归测试点击与断言 */

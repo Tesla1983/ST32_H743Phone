@@ -549,5 +549,60 @@
 #      满负载整帧 ~10.9 ms / ~91 FPS（复位后干净态）。
 #
 # FLASH 1 636 436 B（78.03%），比第十五版 +2 712 B。
-ecaddc96d2766d4c2ebc3763008679e87a13a2ee0d364d5c60d899a36d72d922  ymgui-h743.bin
-a99b9cd4554c76076a252f1347613addad764377a4787f0bfaba5912c07b6b52  ymgui-h743.elf
+# --- 第十六版（SPI 升格为业务上行链路）：已被第十七版取代 ---
+# ecaddc96d2766d4c2ebc3763008679e87a13a2ee0d364d5c60d899a36d72d922  ymgui-h743.bin
+# a99b9cd4554c76076a252f1347613addad764377a4787f0bfaba5912c07b6b52  ymgui-h743.elf
+
+# ============================================================================
+# 第十七版（2026-10-10）· STM32 控 ESP32 的 WiFi / 蓝牙无线电开关
+# ============================================================================
+# 为什么变（按「更新时机」的 a：有意为之的功能改动；工具链 14.3.rel1 未变）：
+#   设置页新增「蓝牙」开关，并把原来的假 WiFi 开关换成真命令 —— 两者都经
+#   SPI 命令通道下发 `$?RADIO,<WIFI|BT>,<ON|OFF>`，对端执行后回状态帧
+#   `$RD,<wifi>,<bt>`，本板以这一帧为**权威来源**刷新开关与副标题。
+#
+# 本仓库改动：
+#   1. src/uart_link.h/.c：解析 `$RD` ⇒ g_net_radio_wifi / g_net_radio_bt /
+#      g_net_rd_pkts；新增 BoardNet_RadioWifiOn / RadioBtOn / SetWifi / SetBt /
+#      QueryRadio。开机命令相位机新增 **CMD_PH_RADIO**（PING 之后、问天气之前），
+#      并在 CMD_PH_DONE 里加 **30 s 周期重查**（RADIO_REFRESH_MS）——
+#      ⚠ 对端开机广播那一帧本板还没开始轮询 SPI ⇒ 不自查的话 g_net_rd_pkts 恒 0（实测就是）。
+#         该相位的判据**不能看 g_cmd_rx**：`$?RD` 只回 `$RD`、**不回 `$!RS`**。
+#   2. **命令重试**（本次最关键的可靠性修复）：SPI 从机 DMA 未按 4 字节对齐
+#      会**截断命令帧**（实测 `$?RADIO,BT,ON` 的 `*79\r\n` 被 5 个 0x00 取代，
+#      紧接着拼上下一条命令 ⇒ XOR 尾丢失 ⇒ 对端 handle_line **静默丢弃**；
+#      对端持续告警 spi_slave: real trans_len is not 4 bytes aligned）。
+#      周期命令丢了下一轮会补，但**开关是一次性命令**，丢了就没了
+#      ⇒ `SetWifi/SetBt` 登记期望态，cmd_tick 用 `$RD` 回流的真实状态比对，
+#        没翻转就重发（RADIO_RETRY_MAX=5 / RADIO_RETRY_MS=500，2.5 s 内发完）。
+#      判据是"状态有没有真的翻转"，不是"我发没发"（g_cmd_tx 涨 ≠ 对端执行了）。
+#   3. third_party/YMGUI/.../apps/settings.c：插入蓝牙卡 ⇒ 下方卡片整体下移 68
+#      （theme 201 / lang 269 / rib 337 / bright 397 / device_name 407→475 /
+#       power 519，content_h 491→559，clamp 上限 135→203）；
+#      sw_mark 3→4 登记 bt_switch；app_inspect 补 bt_switch / bt_status。
+#      同步改 phone_selftest.inc 的 `dev_input->area.y == 407` → **475**
+#      （不改这条自检必 FAIL），以及 settings.c 顶部注释里的三处坐标/算式。
+#   4. tools/radio_check.py（新增验收脚本）：SWD 直读 + 写 g_cmd_req 触发，
+#      判据 = "$RD 帧数涨 + 目标字段翻转"，可选 --wifi 验 WiFi 关/开（末尾自动恢复）。
+#
+# ⚠ 对端 E:\workbuddy\esp32-com8（**不是 git 仓库**，随本版一起烧录）：
+#    · 蓝牙改成**经典单模** CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY + CONFIG_BT_BLE_ENABLED=n
+#      （原计划双模 BTDM ⇒ iram0_0_seg overflowed by 3912 bytes，两家抢 IRAM）。
+#    · bt_radio_enable() 改用官方宏 **BTDM_CONTROLLER_MODE_EFF**
+#      （单模下 = ESP_BT_MODE_CLASSIC_BT），不再硬编码 ESP_BT_MODE_BTDM。
+#    · bt_radio_disable() 只 disable+deinit，**绝不 esp_bt_mem_release()**（不可逆）。
+#    · uplink_cmd.c 新增 $?RADIO / $?RD 与 $RD 帧；wifi_sta.c 新增
+#      wifi_sta_enable/disable/is_enabled；开机推一次 $RD。
+#
+# 验收（tools/radio_check.py --wifi --wait 10，**ALL PASS 5/5**）：
+#   R0 $RD 回流 g_net_rd_pkts>0 · R1 BT ON / BT OFF · R2 WiFi OFF / WiFi ON(恢复)
+#   对端日志佐证：`解析结果: type='?RADIO' args='BT,ON'` → `RADIO 命令: BT ON → rc=ESP_OK`
+#   → `$RD wifi=1 bt=1`；关闭时 disable 1/4~4/4 全 ESP_OK、栈余量充足、`$RD bt=0`。
+#   加 5 次重发后连跑多轮稳定全过（3 次重发时 3 轮 2 过）。
+#
+# ⚠ 治本项**未做**：SPI 从机 DMA 对齐（real trans_len 仍不是 4 字节整数倍）还在丢字节，
+#   重试只是兜底。根治要让主机每事务固定出 64 字节。
+#
+# FLASH 1 637 860 B（78.10%），比第十六版 +1 424 B。
+fb7fb84b176166965adee46e952ca5b4830a40d7d4c0ffbc39e20b12173b01fd  ymgui-h743.bin
+6de35912da6a2bf12a166f0e07eed10210fb12b40b3e3bdd4f5d72f8af7bfc98  ymgui-h743.elf

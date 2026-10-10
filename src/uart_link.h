@@ -39,6 +39,15 @@
  *          code = 天气数字码（0=晴 1=多云 2=阴 3=小雨 … 99=未识别）
  *          text = UTF-8 原始文本（可能是中文，如"晴"）⇒ 参与 XOR，别按字符数算
  *   $WF,<up>,<ip>,<rssi>*HH                            WiFi 状态，变化时各发一次
+ *   $RD,<wifi>,<bt>*HH                                 无线电开关状态（2026-10-10 新增）
+ *                                                          wifi=1 WiFi STA 已开 0 关
+ *                                                          bt  =1 BT 无线电已开 0 关
+ *                                                          开机推一次；$?RADIO 执行后推一次
+ *                                                          （注意：是"开关意图"，非"是否已连上"）
+ *
+ *   命令（本板 → 对端）新增：
+ *   $?RADIO,<目标>,<状态>   目标=WIFI|BT 状态=ON|OFF → 回 $!RS,RADIO,<rc> 后推 $RD
+ *   $?RD                    查询当前无线电状态 → 推 $RD,<wifi>,<bt>
  *
  * 实测样本（对端日志，校验值已独立验算）：
  *   $DT,1791469600,2026-10-08,22:26:40,4*28
@@ -162,6 +171,10 @@ extern volatile uint8_t  g_net_wx_text[24];/* $WD 的 UTF-8 天气文本（"晴"
 extern volatile int      g_net_wf_up;      /* $WF：1=已连上 */
 extern volatile int      g_net_wf_rssi;
 extern volatile uint8_t  g_net_wf_ip[24];
+
+extern volatile int      g_net_radio_wifi;  /* $RD：WiFi 无线电开关意图 1=开 0=关 */
+extern volatile int      g_net_radio_bt;    /* $RD：BT 无线电开关 1=开 0=关 */
+extern volatile uint32_t g_net_rd_pkts;     /* 收到的 $RD 帧数 */
 
 extern volatile uint32_t g_net_dt_pkts;    /* 收到的 $DT 帧数 */
 extern volatile uint32_t g_net_wd_pkts;    /* 收到的 $WD 帧数 */
@@ -306,5 +319,15 @@ int  BoardNet_WifiUp(void);                   /* 1=已连  0=已断开  -1=还�
 int  BoardNet_WifiRssi(void);                 /* dBm（负数）；没收到过返回 0 */
 int  BoardNet_WifiBars(void);                 /* 0..3 信号格数；-1 = 还没收到过 $WF */
 const char* BoardNet_WifiIp(void);            /* "192.168.1.2"；没收到过返回 "" */
+
+/* ---- 无线电开关（$?RADIO / $RD，2026-10-10）----
+ * 数据来源：ESP32 的 $RD 帧，反映的是"本板上 WiFi/BT 无线电的开关意图"
+ * （WiFi STA 是否 start / BT 无线电是否开），不是本芯片的无线状态（H743 无 WiFi/BT）。
+ * 设置页的两个开关以此为准。 */
+int  BoardNet_RadioWifiOn(void);              /* -1=还未知 0=关 1=开 */
+int  BoardNet_RadioBtOn(void);                /* -1=还未知 0=关 1=开 */
+int  BoardNet_SetWifi(int on);                /* 发 $?RADIO,WIFI,ON/OFF（on=1 开） */
+int  BoardNet_SetBt(int on);                  /* 发 $?RADIO,BT,ON/OFF（on=1 开） */
+int  BoardNet_QueryRadio(void);               /* 发 $?RD，查询当前无线电状态 */
 
 #endif /* UART_LINK_H */

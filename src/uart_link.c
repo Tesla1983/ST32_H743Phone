@@ -101,6 +101,15 @@ volatile int      g_net_wf_up;
 volatile int      g_net_wf_rssi;
 volatile uint8_t  g_net_wf_ip[24];
 
+/* $RD：无线电开关状态（2026-10-10，$?RADIO 命令的回报）。
+ * 反映的是"开关意图"，与是否连上 WiFi / 是否正在配对无关：
+ *   g_net_radio_wifi  = WiFi STA 是否已 start（1=开 0=关）
+ *   g_net_radio_bt    = BT 无线电是否已开启（1=开 0=关）
+ * STM32 设置页的两个开关直接吃这两个量。 */
+volatile int      g_net_radio_wifi;
+volatile int      g_net_radio_bt;
+volatile uint32_t g_net_rd_pkts;      /* 收到的 $RD 帧数 */
+
 volatile uint32_t g_net_dt_pkts;
 volatile uint32_t g_net_wd_pkts;
 volatile uint32_t g_net_wf_pkts;
@@ -180,11 +189,41 @@ static uint32_t s_bin_t0;      /* 进入二进制模式时的时基，用于超�
 #define CMD_PH_WDATA   4u
 #define CMD_PH_DONE    5u
 #define CMD_PH_CITY    6u     /* 逐城天气扫描（开机序列跑完之后才进） */
+#define CMD_PH_RADIO   7u     /* 查无线电状态 $?RD（2026-10-10；握手成功之后、问天气之前） */
+/* 周期重查 $?RD 的间隔。为什么不能只靠开机问一次：对端 ESP32 会独立复位
+ * （与 $WF 加 WIFI_PERIOD_S 是同一个道理），复位后无线电态可能变了，
+ * 本板不问就永远停在旧值。30 s 与对端周期重发量级一致。 */
+#define RADIO_REFRESH_MS 30000u
 
 static uint32_t s_cmd_phase;
 static uint32_t s_cmd_t0;      /* 本阶段起点 */
 static uint32_t s_cmd_try;     /* 本阶段已尝试次数 */
 static uint32_t s_cmd_wd0;     /* 发 WEA 时的 $WD 计数，用来判断"真的等到了" */
+static uint32_t s_cmd_rd0;     /* 发 ?RD 时的 $RD 计数（无线电状态的同类判据） */
+static uint32_t s_radio_t0;    /* 上一次周期性重查 $?RD 的时基 */
+
+/* ---- 无线电命令重试（2026-10-10）----
+ *
+ * 【为什么必须重试】SPI 从机 DMA 未按 4 字节对齐 ⇒ **命令帧会被截断**。
+ *   实测抓到：`$?RADIO,BT,ON` 的 `*79\r\n` 被 5 个 0x00 取代，紧接着拼上下一条命令
+ *   ⇒ XOR 校验尾丢失 ⇒ 对端 `handle_line` **静默丢弃**（不打任何日志）。
+ *   对端持续告警：spi_slave: real trans_len is not 4 bytes aligned, slave may loss data。
+ *
+ *   天气 / `$?RD` 这类**周期**命令丢了下一轮会自己补上，看不出问题；
+ *   但开关是**一次性**命令，丢了就真的没了 —— 表现为"拨了开关没反应"，
+ *   而且 `g_cmd_tx` 照样涨（看起来像发出去了），极难定位。
+ *
+ * ⇒ 判据用 **$RD 里回流的真实状态有没有翻转**，不用"我发没发"。
+ *   最多重发 RADIO_RETRY_MAX 次，避免链路真断时无限重发占总线。 */
+/* 实测丢帧率不低（3 次里有 1 次命中不了），3 次不够 ⇒ 取 5 次。
+ * 5 次 × 500 ms = 2.5 s 内发完，用户拨开关的等待感可接受；
+ * 只在"有待确认的开关命令"时才发，平时零开销。 */
+#define RADIO_RETRY_MAX  5u
+#define RADIO_RETRY_MS   500u
+static uint32_t s_radio_pend;      /* 0=无待确认  1=WiFi  2=BT */
+static uint32_t s_radio_pend_on;   /* 期望状态 0/1 */
+static uint32_t s_radio_pend_t0;   /* 0=尚未装填，由 cmd_tick 首次看到时填 now_ms */
+static uint32_t s_radio_pend_tries;
 
 /* ====================== 小工具 ====================== */
 
@@ -546,6 +585,16 @@ static int parse_frame(const uint8_t* line, uint32_t len)
         return 0;
     }
 
+    if (nf >= 3 && f[0][0] == 'R' && f[0][1] == 'D')
+    {
+        /* $RD,<wifi>,<bt> —— 无线电开关状态，$?RADIO 命令执行后或开机时回报。
+         * 设置页的 WiFi / 蓝牙开关以这一帧为权威来源（见 BoardNet_RadioWifiOn/BtOn）。 */
+        g_net_radio_wifi = to_int(f[1]);
+        g_net_radio_bt   = to_int(f[2]);
+        g_net_rd_pkts++;
+        return 0;
+    }
+
     /* ---- 命令响应：$!RS,<CMD>,<rc>[,<附加>] ---- */
     if (nf >= 3 && f[0][0] == '!' && f[0][1] == 'R' && f[0][2] == 'S')
     {
@@ -734,7 +783,67 @@ static void cmd_tick(uint32_t now_ms)
         {
             (void)uart_link_cmd("?WGET", "1," CMD_TEST_URL);
         }
+        /* ---- 无线电开关的脚本触发（2026-10-10）----
+         * 验"STM32 控 ESP32 WiFi/BT 开关"用：写值后对端执行并回 $RD，
+         * 判据是 g_net_rd_pkts 涨 + g_net_radio_wifi/bt 翻转。
+         * ⚠ 7(WiFi OFF) 会断网（天气/时间停更），验完务必写 8 恢复。 */
+        else if (r == 4u)
+        {
+            (void)BoardNet_SetBt(1);        /* 蓝牙开 */
+        }
+        else if (r == 5u)
+        {
+            (void)BoardNet_SetBt(0);        /* 蓝牙关 */
+        }
+        else if (r == 6u)
+        {
+            (void)BoardNet_QueryRadio();    /* 查 $RD */
+        }
+        else if (r == 7u)
+        {
+            (void)BoardNet_SetWifi(0);      /* WiFi 关（会断网） */
+        }
+        else if (r == 8u)
+        {
+            (void)BoardNet_SetWifi(1);      /* WiFi 开 */
+        }
         return;
+    }
+
+    /* ---- 无线电命令重试：看 $RD 回流的真实状态，没翻转就补发 ----
+     * 只在"有待确认的开关命令"时跑，平时零开销。 */
+    if (s_radio_pend != 0u)
+    {
+        int cur = (s_radio_pend == 1u) ? BoardNet_RadioWifiOn()
+                                       : BoardNet_RadioBtOn();
+
+        if (s_radio_pend_t0 == 0u)
+        {
+            s_radio_pend_t0 = now_ms;       /* 首次巡检：开始计时 */
+        }
+        else if (cur == (int)s_radio_pend_on)
+        {
+            s_radio_pend = 0u;              /* 已确认：状态真的翻转了，收工 */
+        }
+        else if (now_ms - s_radio_pend_t0 > RADIO_RETRY_MS)
+        {
+            if (++s_radio_pend_tries >= RADIO_RETRY_MAX)
+            {
+                /* 重发够多次仍未翻转 ⇒ 别再占总线（可能是链路真断或对端拒绝）。
+                 * 设置页会停在"等待同步/未生效"的真实状态，不撒谎。 */
+                s_radio_pend = 0u;
+            }
+            else
+            {
+                s_radio_pend_t0 = now_ms;
+                if (s_radio_pend == 1u)
+                    (void)uart_link_cmd("?RADIO",
+                                        s_radio_pend_on ? "WIFI,ON" : "WIFI,OFF");
+                else
+                    (void)uart_link_cmd("?RADIO",
+                                        s_radio_pend_on ? "BT,ON" : "BT,OFF");
+            }
+        }
     }
 
     switch (s_cmd_phase)
@@ -770,12 +879,16 @@ static void cmd_tick(uint32_t now_ms)
         if (g_cmd_rx != 0u)                 /* 收到任意 $!RS 即算握手成功 */
         {
             g_cmd_ping_ok++;
-            s_cmd_phase = CMD_PH_WEA;
+            /* 2026-10-10：握手成功**先问无线电状态**（设置页的 WiFi/蓝牙开关
+             * 要拿真值），拿到或超时后才问天气。
+             * ⚠ 不能只指望对端开机广播的那一次 $RD：对端比本板先起来，
+             *   那一帧本板还没开始轮询 SPI ⇒ 实测 g_net_rd_pkts 恒 0。
+             *   ⇒ 本板必须自己问。 */
+            s_cmd_phase = CMD_PH_RADIO;
             s_cmd_t0    = now_ms;
             s_cmd_try   = 0u;
-            s_cmd_wd0   = g_net_wd_pkts;
-            g_cmd_weather_req++;
-            (void)uart_link_cmd("?WEA", NULL);
+            s_cmd_rd0   = g_net_rd_pkts;
+            (void)BoardNet_QueryRadio();
             break;
         }
         if (now_ms - s_cmd_t0 > 1500u)
@@ -787,6 +900,42 @@ static void cmd_tick(uint32_t now_ms)
             }
             s_cmd_t0 = now_ms;
             (void)uart_link_cmd("?PING", NULL);
+        }
+        break;
+
+    case CMD_PH_RADIO:
+        /*
+         * 判据：**$RD 帧数涨了**。
+         * ⚠ 不能看 g_cmd_rx —— `$?RD` 只让对端回一个 `$RD` 状态帧，
+         *   对端**不会**回 `$!RS`（`$!RS` 是"命令受理"类才有的响应），
+         *   所以 g_cmd_rx 在这一相里恒不变，拿它当判据会必定超时。
+         *   （与 CMD_PH_WDATA 看 g_net_wd_pkts 而不是看 ack 同理。）
+         */
+        if (g_net_rd_pkts > s_cmd_rd0)
+        {
+            s_cmd_phase = CMD_PH_WEA;
+            s_cmd_t0    = now_ms;
+            s_cmd_try   = 0u;
+            s_cmd_wd0   = g_net_wd_pkts;
+            g_cmd_weather_req++;
+            (void)uart_link_cmd("?WEA", NULL);
+            break;
+        }
+        if (now_ms - s_cmd_t0 > 2000u)
+        {
+            s_cmd_t0 = now_ms;
+            if (++s_cmd_try >= 3u)
+            {
+                /* 无线电状态查不到**不要卡住开机序列**：天气/时间才是主业，
+                 * 开关最多显示"等待同步"，周期重查（CMD_PH_DONE）还会补救。 */
+                s_cmd_phase = CMD_PH_WEA;
+                s_cmd_try   = 0u;
+                s_cmd_wd0   = g_net_wd_pkts;
+                g_cmd_weather_req++;
+                (void)uart_link_cmd("?WEA", NULL);
+                break;
+            }
+            (void)BoardNet_QueryRadio();
         }
         break;
 
@@ -830,6 +979,14 @@ static void cmd_tick(uint32_t now_ms)
          *   这时还去问只会每 8 s 往线上吐一帧，既没用又占主循环 —— 直接不动。 */
         if (g_cmd_rx == 0u)
             break;
+        /* 周期性重查无线电状态（对端可能独立复位，或本板错过了某帧 $RD）。
+         * 与 CMD_PH_RADIO 的开机首查互补：首查保证"快点拿到"，
+         * 这里保证"长期不会失同步"。 */
+        if (s_radio_t0 == 0u || (now_ms - s_radio_t0 > RADIO_REFRESH_MS))
+        {
+            s_radio_t0 = now_ms;
+            (void)BoardNet_QueryRadio();
+        }
         if (s_city_scanned != 0 && (now_ms - s_city_scan_t0 < s_city_next_ms))
             break;
         s_city_gen++;
@@ -1510,4 +1667,56 @@ int BoardNet_WifiBars(void)
 const char* BoardNet_WifiIp(void)
 {
     return g_net_wf_ip;
+}
+
+/* ---- 无线电开关状态（2026-10-10，$?RADIO / $RD）----
+ * 与 BoardNet_WifiUp 同一套三态纪律：没收到过 $RD 之前返回 -1（"还不知道"），
+ * 收到过才返回 0/1。设置页的开关据此画"未知 / 关 / 开"。
+ * ⚠ g_net_radio_* 反映的是"开关意图"（STA 是否 start / BT 无线电是否开），
+ *   不是"是否已连上 WiFi"——那个由 BoardNet_WifiUp 管，别混。 */
+int BoardNet_RadioWifiOn(void)
+{
+    if (g_net_rd_pkts == 0u) return -1;
+    return g_net_radio_wifi ? 1 : 0;
+}
+
+int BoardNet_RadioBtOn(void)
+{
+    if (g_net_rd_pkts == 0u) return -1;
+    return g_net_radio_bt ? 1 : 0;
+}
+
+/* 发 $?RADIO 命令切换无线电（2026-10-10）。on=1 开 / on=0 关。
+ * 返回 uart_link_cmd 的发出字节数；对端执行后回 $!RS,RADIO,<rc> 并推 $RD，
+ * 设置页的开关由 $RD 回流刷新，不靠本地的"我发了什么"自缓存。
+ *
+ * ⚠⚠ **`?` 必须自己写进 type**（2026-10-10 实测抓出来的真 bug，别再漏）：
+ *   `uart_link_cmd()` **不会**替你补 `?` —— 看它的长度账注释就能确认
+ *   （`$?PING` = 1+len("?PING")+5，len 里已含 `?`），现有调用一律写 `"?WEA"/"?PING"`。
+ *   当初这里写成 `"RADIO"/"RD"` ⇒ 线上发出的是 `$RADIO,WIFI,ON` 而不是 `$?RADIO,...`，
+ *   对端 `handle_line` 比的是 `"?RADIO"` ⇒ **永远匹配不上，开关静默失效**，
+ *   而 g_cmd_tx 照样涨、看起来"发出去了"，极难发现。
+ *   ⇒ 判断据要看 `$RD` 帧数（g_net_rd_pkts）涨没涨，不能只看 g_cmd_tx。 */
+int BoardNet_SetWifi(int on)
+{
+    s_radio_pend      = 1u;
+    s_radio_pend_on   = (uint32_t)(on ? 1 : 0);
+    s_radio_pend_tries = 0u;
+    s_radio_pend_t0   = 0u;          /* 由 cmd_tick 首次巡检时装填 */
+    return uart_link_cmd("?RADIO", on ? "WIFI,ON" : "WIFI,OFF");
+}
+
+int BoardNet_SetBt(int on)
+{
+    s_radio_pend      = 2u;
+    s_radio_pend_on   = (uint32_t)(on ? 1 : 0);
+    s_radio_pend_tries = 0u;
+    s_radio_pend_t0   = 0u;
+    return uart_link_cmd("?RADIO", on ? "BT,ON" : "BT,OFF");
+}
+
+/* 查询当前无线电状态（发 $?RD，对端回 $RD）。开机序列与周期重查各调一次。 */
+int BoardNet_QueryRadio(void)
+{
+    return uart_link_cmd("?RD", NULL);
 }
