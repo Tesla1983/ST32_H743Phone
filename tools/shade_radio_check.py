@@ -156,6 +156,16 @@ def main():
         if not ok:
             fails.append(f"S2-{label}")
 
+    # ---- 收尾：把 WiFi 恢复成开 ----
+    # ⚠ S1 点 WiFi 瓦片是**真的**下发 $?RADIO,WIFI,...，会把对端 ESP32 的 WiFi 关掉
+    #   （之后时间/天气停更）。收尾用固件自带的测试触发口 g_cmd_req=8 恢复，
+    #   否则每跑一次这个脚本就把对端留在断网状态。
+    #   取值与 src/uart_link.c 的 cmd_tick() 一致：7=WiFi OFF / 8=WiFi ON。
+    print("收尾：恢复 WiFi 为开（发 $?RADIO,WIFI,ON）")
+    bench.wr("g_cmd_req", [8])
+    time.sleep(3.0)
+    print(f"  g_net_radio_wifi = {rd1('g_net_radio_wifi')}（期望 1）")
+
     print("=== " + ("ALL PASS" if not fails else "FAILED: " + ", ".join(fails)) + " ===")
     return 0 if not fails else 1
 
