@@ -38,6 +38,8 @@
 #define GET_GAP_MS       2u
 #define GET_IDLE_GAP_MS  25u
 #define STALL_MS         12000u  /* 这么久没有任何进展（块/响应/状态帧）⇒ 判死 */
+#define WAIT_MAX_MS      180000u /* "一个字节都还没收到"时的**总时长**上限（3 分钟），
+                                  * 见下面 ⑥ 的说明。运行期可写（g_bt_wait_max_ms）。 */
 #define GET_TRY_MAX      8u      /* 同一序号连续无效多少次后放弃 */
 
 #define BT_NAME_FALLBACK "bt_recv.bmp"
@@ -97,6 +99,9 @@ volatile uint32_t g_bt_get_max;
  * 实测链路仍有 ~10% 的命令/响应会丢，2 s 太贵；对端是从本地环形缓冲立刻回答的，
  * 几百毫秒足够。⚠ 必须满足 6 × g_bt_get_ack_ms < STALL_MS(12 s)，否则 STALL 会先触发。 */
 volatile uint32_t g_bt_get_ack_ms = GET_ACK_MS;
+/* "一个字节都还没收到"时的总时长上限（ms），运行期可写 —— 3 分钟太久，验收时要能调小。
+ * 详见 poll 里 ⑥ 的注释：修掉 s_retry 语义之后，等待期不再靠重试判死，改用这个兜底。 */
+volatile uint32_t g_bt_wait_max_ms = WAIT_MAX_MS;
 
 /* ====================== 小工具 ====================== */
 
@@ -424,10 +429,30 @@ int bt_recv_start_test(uint32_t w, uint32_t h)
     return begin(1, w, h);
 }
 
+/* 中止时把 `$?BTF,ABORT` 连发这么多遍。
+ *
+ * ⚠ 为什么是"连发"而不是"发一次 + 等确认"（2026-10-10 **真实路径**实测后定的）：
+ *   实测中止后对端**根本没收到**这条命令（本板 `$BT帧` 不增、对端日志无 ABORT、
+ *   对端 state 仍停在 1），因为 SPI 链路的命令通道有 6%~20% 的丢包，
+ *   而 ABORT 和 GET 不同 —— GET 丢了有"无应答 300 ms 重发"兜着，
+ *   ABORT 是一次性的，丢了就是丢了。
+ *   ⇒ 连发 ABORT_N 遍，每遍都是独立的一笔事务，命中率 1−p^N
+ *     （p=0.2 时 3 遍即 99.2%）。
+ *
+ * ⚠ 连发**绝对安全**，有两条独立保证：
+ *   ① 对端 `bt_file_abort()` 在 `BT_FILE_IDLE` 时**直接 return**（幂等）；
+ *   ② 更彻底的一条：对端 `bt_file_open()` 的**第一行就是 `session_reset()`**
+ *      ⇒ 即使所有 ABORT 都丢了，下次「开始接收」的 OPEN 也会无条件清干净旧会话。
+ *      （实测印证：那一轮 ABORT 全丢、对端 state 停在 1，紧接着再开会话仍然成功。）
+ *   所以这里不做"带状态确认的重发相位"—— 那要给 poll 再加一个尾巴状态，
+ *   而上面第 ② 条已经能自愈，代价与收益不成比例。 */
+#define ABORT_N          3u
+
 int bt_recv_abort(void)
 {
     if (s_state == BT_RECV_IDLE) return -1;
-    (void)uart_link_cmd("?BTF", "ABORT");
+    for (uint32_t i = 0u; i < ABORT_N; i++)
+        (void)uart_link_cmd("?BTF", "ABORT");
     discard_sink();
     reset_session();
     g_bt_rc = -1;
@@ -565,7 +590,20 @@ void bt_recv_poll(uint32_t now_ms)
         }
         if (rc == 0)
         {
-            /* 暂时没有数据（对端还在等手机发 / 环里暂时空）。隔一会儿再问。 */
+            /* 暂时没有数据（对端还在等手机发 / 环里暂时空）。隔一会儿再问。
+             *
+             * ⚠⚠ 这里必须把 `s_retry` 清零（2026-10-10 **真实路径**实测暴露的缺陷）：
+             *   `s_retry` 的语义是"**同一个序号连续失败**多少次"（见 GET_TRY_MAX 注释），
+             *   不是"开机以来总共失败了多少次"。而对端明确回 `$!RS,BTF,0` 说明
+             *   **链路是活的、只是还没数据** —— 这必须算进"没有失败"，否则：
+             *     用户点「开始接收」后还要去手机上配对 + 挑文件，几十秒很正常；
+             *     这段**正常的等待期**里每一笔 GET 丢包都被记成失败，
+             *     实测 12 s 内累积到 8 次就判 `BTE_BADSEQ` 死掉
+             *     （板上实测：err=6 BADSEQ、get_n=322、**一个字节都还没传**）。
+             *   清零之后，"8 次"才真的是"连续 8 次连一句话都没换来"（≈2.4 s）。
+             *   等待期不再判死，改由下面的 g_bt_wait_max_ms 兜总时长。 */
+            s_retry    = 0u;
+            s_t0       = now_ms;          /* 对端活着（响应过），刷新"还有进展"时基 */
             s_need_get = 1u;
             s_next_get = now_ms + GET_IDLE_GAP_MS;
         }
@@ -590,6 +628,20 @@ void bt_recv_poll(uint32_t now_ms)
     }
 
     /* ---- ⑥ 判死 ---- */
+    /* ① "一个字节都还没收到"时的**总时长**上限（2026-10-10 真实路径补）。
+     *   为什么不能用 STALL_MS 顶：等待期里对端每 25 ms 回一次 `$!RS,BTF,0`，
+     *   那也算"有进展"、会把 s_t0 一直刷新 ⇒ STALL 永远不触发 ⇒ 用户点了
+     *   「开始接收」又忘了，会话会**无限挂着**（SPI 上每 25 ms 一笔 GET 白跑）。
+     *   也**不能**用 s_retry 顶：那个已经按语义改成"对端明确回了话就清零"。
+     *   ⇒ 单独拿"会话开始到现在"计时，只在这一字节都没到的阶段生效；
+     *     一旦开始收块（s_recv > 0），保护交给下面那条 STALL。
+     *   ⚠ 3 分钟是给"用户去手机上配对 + 挑文件"留的余量；UI 上有「中止接收」
+     *     按钮可随时退出，所以这个上限只需防"忘了"。 */
+    if (s_recv == 0u && (now_ms - s_t_start) > g_bt_wait_max_ms)
+    {
+        fail(BTE_STALL);
+        return;
+    }
     if ((now_ms - s_t0) > STALL_MS) { fail(BTE_STALL); return; }
     if (s_retry > GET_TRY_MAX)     { fail(BTE_BADSEQ); return; }
 

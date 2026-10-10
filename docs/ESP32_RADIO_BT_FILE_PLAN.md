@@ -251,7 +251,18 @@ esp_bluedroid_init();  esp_bluedroid_enable();
 > **P3–P6 全部完成（2026-10-10 第三轮）**，验收命令与结果：
 > · P4 数据：`tools/bt_file_check.py --snap 0 --wait 30 --burst 8` ⇒ B0–B6 全 PASS（连跑两轮）
 > · P5 视觉：`tools/bt_ui_shot.py` ⇒ U1/U2/U3 全 PASS，产物 `build/bt_ui_{1,2,3}_*.png`
-> · 出货形态核验：`tools/verify_board_image.py build/ymgui-h743.bin` ⇒ 1 643 648 B 逐字节一致
+> · **P3 真实路径**（2026-10-10 第四轮补验）：`tools/bt_real_check.py` ⇒ R0–R5 全 PASS ——
+>   点「开始接收」→ `$?BTF,OPEN` → 对端 **~560 ms** 开好经典蓝牙并起 SPP 服务端
+>   （`设备名 "YMGUI-H743"、服务名 "YMGUI-FILE"（可发现）`、`scn=1`），
+>   **WiFi 同期不掉线**（共存 OK）；本板进入 WAIT 后**等 47 s 仍不被误判死**；
+>   UI 文字正确显示"等待对端发送"；中止后能立刻重开；等待上限仍生效。
+>   ⚠ 该轮首跑暴露并修掉三个缺陷（等待期被误判 BADSEQ / 无等待上限 / UI 文字卡住），
+>   详见 `docs/DEVELOPMENT_LOG.md` 的「2026-10-10（5）」。
+> · 出货形态核验：`tools/verify_board_image.py build/ymgui-h743.bin` ⇒ 1 643 768 B 逐字节一致
+>
+> ⚠ **仍未验的边界**：手机连上 SPP **真的发字节**这一段需要一部真手机。
+> 它前面的环节（对端就绪 / 按序号拉 / CRC / 写卡 / 进相册）都已分别验过，
+> 确实只差"SPP 数据流入队"。
 >
 > ⚠ `bt_file_check.py` 有一条**测量纪律**（写在文件头，别省）：它的快照是"一次读整段
 > DTCM（37 KB）"，实测**一次要 ~6 s**。期间主循环被拖慢一个数量级、还会把主机侧的命令

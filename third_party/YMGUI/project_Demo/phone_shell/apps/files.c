@@ -42,6 +42,7 @@ typedef struct
 	int import_rc;       /* 上一次导入的返回码；-1 = 还没结果 */
 	int bt_last_p;       /* 上次写进进度条的值（只为少做无谓 SetValue；判据仍是当前值） */
 	int bt_last_st;      /* 上次刷该页时的会话状态（变状态才重设按钮文案） */
+	const char* bt_last_txt; /* 上次画上去的状态文字**指针**（静态字面量，见 bt_view_refresh） */
 } AppState;
 static AppState state;
 
@@ -203,6 +204,10 @@ static void bt_view_refresh(void)
 	int  st    = BoardBt_State();
 	uint32_t got = BoardBt_Bytes(), total = BoardBt_Total();
 	const char* name = BoardBt_Name();
+	/* ⚠ 取一次复用，并把**指针**存进缓存做变化检测（见 app_tick）。
+	 *   src/bt_recv.c 的 bt_recv_status_text() 返回的全是静态字面量，
+	 *   所以指针相等等价于内容相等；换成动态拼串就必须改成内容比较。 */
+	const char* txt = BoardBt_StatusText();
 
 	bt_buttons_set();
 
@@ -210,18 +215,18 @@ static void bt_view_refresh(void)
 	if (st == BTUI_DONE)
 		snprintf(text, sizeof(text),
 			"状态：%s\n已收 %s（%u KB）\n已排队导入图库，去相册看。",
-			BoardBt_StatusText(), name[0] ? name : "文件",
+			txt, name[0] ? name : "文件",
 			(unsigned)((got + 511u) / 1024u));
 	else if (st == BTUI_ERROR)
 		snprintf(text, sizeof(text),
 			"状态：%s（返回码 %d）\n半截文件已删除，没留给相册。\n可点「开始接收」重来。",
-			BoardBt_StatusText(), BoardBt_LastRc());
+			txt, BoardBt_LastRc());
 	else if (BoardBt_Busy())
 	{
 		if (total != 0u)
 			snprintf(text, sizeof(text),
 				"状态：%s\n%u / %u KB（%d%%）",
-				BoardBt_StatusText(), (unsigned)(got / 1024u),
+				txt, (unsigned)(got / 1024u),
 				(unsigned)(total / 1024u), BoardBt_Progress());
 		else
 			snprintf(text, sizeof(text),
@@ -232,7 +237,7 @@ static void bt_view_refresh(void)
 		snprintf(text, sizeof(text),
 			"状态：%s\n点「开始接收」，再从手机蓝牙发文件。\n"
 			"（手机侧用任意蓝牙串口 App 发送）",
-			BoardBt_StatusText());
+			txt);
 
 	YMGUI_TextView_SetText(state.file_preview, text);
 
@@ -245,8 +250,9 @@ static void bt_view_refresh(void)
 		/* 缓存"刚画上去的值"，交给 app_tick 做变化检测。
 		 * ⚠ 缓存放在**这个函数末尾**、由它自己维护 —— 否则从 file_refresh()
 		 *   进来的那条路径不会更新缓存，app_tick 会以为"没变"而不刷。 */
-		state.bt_last_st = st;
-		state.bt_last_p  = p;
+		state.bt_last_st  = st;
+		state.bt_last_p   = p;
+		state.bt_last_txt = txt;
 	}
 }
 
@@ -281,6 +287,13 @@ static void file_open(GYOBJ obj)
 	{
 		if (index == 0)
 		{
+			/* 返回值可以忽略（2026-10-10 真实路径复核）：
+			 *   BoardBt_Start() 只会在"已有会话在跑"时返回 -1，而那种情况下
+			 *   BoardBt_Busy() 为真 ⇒ 按钮显示的是「中止接收」，走的是另一条分支；
+			 *   BoardBt_Abort() 只在"本来没有会话"时返回 -1，同理走不到。
+			 *   链路不通**不是**返回值能表达的 —— 那次会话会进 WAIT，
+			 *   4 s × 重试后落到 g_bt_err=BTE_OPEN_TO，UI 显示"接收失败"。
+			 *   ⇒ 这里不需要额外提示，状态行已经会说清楚。 */
 			if (BoardBt_Busy())
 				(void)BoardBt_Abort();
 			else
@@ -336,14 +349,22 @@ static void app_tick(uint32 elapsed)
 		int st = BoardBt_State();
 		int p  = BoardBt_Progress();
 		if (p < 0) p = 0;
-		if (st != state.bt_last_st || p != state.bt_last_p)
+		/* ⚠ 判据必须带上**状态文字**：WAIT 阶段里 s_opening 从 1→0 时
+		 *   st(WAIT) 与 p(0) 都没变，只看这两个的话文字会一直卡在
+		 *   "正在启动蓝牙…"，永远变不成"等待对端发送"。
+		 *   （2026-10-10 真实路径实测：点「开始接收」→ 对端 560 ms 就开好
+		 *    蓝牙并回了 $BT，但那之后文字本该从"正在启动蓝牙…"翻成
+		 *    "等待对端发送"—— 只看 st/p 的话这一翻永远不会发生。） */
+		if (st != state.bt_last_st || p != state.bt_last_p
+		    || BoardBt_StatusText() != state.bt_last_txt)
 			bt_view_refresh();   /* 缓存由 bt_view_refresh 自己更新 */
 	}
 }
 static void app_create(GYOBJ view)
 {
 	state = (AppState){.file_folder = -1, .pic_n = 0, .import_pending = 0,
-	                   .import_rc = -1, .bt_last_p = -1, .bt_last_st = -1};
+	                   .import_rc = -1, .bt_last_p = -1, .bt_last_st = -1,
+	                   .bt_last_txt = NULL};
 	g_files_folder = -1;
 	PhoneUI_app_header(view, "文件管理器", "照片 / 笔记读写 TF 卡");
 	state.file_path = PhoneUI_left_label(view, 24, 65, 272, "", MUTED, 2);
