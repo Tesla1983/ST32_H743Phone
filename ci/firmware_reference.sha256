@@ -917,5 +917,38 @@
 #   未验：真手机再发一次文件（需用户操作）。
 #
 # FLASH 1 644 792 B（78.41%），比第二十二版 +536 B。
-e2a06c3acc7670a25cbe1bee82a6d8b8515d104294001bb0e04d67f916bdd2c5  ymgui-h743.bin
-5f8d52a3ae179696a9d1de12d98cc2dec9d646bcb79ad6a08d1ad0d39a328ebd  ymgui-h743.elf
+# e2a06c3acc7670a25cbe1bee82a6d8b8515d104294001bb0e04d67f916bdd2c5  ymgui-h743.bin
+# 5f8d52a3ae179696a9d1de12d98cc2dec9d646bcb79ad6a08d1ad0d39a328ebd  ymgui-h743.elf
+
+# ============================================================================
+# 第二十四版（2026-10-11）—— 真实手机路径打通；新增文件头魔数诊断
+# ----------------------------------------------------------------------------
+# 一、实测：蓝牙收文件**链路全通**（此前几轮失败都不是传输问题）
+#   s_state=3(DONE) / s_recv=53316 / g_bt_bytes=53316 / chunks=27 /
+#   err=0 / crc_bad=0 / fs_rc=0 / g_bt_done=1 / **g_bt_idle_finishes=1（兜底接住）**
+#   g_spp_rx_m 累计 106632 = 53316×2（两次发送各一份）
+#   ⇒ 手机连上 → 全收 → 落卡 → 兜底收尾 → 排队导入，全部正常。
+#   唯一的失败点在图库导入，与蓝牙无关。
+#
+# 二、导入失败的真因：**用户发的是 PNG**
+#   对卡上已有文件重放导入后读到
+#     g_sniff_magic = 0x89504E47（89 50 4E 47 = "\x89PNG"）、g_sniff_bytes=8
+#     g_img_rc = 4 (RC_NOT_BMP)
+#   ⇒ 头既不是 FF D8 也不是 BM，是 PNG 魔数；固件只接了 BMP 与硬件 JPEG，
+#     没有 PNG 解码器 ⇒ 必然失败。换 .bmp / .jpg 发应可成功（待用户复验）。
+#
+# 三、本次改动：src/img_store.c 新增 g_sniff_magic / g_sniff_bytes
+#   sniff_image_kind() 改为读 8 字节（判定仍只用前 2 个），前 4 字节记成大端
+#   g_sniff_magic、实读字节数记 g_sniff_bytes。
+#   价值：裸流文件一律被命名为 btrecv.bin（原始后缀在对端就丢了），
+#   只看 g_img_rc=4 根本不知道收到的是什么，把头字节打出来才能一眼分辨
+#   （PNG / 有垃圾前缀 / 文件被截断）。
+#
+# 四、验收（已验）
+#   两侧固件均已烧录；用"SWD 写 g_img_path + g_img_test=1"重放导入卡上已有
+#   文件（无需重发），成功读出魔数 ⇒ 诊断通路可用。
+#   未验：改发 .jpg 后能否成功进相册（需用户操作）。
+#
+# FLASH 1 644 840 B（78.41%），比第二十三版 +48 B。
+f4f604ff61b756ed1ee35944928c7bd21e6290f73d91ddf8de4d10462c1decda  ymgui-h743.bin
+a6abbcece97ef872c1c096c389ceaaf66faf3fbc2fa605baa7df3d959257c57e  ymgui-h743.elf

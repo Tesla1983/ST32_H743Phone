@@ -501,6 +501,15 @@ void bt_recv_poll(uint32_t now_ms)
         {
             (void)bt_recv_abort();
         }
+        else if (q == 3u)
+        {
+            /* 开启**真实等待会话**（等手机连上来发文件），区别于 q==1 的自测源。
+             * 为什么要有它：验收时得能把板子精确置于"等待对端发送"态，
+             * 否则只能靠人在 UI 上点「开始接收」—— 一旦没收到数据，就分不清
+             * 是"用户没点"还是"点了没生效"。有了这个入口，脚本能自己开会话，
+             * 把 UI 这个变量彻底排除掉。 */
+            (void)bt_recv_start();
+        }
     }
 
     if (s_state == BT_RECV_IDLE || s_state == BT_RECV_DONE || s_state == BT_RECV_ERROR)

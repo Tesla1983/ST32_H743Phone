@@ -607,12 +607,20 @@ static int path_is_jpeg(const char* p)
  * ⚠ 只在这里读 2 字节然后立刻关掉，不持有句柄、不改动 g_img_step ——
  *   真正的导入随后由 import_bmp/import_jpeg 各自重新打开。
  */
+/* 诊断：最近一次嗅探读到的文件头（前 4 字节，大端）与实际读到的字节数。
+ * 为什么需要：手机走裸流发来的文件一律被命名成 btrecv.bin（原始后缀在对端就丢了），
+ * 一旦嗅探没认出格式就会回退到"看扩展名"⇒ 当成 BMP ⇒ 报 RC_NOT_BMP(4)。
+ * 只看返回码无法知道文件**到底是什么**，把头字节打出来才能一眼看出
+ * （是 PNG / 有垃圾前缀 / 还是被截断）。 */
+__attribute__((used)) volatile uint32_t g_sniff_magic;
+__attribute__((used)) volatile uint32_t g_sniff_bytes;
+
 static int sniff_image_kind(const char* p)
 {
     FIL     f;
     UINT    br = 0;
     FRESULT fr;
-    uint8_t sig[2];
+    uint8_t sig[8];
 
     if (p == NULL || p[0] == 0) { return -1; }
     if (fatfs_ensure_mounted() != 0) { return -1; }
@@ -620,9 +628,19 @@ static int sniff_image_kind(const char* p)
     fr = f_open(&f, p, FA_READ);
     if (fr != FR_OK) { return -1; }
 
+    /* 读 8 字节而不是 2：多读几个只为诊断（看清前缀/容器头），判定仍只用前 2 个。 */
     fr = f_read(&f, sig, sizeof(sig), &br);
     (void)f_close(&f);
-    if ((fr != FR_OK) || (br != sizeof(sig))) { return -1; }
+
+    g_sniff_bytes = (uint32_t)br;
+    if (br >= 4u) {
+        g_sniff_magic = ((uint32_t)sig[0] << 24) | ((uint32_t)sig[1] << 16) |
+                        ((uint32_t)sig[2] << 8)  |  (uint32_t)sig[3];
+    } else {
+        g_sniff_magic = 0u;
+    }
+
+    if ((fr != FR_OK) || (br < 2u)) { return -1; }
 
     if ((sig[0] == 0xFFu) && (sig[1] == 0xD8u)) { return 1; }   /* JPEG SOI  */
     if ((sig[0] == 'B')  && (sig[1] == 'M'))    { return 0; }   /* BMP 'BM'  */
