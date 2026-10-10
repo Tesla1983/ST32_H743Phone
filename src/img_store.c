@@ -246,6 +246,58 @@ static uint32_t idx_used_in(const uint8_t *base)
     return (mx + (IMG_BLK - 1u)) & ~(IMG_BLK - 1u);
 }
 
+/* 在索引副本上找一块放得下 need 字节的空洞，返回它相对**数据区起点**的偏移；
+ * 0xFFFFFFFF = 放不下（图库真的满了）。
+ *
+ * ⚠ 为什么必须有它（2026-10-11 板上实测暴露）：
+ *   原来的分配是"永远追加在 used = max(off+len) 之后" ⇒ **删掉中间某张不会回收
+ *   空间**，只有删掉最靠后那张才会。于是"相册有删除按钮，却腾不出空间"。
+ *   实测图库 31 张占满 2 MB 之后，连一张合法的 224×152 BMP 都导不进去
+ *   （g_img_rc=8 RC_NO_SPACE、g_img_step=5 STEP_ALLOC）—— 收文件那一侧完全正常，
+ *   是被图库空间卡死的。
+ *   有了它，删除任意一张腾出的空洞都能被后续导入复用。
+ *
+ * 判据与历史行为保持一致：**每条目的起点都对齐到 IMG_BLK**（旧代码用
+ *   align_up(max end) 当下一条的起点），所以空洞的可用起点也按块向上对齐；
+ *   且新条目必须**整段**落在下一条有效条目之前（跨过去就会覆盖别人的数据）。
+ *
+ * 为什么不用"排序 + 临时数组"：候选表最坏 256 条，用"每轮找起点最小的下一条"
+ *   的 O(n²) 扫描即可（n=256 ⇒ 至多约 6.5 万次整数比较），省掉 2 KB 栈。
+ * ⚠ 跳过 len==0 的条目：否则 cur 不前进，循环会卡死。
+ */
+static uint32_t idx_alloc_in(const uint8_t *base, uint32_t need)
+{
+    uint32_t cur = 0u;
+
+    for (;;)
+    {
+        uint32_t i, bs = 0xFFFFFFFFu, be = 0u, start, len;
+
+        /* 找"起点 >= cur"里起点最小的那一条 */
+        for (i = 0u; i < IMG_MAX_SLOTS; i++)
+        {
+            const uint8_t *e = base + i * IMG_ENTRY_BYTES;
+            if ((rd16(e) == IMG_MAGIC) && ((rd16(e + 2u) & IMG_FLAG_VALID) != 0u))
+            {
+                uint32_t s = rd32(e + 4u);
+                len = rd32(e + 8u);
+                if (len != 0u && s >= cur && s < bs) { bs = s; be = s + len; }
+            }
+        }
+
+        start = (cur + (IMG_BLK - 1u)) & ~(IMG_BLK - 1u);
+
+        if (bs == 0xFFFFFFFFu)
+        {
+            /* 后面没有条目了：追加在末尾（与旧行为逐字相同）*/
+            return ((start + need) <= IMG_DATA_SIZE) ? start : 0xFFFFFFFFu;
+        }
+        /* ⚠ bs >= start 恒成立：条目的起点都是块对齐的，align_up(cur) 不会越过它 */
+        if ((bs - start) >= need) { return start; }
+        cur = be;
+    }
+}
+
 /* ===========================================================================
  * XIP 冲突探针（g_img_test = 2）
  *
@@ -410,8 +462,10 @@ static uint32_t import_bmp(void)
     memcpy(s_blk, (const void *)XIP_PTR(IMG_IDX_ADDR), IMG_BLK);
     __DSB();
     __ISB();
-    used = idx_used_in(s_blk);
-    if ((used + out_len) > IMG_DATA_SIZE) { (void)f_close(&s_fil); return RC_NO_SPACE; }
+    /* ★分配改"空洞优先"（2026-10-11）：删过图之后要能复用腾出来的空间，
+     * 见 idx_alloc_in 上方注释。used 在这里的语义 = "本张要写到的起点"。 */
+    used = idx_alloc_in(s_blk, out_len);
+    if (used == 0xFFFFFFFFu) { (void)f_close(&s_fil); return RC_NO_SPACE; }
 
     for (slot = 0u; slot < IMG_MAX_SLOTS; slot++)
     {
@@ -1190,8 +1244,9 @@ static uint32_t import_jpeg(void)
     memcpy(s_blk, (const void *)XIP_PTR(IMG_IDX_ADDR), IMG_BLK);
     __DSB();
     __ISB();
-    used = idx_used_in(s_blk);
-    if ((used + out_len) > IMG_DATA_SIZE)
+    /* 同 BMP：空洞优先分配（used = 本张要写到的起点），见 idx_alloc_in 注释 */
+    used = idx_alloc_in(s_blk, out_len);
+    if (used == 0xFFFFFFFFu)
     {
         (void)f_close(&s_j.f);
         return RC_NO_SPACE;
