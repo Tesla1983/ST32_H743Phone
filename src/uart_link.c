@@ -172,13 +172,30 @@ volatile uint32_t g_cmd_btf_rs;
  * 永远抓不到现场。所以让对端随 $BT 一起把它们回送过来，本板留一份镜像，
  * 之后用 SWD 读（SWD 不动 ESP32）即可无损观测。
  * 判据用法：opens==0 ⇒ 手机根本没连上 SPP；opens>0 而 rx 小 ⇒ 连上了但没发数据。 */
-volatile uint32_t g_spp_opens_m;    /* 手机连上 SPP 的次数 */
-volatile uint32_t g_spp_closes_m;   /* 断开次数 */
-volatile uint32_t g_spp_rx_m;       /* 对端从 SPP 收到的总字节 */
-volatile uint32_t g_spp_last_m;     /* 最近一包字节数 */
-volatile uint32_t g_spp_err_m;      /* 回调里非成功状态次数 */
-volatile int      g_spp_run_m;      /* 1 = SPP 服务端在监听 */
-volatile int      g_spp_conn_m;     /* 1 = 手机当前连着 */
+/* ⚠⚠ 这些量**只被写、在本工程里没有任何代码读它们**（读的人是 SWD 脚本），
+ *   而本工程开了 -fdata-sections + --gc-sections ⇒ 链接器会把"没有引用"的
+ *   data section 整块回收，符号从 elf 里消失，SWD 脚本按名字查地址直接 KeyError。
+ *   实测踩过一次（2026-10-11）：改完代码编译通过，nm 里却查不到 g_spp_*_m。
+ *   ⇒ 一律加 __attribute__((used)) 强制保留。
+ *   注：g_bt_idle_* 之所以没被回收，是因为 poll 里读过它们 —— 有读就有引用。 */
+__attribute__((used)) volatile uint32_t g_spp_opens_m;    /* 手机连上 SPP 的次数 */
+__attribute__((used)) volatile uint32_t g_spp_closes_m;   /* 断开次数 */
+__attribute__((used)) volatile uint32_t g_spp_rx_m;       /* 对端从 SPP 收到的总字节 */
+__attribute__((used)) volatile uint32_t g_spp_last_m;     /* 最近一包字节数 */
+__attribute__((used)) volatile uint32_t g_spp_err_m;      /* 回调里非成功状态次数 */
+__attribute__((used)) volatile int      g_spp_run_m;      /* 1 = SPP 服务端在监听 */
+__attribute__((used)) volatile int      g_spp_conn_m;     /* 1 = 手机当前连着 */
+
+/* 对端裸流 EOF 判定的逐条否决计数（定位"手机发完了但会话卡在 RECV"用）。
+ * g_eof_run_m 是关键：它为 0 就说明对端的 bt_file_poll() 根本没被周期调用。 */
+__attribute__((used)) volatile uint32_t g_eof_run_m;      /* eof_check 被调用次数 */
+__attribute__((used)) volatile uint32_t g_eof_v_state_m;  /* 否决：状态不是 RECV */
+__attribute__((used)) volatile uint32_t g_eof_v_size_m;   /* 否决：已声明总长 */
+__attribute__((used)) volatile uint32_t g_eof_v_recv_m;   /* 否决：还没收到字节 */
+__attribute__((used)) volatile uint32_t g_eof_v_ring_m;   /* 否决：环里还有字节 */
+__attribute__((used)) volatile uint32_t g_eof_v_time_m;   /* 否决：空闲不够 */
+__attribute__((used)) volatile uint32_t g_eof_idle_m;     /* 最近一次算出的空闲时长（ms） */
+__attribute__((used)) volatile uint32_t g_eof_fired_m;    /* 成功判定收全的次数 */
 volatile uint32_t g_bt_recv_req;
 volatile uint32_t g_bt_recv_w;
 volatile uint32_t g_bt_recv_h;
@@ -454,7 +471,13 @@ static int      s_city_scanned; /* 0 = 从没扫完过一轮 */
 static int parse_frame(const uint8_t* line, uint32_t len)
 {
     char  buf[UART_LINK_LINE_MAX];
-    char* f[8];
+    /* ⚠ 容量 16（原为 8）：$BS 帧已扩到 16 个字段。
+     * 踩过的坑（2026-10-11）：把 $BS 的判据写成 `nf >= 16` 却忘了扩这个数组，
+     * 结果 nf 最大只能是 8 ⇒ 条件**恒为假** ⇒ 整个分支被判成死代码删掉，
+     * 里面的 g_spp_*_m / g_eof_*_m 全成"只写不读"⇒ 被 --gc-sections 回收，
+     * 表现是"编译通过但 nm 查不到符号"。更隐蔽的是 f[8]..f[15] 全是越界访问。
+     * ⇒ 改字段数门槛时，**数组容量必须一起改**。 */
+    char* f[16];
     int   nf;
 
     if (len == 0u || len >= UART_LINK_LINE_MAX)
@@ -506,7 +529,9 @@ static int parse_frame(const uint8_t* line, uint32_t len)
     }
 
     *star = 0;                          /* 到此为止是 "<TYPE>,<字段...>" */
-    nf = split_fields(dollar + 1, f, 8);
+    /* 容量必须与上面的 char* f[16] 一致（同理：不同步就会让 nf 上限变小、
+     * 使高门槛的分支变成永不执行的死代码）。 */
+    nf = split_fields(dollar + 1, f, 16);
 
     if (nf >= 5 && f[0][0] == 'D' && f[0][1] == 'T')
     {
@@ -648,9 +673,13 @@ static int parse_frame(const uint8_t* line, uint32_t len)
         return 0;
     }
 
-    /* ---- 上游 SPP 诊断：$BS,<opens>,<closes>,<rx>,<last>,<err>,<run>,<conn> ----
-     * ⚠ 紧跟在 $BT 之后判：两者都是 'B' 开头，靠第二个字符 'T' / 'S' 区分。 */
-    if (nf >= 8 && f[0][0] == 'B' && f[0][1] == 'S' && f[0][2] == 0)
+    /* ---- 上游诊断：$BS,<opens>,<closes>,<rx>,<last>,<err>,<run>,<conn>,
+     *                    <eof_run>,<v_state>,<v_size>,<v_recv>,<v_ring>,<v_time>,
+     *                    <eof_idle>,<eof_fired>
+     * ⚠ 紧跟在 $BT 之后判：两者都是 'B' 开头，靠第二个字符 'T' / 'S' 区分。
+     * ⚠ nf 门槛由 8 提到 16：对端后来又追加了 8 个 EOF 判据计数，写 8 会把
+     *   新帧当成不认识的帧丢掉（静默失效，最难受）。 */
+    if (nf >= 16 && f[0][0] == 'B' && f[0][1] == 'S' && f[0][2] == 0)
     {
         g_spp_opens_m  = to_u32(f[1]);
         g_spp_closes_m = to_u32(f[2]);
@@ -659,6 +688,14 @@ static int parse_frame(const uint8_t* line, uint32_t len)
         g_spp_err_m    = to_u32(f[5]);
         g_spp_run_m    = to_int(f[6]);
         g_spp_conn_m   = to_int(f[7]);
+        g_eof_run_m     = to_u32(f[8]);
+        g_eof_v_state_m = to_u32(f[9]);
+        g_eof_v_size_m  = to_u32(f[10]);
+        g_eof_v_recv_m  = to_u32(f[11]);
+        g_eof_v_ring_m  = to_u32(f[12]);
+        g_eof_v_time_m  = to_u32(f[13]);
+        g_eof_idle_m    = to_u32(f[14]);
+        g_eof_fired_m   = to_u32(f[15]);
         return 0;
     }
 

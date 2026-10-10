@@ -42,6 +42,14 @@
                                   * 见下面 ⑥ 的说明。运行期可写（g_bt_wait_max_ms）。 */
 #define GET_TRY_MAX      8u      /* 同一序号连续无效多少次后放弃 */
 
+/* 裸流兜底收尾：已经开始收字节之后，连续这么久**没有新字节落地**就自己收尾（ms）。
+ * 2026-10-11 实测必需：手机把 53 316 字节全发完、本板也全取完并落卡，但对端的
+ * 空闲 EOF 判定没有置 DONE（state 一直停在 RECV）⇒ 只认对端 DONE 会让会话永远挂着。
+ * 5 s 的依据：SPP 连续发送时包间隔是毫秒级，手机端"发完了"之后就不再有字节；
+ * 留 5 s 是给"手机分两次点发送"这类人为间隔留余量，同时远短于 STALL(12 s)。
+ * 运行期可写（g_bt_idle_max_ms）；写 0 = 关闭兜底。 */
+#define BT_IDLE_MAX_MS   5000u
+
 #define BT_NAME_FALLBACK "bt_recv.bmp"
 
 /* ---- 会话状态 ---- */
@@ -59,6 +67,11 @@ static uint32_t s_t0;           /* 最近一次"有进展"的时基（判 STALL�
 static uint32_t s_open_try;
 static uint32_t s_now;          /* 最近一拍的时基（bt_recv_start 没带时基，用它）*/
 static uint32_t s_t_start;      /* 会话开始的时基（算墙钟时长，见 g_bt_ms）*/
+/* 最近一次**真正收到字节**的时基（裸流兜底收尾用）。
+ * ⚠ 为什么不能复用 s_t0：s_t0 在收到 `$!RS,BTF,0`（"暂时没数据"）时也会被刷新
+ *   （rc==0 分支，见 ⑤ 上方注释），而那个响应每 25 ms 来一次 ⇒ s_t0 永远年轻，
+ *   STALL 判死永远不触发。兜底必须只看"有没有新字节落地"。 */
+static uint32_t s_last_rx;
 static uint32_t s_get_to_run;   /* 连续"GET 发了没人回"的笔数（算 g_bt_get_max）*/
 static uint32_t s_rx_base;      /* 发 GET 那一刻的 g_spi_rx_bytes（判"到底有没有字节在下行"）*/
 /* 已发出的那条请求（用于超时重发：OPEN 与 TEST 参数不同，得原样再发一遍） */
@@ -94,6 +107,10 @@ volatile uint32_t g_bt_spi_tx;
 volatile uint32_t g_bt_ms;
 volatile uint32_t g_bt_get_to;
 volatile uint32_t g_bt_get_max;
+/* 由"裸流兜底"收尾的次数（区别于 g_bt_done 里靠对端置 DONE 收尾的那些）。
+ * 这个数 > 0 就说明对端的空闲 EOF 判定确实没生效、是本板自己兜住的。
+ * ⚠ 同 uart_link.c 的 g_spp_*_m：只写不读会被 --gc-sections 回收，加 used 保住。 */
+__attribute__((used)) volatile uint32_t g_bt_idle_finishes;
 /* "发了 GET 多久没回就当丢了"的等待时长，运行期可写（SWD 改一下即可扫档，
  * 不用重烧固件）。默认 = GET_ACK_MS。理由：丢一笔 GET 的代价就是白等这么久，
  * 实测链路仍有 ~10% 的命令/响应会丢，2 s 太贵；对端是从本地环形缓冲立刻回答的，
@@ -102,6 +119,9 @@ volatile uint32_t g_bt_get_ack_ms = GET_ACK_MS;
 /* "一个字节都还没收到"时的总时长上限（ms），运行期可写 —— 3 分钟太久，验收时要能调小。
  * 详见 poll 里 ⑥ 的注释：修掉 s_retry 语义之后，等待期不再靠重试判死，改用这个兜底。 */
 volatile uint32_t g_bt_wait_max_ms = WAIT_MAX_MS;
+/* 裸流兜底收尾阈值（ms）。已经开始收字节后，连续这么久没新字节就自己收尾，
+ * **不再依赖对端置 DONE**。运行期可写：写 0 = 关闭兜底（回到只认对端）。 */
+volatile uint32_t g_bt_idle_max_ms = BT_IDLE_MAX_MS;
 
 /* ====================== 小工具 ====================== */
 
@@ -257,6 +277,7 @@ static int write_chunk(uint32_t len)
     s_recv    += len;
     g_bt_bytes = s_recv;
     g_bt_chunks++;
+    s_last_rx = s_now;               /* 兜底收尾只看这个，不看 s_t0 */
     return 0;
 }
 
@@ -625,6 +646,23 @@ void bt_recv_poll(uint32_t now_ms)
         if (s_total == 0u || s_recv >= s_total) { finish_ok(); return; }
         /* 对端说完成、本板还差字节 ⇒ 中间丢过整块。继续 GET 兜底，
          * 补不回来就由下面的 STALL 判死。 */
+    }
+
+    /* ---- ⑤b 裸流兜底收尾（2026-10-11 实测必需，见 BT_IDLE_MAX_MS 注释）----
+     * 只靠上面那条（对端置 DONE）不够：实测手机发完 53 316 字节、本板全部落卡，
+     * 但对端 state 一直停在 RECV（它的空闲 EOF 判定没有生效）⇒ 会话永远挂着，
+     * 用户看到的就是"传送失败"。
+     * 所以本板自己按"多久没有新字节落地"收尾，不依赖对端的状态帧。
+     * ⚠ 判据只用 s_last_rx（最后一次 write_chunk 的时刻），**不能**用 s_t0：
+     *   s_t0 会被对端每 25 ms 一次的 `$!RS,BTF,0` 刷新，永远是"年轻"的。
+     * ⚠ 只在这三种情况下才生效：已经收过字节、阈值非 0、当前确实在接收态。
+     *   等待手机发文件期间（s_recv==0）不受影响 —— 那段时间由 g_bt_wait_max_ms 管。 */
+    if (s_recv > 0u && g_bt_idle_max_ms != 0u &&
+        (uint32_t)(now_ms - s_last_rx) > g_bt_idle_max_ms)
+    {
+        g_bt_idle_finishes++;
+        finish_ok();
+        return;
     }
 
     /* ---- ⑥ 判死 ---- */

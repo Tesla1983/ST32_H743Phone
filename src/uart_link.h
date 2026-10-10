@@ -259,6 +259,16 @@ extern volatile uint32_t g_spp_err_m;       /* 回调里非成功状态次数 */
 extern volatile int      g_spp_run_m;       /* 1 = SPP 服务端在监听 */
 extern volatile int      g_spp_conn_m;      /* 1 = 手机当前连着 */
 
+/* 对端裸流 EOF 判定的逐条否决计数。g_eof_run_m 为 0 ⇒ 对端 bt_file_poll() 没跑。 */
+extern volatile uint32_t g_eof_run_m;      /* eof_check 被调用次数 */
+extern volatile uint32_t g_eof_v_state_m;  /* 否决：状态不是 RECV */
+extern volatile uint32_t g_eof_v_size_m;   /* 否决：已声明总长 */
+extern volatile uint32_t g_eof_v_recv_m;   /* 否决：还没收到字节 */
+extern volatile uint32_t g_eof_v_ring_m;   /* 否决：环里还有字节 */
+extern volatile uint32_t g_eof_v_time_m;   /* 否决：空闲不够 */
+extern volatile uint32_t g_eof_idle_m;     /* 最近一次算出的空闲时长（ms） */
+extern volatile uint32_t g_eof_fired_m;    /* 成功判定收全的次数 */
+
 /* 手工触发（脚本用）：1 = 自测接收（对端合成 BMP 走全链路）
  *                   2 = 中止；写后固件自动清 0。
  * ⚠ 这两个尺寸是 P4 验收用的"约 100 KB"档：224×152 的 24 位 BMP

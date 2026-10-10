@@ -868,5 +868,54 @@
 #   未验：手机实连 SPP 的 opens/rx 数值（需真手机）。
 #
 # FLASH 1 644 256 B（78.40%），比第二十一版 +360 B。
-4753838bbfda10ef9dd0623932065ff1c5c685705485857dcf3832dc3dda013e  ymgui-h743.bin
-41db686bb9e06e81f6ca528774ec60547f2dd47081c1d2bb7dd5884eda0d0d4a  ymgui-h743.elf
+# 4753838bbfda10ef9dd0623932065ff1c5c685705485857dcf3832dc3dda013e  ymgui-h743.bin
+# 41db686bb9e06e81f6ca528774ec60547f2dd47081c1d2bb7dd5884eda0d0d4a  ymgui-h743.elf
+
+# ============================================================================
+# 第二十三版（2026-10-11）—— 裸流兜底收尾 + $BS 扩到 16 字段
+# ----------------------------------------------------------------------------
+# 一、为什么改（用户实机测过之后的结论，与上版推测不同）
+#   仪表读数：g_spp_run_m=1 / conn_m=1 / opens_m=1 / rx_m=53316，
+#     g_bt_bytes=53316 / chunks=77 / err=0 ⇒ **手机连上了、53316 字节全到了、
+#     本板也全部落卡**；但 g_net_btf_state 停在 2(RECV) 没收尾 ⇒ 用户看到"传送失败"。
+#     ⇒ 上一版怀疑的"ESP_SPP_SEC_AUTHENTICATE 太严"**不成立**（opens=1 证明连上了）。
+#   决定性测量：相隔 8 s 两次快照 g_spp_rx_m 纹丝不动（手机早发完）、
+#     g_bt_get_n 仍在涨（链路活着），而 state 死死停在 2 ⇒ 对端空闲 EOF 判定没生效。
+#
+# 二、改动
+#   ① 本仓库 src/bt_recv.c：**裸流兜底收尾**（让功能真正可用的那一步）
+#      新增 s_last_rx（最近一次真正收到字节的时基，在 write_chunk 里更新）
+#      + g_bt_idle_max_ms（默认 BT_IDLE_MAX_MS=5000，可写；写 0 关闭）
+#      + 判定挂在 poll 的 ⑤ 之后、⑥ 判死之前：
+#        s_recv>0 && g_bt_idle_max_ms!=0 && (now_ms - s_last_rx) > g_bt_idle_max_ms ⇒ finish_ok()
+#      ⚠ 只能用 s_last_rx、**不能用 s_t0**：s_t0 会被对端每 25 ms 一次的
+#        $!RS,BTF,0（"暂时没数据"）刷新 ⇒ 永远年轻 ⇒ STALL(12 s) 永远不触发。
+#      ⚠ 5 s 依据：SPP 连续发包间隔毫秒级；留 5 s 给"手机分两次点发送"留余量，
+#        且远短于 STALL。等待期（s_recv==0）不受影响，归 g_bt_wait_max_ms 管。
+#   ② 本仓库 src/uart_link.c/.h：$BS 扩到 16 字段，新增对端 EOF 逐条否决计数镜像
+#      g_eof_run_m / v_state_m / v_size_m / v_recv_m / v_ring_m / v_time_m /
+#      g_eof_idle_m / g_eof_fired_m。
+#   ③ 对端 main/bt_file.c/.h（非 git 仓库，随本版烧录）：bt_file_eof_check() 内
+#      逐条判据加否决计数 + 暴露当前空闲时长 g_eof_idle。
+#
+# 三、⚠⚠ 本轮最大坑（改动时务必同步）
+#   把 $BS 判据从 `nf >= 8` 提到 `nf >= 16` 却忘了扩字段数组：
+#     src/uart_link.c 里是 `char* f[8]` + `split_fields(dollar + 1, f, 8)`
+#     ⇒ nf 上限只有 8 ⇒ `nf >= 16` **恒为假** ⇒ 分支被判死代码删掉
+#     ⇒ 里面的镜像量全成"只写不读" ⇒ 被 -fdata-sections + --gc-sections 回收。
+#     表现：**编译通过、零告警，但 arm-none-eabi-nm 查不到符号**（SWD 脚本 KeyError），
+#     且 f[8]..f[15] 全是越界访问。
+#     `__attribute__((used))` **挡不住** gc-sections（只保证 emit 到 .o）。
+#     正解：**字段数门槛与 f[] 数组容量必须一起改**（已改 char* f[16] + split_fields(...,16)）。
+#
+# 四、验收（已验）
+#   SWD 触发 g_bt_recv_req=1 跑 TEST：g_bt_bytes=102399 / chunks=50 / err=0 /
+#     imp_rc=0（导入成功）/ done=1 / **g_bt_idle_finishes=0（兜底未误伤正常会话）**；
+#     g_eof_run_m=3868、g_eof_v_state_m=3868 ⇒ $BS 帧解析正常、对端 poll 心跳在跑
+#     （这 3868 次否决全部来自 TEST 前后的非 RECV 时段，逻辑自洽）。
+#   两侧均已重新编译并烧录（ESP32 COM10 哈希校验通过；STM32 probe-rs download + reset）。
+#   未验：真手机再发一次文件（需用户操作）。
+#
+# FLASH 1 644 792 B（78.41%），比第二十二版 +536 B。
+e2a06c3acc7670a25cbe1bee82a6d8b8515d104294001bb0e04d67f916bdd2c5  ymgui-h743.bin
+5f8d52a3ae179696a9d1de12d98cc2dec9d646bcb79ad6a08d1ad0d39a328ebd  ymgui-h743.elf
