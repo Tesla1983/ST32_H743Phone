@@ -2749,3 +2749,118 @@ R4 第一次跑判 FAIL，但线索自相矛盾：对端 `$BT` 帧没增加（�
 （B0–B6 全 PASS）⇒ 确实只差"SPP 数据流入队"那一段。
 要补就把手机当普通蓝牙串口（设备名 **YMGUI-H743**、服务名 **YMGUI-FILE**）连上，
 发一个 ≤240×180 的 .bmp，然后在板上确认相册多一张。
+
+---
+
+## 2026-10-11 · 项目结构速查 + 开机界面（Boot Screen）怎么改
+
+> 本节是给"新接手/隔一段时间回来"的人看的**地图**，不是某一轮改动的记录。
+> README 只讲"项目是什么、怎么构建"，这里补两件 README 没细讲的事：
+> **代码放哪** 与 **开机画面在哪改**。
+
+### 1. 项目结构（三层 + 支撑目录）
+
+工程分三层，理解"层与层之间怎么说话"比记住每个文件名更重要：
+
+```
+ymgui-h743/
+├── src/                        ① 本项目自写：HAL 移植层 + 板级驱动（≈13.5k 行）★核心
+│   ├── main.c                  主循环、启动序列（阶段 1–5）、帧率/内存测量
+│   ├── qspi_port.c/.h          QSPI Flash 驱动（W25Q128，XIP 窗口 0x90000000）
+│   ├── img_store.c/.h          图库：索引 + 数据布局、导入（BMP/JPEG）、清空/删除
+│   ├── qspi_provision.c/.h     图库一次性烧录（产线动作，非每次上电）
+│   ├── font_provision.c/.h     字库 provision
+│   ├── bt_recv.c/.h            蓝牙收文件状态机（手机 → ESP32 → 本板 → 卡 → 图库）
+│   ├── spi_link.c/.h           与 ESP32 的 SPI 主从链路（★现业务介质）
+│   ├── uart_link.c/.h          与 ESP32 的 UART 帧协议（回退路径；命令通道两者共用）
+│   ├── sd_card.c/.h + fatfs_port  TF 卡（SDMMC1 4-bit）与 FatFs 挂载
+│   ├── touch_port.c/.h         GT9xxx 触摸
+│   ├── rtc_clock.c/.h          板载 RTC / 时间递推
+│   ├── board_alloc.c/.h        堆/内存自检     board_fault.c/.h  故障捕获
+│   ├── ymgui_port.c/.h         YMGUI 的 flush/分配等移植回调
+│   ├── app_config.c/.h         用户设置持久化（写 Flash）
+│   └── dma_bench.c/.h          性能台架
+│
+├── third_party/YMGUI/          ② 上游 GUI 库（**尽量别改内核**）
+│   ├── YMGUI/                  内核：对象树、绘制、动画、控件（≈19k 行）
+│   └── project_Demo/phone_shell/   手机壳 UI 层（≈22.3k 行）
+│       ├── phone_shell.c       所有页面的构建与场景切换（★开机画面在这里）
+│       ├── phone_shell_board.h ★板级转发接口声明（UI 只认这一层）
+│       ├── phone_ui.c          一组 UI 小工具（label/button/panel/bar）
+│       ├── phone_app.c/.h      App 生命周期（创建/显示/隐藏/销毁）
+│       ├── phone_shade.c       下拉快捷中心    phone_ime.*  中文输入法
+│       ├── phone_desktop.c     桌面时钟/天气
+│       └── apps/               ★17 个 App：gallery/files/settings/weather/
+│                               clock/calculator/camera/messages/notes/music/
+│                               contacts/phone/recorder/tasks/browser/…
+│
+├── cmake/                     工具链文件（arm-none-eabi.cmake）
+├── linker/                    链接脚本（内存分区：DTCM/SRAM1-3/AXI/FLASH）
+├── ci/                        可复现性参考哈希 + check_firmware_hash.py
+├── docs/                      专题文档（本文件 + 引脚/CI/字体/滚动等 16 篇）
+├── tools/                     上板验收脚本（*_check.py / *_shot.py / bench.py …）
+├── host_check/                PC 端离屏渲染（不接硬件就能预览 UI 布局）
+└── build/                     ★构建目录，**必须叫 build**（CI 与脚本都按此名找）
+```
+
+**★ 分层铁律（改代码前必须知道）**：
+`phone_shell`（third_party 里的官方 Demo）**不直接 include `src/` 下的头**。
+所有跨层调用都走 `phone_shell_board.h` 里声明的 `BoardXxx_*` 转发函数
+（如 `BoardBt_*` / `BoardGallery_*` / `BoardPic_*` / `BoardNet_*`）。
+⇒ **要在 UI 里用一个新的板级能力，先在 `src/` 写实现，再在 `phone_shell_board.h`
+加一个 `BoardXxx_*` 声明 + 在对应 .c 里转一手**（转发层只改名不重复实现）。
+
+### 2. 开机界面（Boot Screen）在哪改
+
+**★ 关键认知：开机画面没有"图片文件"，全是代码矢量绘制。**
+仓库里那些 `phone_shell_boot.png` / `host_check/out/0*_boot*.png` 只是**文档截图**，
+固件**不加载**它们 —— 改那些 PNG 对开机画面没有任何影响。
+
+要改的外观都在 **`third_party/YMGUI/project_Demo/phone_shell/phone_shell.c`**：
+
+| 函数 | 行号* | 作用 |
+| --- | --- | --- |
+| `build_boot_power()` | ~1818 | **开机页所有构件的创建处**（改布局/配色/文案主要动这里） |
+| `logo_draw()` | ~630 | 圆环 logo 的画法（三段 `YMGUI_Draw_CircleFill`） |
+| `begin_boot()` | ~655 | 进入开机动画（logo 上移 + 进度条 0→100） |
+| `begin_shutdown()` | ~689 | 关机页逻辑；关机页 `power_page` 也在 `build_boot_power()` 里建 |
+
+\* 行号会随改动漂移，用 `grep -n "build_boot_power\|logo_draw\|begin_boot" phone_shell.c` 现查。
+
+**开机页由这些构件拼成**（均在 `build_boot_power()` 内）：
+
+| 构件 | 创建调用 | 说明 |
+| --- | --- | --- |
+| `boot_page` | `YMGUI_Creat_Obj_Creat(root,0,0,W,H)` | 全屏页；背景 `RGB(10,25,44)`（深蓝） |
+| `boot_logo` | `YMGUI_Creat_Obj_Creat(boot_page,0,106,W,86)` | `draw_cb = logo_draw`（圆环 logo） |
+| 标题 label | `PhoneUI_label(boot_page,40,225,240,"Y A O M I",…)` | 品牌名 |
+| 副标题 | `PhoneUI_label(…, "点亮你的小小世界", …)` | 用 `T("…")` 包裹走字库 |
+| `boot_bar` | `YMGUI_Creat_Bar_Creat(boot_page,65,343,190,7)` | 进度条；色 `RGB(35,65,81)`→`RGB(81,223,186)` |
+| 提示 label | `PhoneUI_label(…, T("正在启动"), …)` | 进度条下方一行 |
+
+**换 logo** ⇒ 改 `logo_draw()`（当前是三个同心圆：
+
+```c
+YMGUI_Draw_CircleFill(surface, cx, cy, 37, RGB(66,209,180));        /* 外圈青 */
+YMGUI_Draw_CircleFill(surface, cx, cy, 27, RGB(14,32,55));          /* 内圈深蓝 */
+YMGUI_Draw_CircleFill(surface, cx+14, cy-15, 8, RGB(66,209,180));   /* 右上小青点 */
+```
+
+**换文字/背景色/进度条色** ⇒ 改 `build_boot_power()` 里的 label 文案与 `RGB(...)`。
+
+**动画与时长** ⇒ `begin_boot()`：`PhoneUI_move(boot_logo,0,94,680)`（680 ms 上移）、
+`PhoneUI_animate_bar(boot_bar,100,740)`（740 ms 冲到 100%）。
+`YMGUI_ANIM` 关闭时直接 `show_home()` 跳过动画。
+
+⚠ 注意"重启（重新开机）"按钮走后端**软复位**再回到 `begin_boot()` 这条链路
+（`on_restart` → 重新进开机流程），所以改了 `build_boot_power()` /
+`logo_draw()`，**开机与"重启"两处外观会一起变**，不存在两套画面。
+
+### 3. 顺带：旧构建目录清理（2026-10-11）
+
+`build_prev`、`build_prev_20261010{,b,c}` 四个历史构建目录（共 ~80.5 MB）已
+**送进回收站**（E:\$Recycle.Bin，可还原），release 用的 `build/` 未动。
+清理脚本留作工具：`tools/recycle_build_prev.py`（`--dry-run` 先看、`--rbinspect` 查回收站记录）。
+⚠ 教训：**E: 盘删的东西进的是 `E:\$Recycle.Bin` 而不是 `C:`** —— 查错盘会拿到
+"$I 记录 0 → 0"的**假阴性**，把"真的进了回收站"误读成"被永久删除"。判据要看**目标盘**的
+回收站目录，并核对 `$I` 记录里的原始路径与原大小。
