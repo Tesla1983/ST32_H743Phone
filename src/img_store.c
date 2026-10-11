@@ -216,6 +216,81 @@ int img_store_delete(uint32_t slot)
     return 0;
 }
 
+/* 计算「当前还能存下的单张最大图」字节数（空洞优先分配下 = 最大连续空闲块）。
+ * 与 idx_alloc_in 同口径：直接读 XIP 做 O(n²) 扫描太慢（256×256 次 AHB 事务），
+ * 先拷 4 KB 索引副本到 s_blk 再算。返回 -1 = 导入中（XIP 不可读）；0 = 完全满。
+ *
+ * 为什么是「最大连续空闲块」而不是「已用/总量」：删除不擦数据区，图库里存在空洞，
+ * 一个 N 字节的新图只要能塞进某段空闲（尾部余量或某个空洞）就能导入。
+ * 报「剩余容量」若按高水位算会**谎报**（明明有空洞却显示满了），所以这里报的是
+ * 分配器实际能放下的最大单张 —— 这才是诚实的「还能存多大一张」。 */
+static uint32_t idx_free_in(const uint8_t *base)
+{
+    uint32_t i, high = 0u, best;
+
+    for (i = 0u; i < IMG_MAX_SLOTS; i++)
+    {
+        const uint8_t *e = base + i * IMG_ENTRY_BYTES;
+        if ((rd16(e) == IMG_MAGIC) && ((rd16(e + 2u) & IMG_FLAG_VALID) != 0u))
+        {
+            uint32_t end = rd32(e + 4u) + rd32(e + 8u);
+            if (end > high) { high = end; }
+        }
+    }
+    high = (high + (IMG_BLK - 1u)) & ~(IMG_BLK - 1u);
+    best = (IMG_DATA_SIZE > high) ? (IMG_DATA_SIZE - high) : 0u;   /* 尾部余量 */
+
+    for (i = 0u; i < IMG_MAX_SLOTS; i++)
+    {
+        const uint8_t *e = base + i * IMG_ENTRY_BYTES;
+        uint32_t off_i, prev_end, j, start, gap;
+        if ((rd16(e) != IMG_MAGIC) || ((rd16(e + 2u) & IMG_FLAG_VALID) == 0u)) { continue; }
+        off_i = rd32(e + 4u);
+        prev_end = 0u;
+        for (j = 0u; j < IMG_MAX_SLOTS; j++)
+        {
+            const uint8_t *f = base + j * IMG_ENTRY_BYTES;
+            uint32_t off_f, end_f;
+            if ((rd16(f) == IMG_MAGIC) && ((rd16(f + 2u) & IMG_FLAG_VALID) != 0u))
+            {
+                off_f = rd32(f + 4u);
+                end_f = off_f + rd32(f + 8u);
+                if (off_f < off_i && end_f > prev_end) { prev_end = end_f; }
+            }
+        }
+        start = (prev_end + (IMG_BLK - 1u)) & ~(IMG_BLK - 1u);
+        if (off_i > start)
+        {
+            gap = off_i - start;
+            if (gap > best) { best = gap; }
+        }
+    }
+    return best;
+}
+
+int img_store_free_bytes(void)
+{
+    if (g_img_busy != 0u) { return -1; }
+    memcpy(s_blk, XIP_PTR(IMG_IDX_ADDR), IMG_BLK);
+    return (int)idx_free_in(s_blk);
+}
+
+/* 清空整本图库（使所有索引条目失效）：擦掉索引扇区（4 KB，正好 256 条）。
+ * 数据区**不擦**（与单张删除同一取舍：留待后续空洞复用）。
+ * 返回 0 = 成功；1 = 忙（导入中或有别的诊断操作在跑）；3 = flash 写失败。
+ * ⚠ qspi_erase_sector 只退映射、不自动恢复 ⇒ 这里必须手动 qspi_enter_mmap()，
+ *   否则返回后 UI 下一帧读 XIP（字模/IME 词典）会 BusFault。 */
+int img_store_clear(void)
+{
+    int q;
+    if (g_img_busy != 0u || g_img_test != 0u) { return 1; }
+    q = qspi_erase_sector(IMG_IDX_ADDR / IMG_BLK);
+    g_img_qspi_rc = (uint32_t)q;
+    (void)qspi_enter_mmap();
+    if (q == QSPI_OK) { g_img_used = 0u; return 0; }
+    return 3;
+}
+
 static uint32_t idx_used_in(const uint8_t *base);   /* 定义在下面（导入路径专用） */
 
 /* 已用字节数（= 所有有效条目里 max(off+len)，再向上按 4 KB 对齐）
@@ -2115,6 +2190,19 @@ int BoardGallery_Delete(int slot, int *next_valid)
 
     if (next_valid) { *next_valid = img_store_next_valid(slot); }
     return 0;
+}
+
+/* 当前还能存下的单张最大图字节数；-1 = 导入中（XIP 不可读）。
+ * 相册 UI 拿它显示「剩余容量」或「已满」。 */
+int BoardGallery_FreeBytes(void)
+{
+    return img_store_free_bytes();
+}
+
+/* 清空整本图库（两段式确认在 UI 层做）。返回 0 = 成功；1 = 忙；3 = flash 失败。 */
+int BoardGallery_Clear(void)
+{
+    return img_store_clear();
 }
 
 /* 写文件夹具：不走 busy（写卡不涉及 XIP，UI 可以继续跑） */

@@ -1063,5 +1063,43 @@
 #     并补进 3 张 224×152 ⇒ 净 +1 张、空洞余量 188 416 B（图库不再"卡死"）。
 #
 # FLASH 1 646 192 B（78.50%），比第二十六版 +56 B。
-44b2012c3a9afaa95f1c47388272211dd702f3798879b4afea21bf09a7292a1e  ymgui-h743.bin
-0f76deb56d63cc8e18f89eb78617149045f31efbeeddee212d547cba963eea72  ymgui-h743.elf
+# --- 第二十七版：已被第二十八版取代 ---
+# 44b2012c3a9afaa95f1c47388272211dd702f3798879b4afea21bf09a7292a1e  ymgui-h743.bin
+# 0f76deb56d63cc8e18f89eb78617149045f31efbeeddee212d547cba963eea72  ymgui-h743.elf
+
+# ============================================================================
+# 第二十八版（2026-10-11）—— 相册清空/删除恢复可用 + 容量 UI 文案精简
+# ----------------------------------------------------------------------------
+# 一、问题
+#   (a) 相册「清空 / 删除」点了没反应 —— gallery App 没注册 `.show` 生命周期回调。
+#       PhoneApps_Create 只在开机时建一次 view；之后打开 App 走 PhoneApps_Show
+#       （phone_app.c:80），**仅当注册了 .show 才调用**。相册把
+#       state.gallery_total 的刷新写在 create 里 ⇒ 只在开机刷一次、之后陈旧；
+#       而 on_clear / on_delete 首行就是 `if (gallery_total <= 0) return;` 早退
+#       ⇒ 功能整体失效（开机后若第一次打开为空，之后就永远回不来）。
+#   (b) 容量提示末尾「B」被整字裁掉：caption 是固定宽 label（x=22..298，宽 276），
+#       原串 "1 / 4 张卡上图片 · 剩1772KB" 全宽约 294px > 276 ⇒ 末尾整字被裁。
+# 二、改动（third_party/YMGUI/project_Demo/phone_shell/apps/gallery.c）
+#   1) 抽出 gallery_refresh_state()：复位两段式确认态 + 用 BoardGallery_Count()
+#      刷 gallery_total/gallery_index + 按计数切 panel draw_cb（有图画照片、
+#      无图画示例矢量）+ 刷 caption + Invalidate。app_create 与 app_show 共用。
+#   2) 新增 app_show() 调 gallery_refresh_state()，并在 PhoneApp_gallery 注册
+#      `.show = app_show` ⇒ **每次打开相册都按真实计数刷新**（根治病灶）。
+#   3) refresh_caption() 去掉冗余的 " 张卡上图片"（约 98px），caption 改为
+#      "NN / MM · 剩NK B" / " · 已满"（约 204px，余量充足、不再裁字）。
+# 三、验收（`python tools/gallery_clear_check.py`，新增脚本；上板实测）
+#   从**非空相册**（g_img_board_count=4）跑清空两段式：
+#     第一段点「清空」：g_img_qspi_rc 哨兵仍 0xDEAD ⇒ 没执行擦除（两段式成立）；
+#     第二段再点：g_img_qspi_rc=0x0 ⇒ 真擦了索引扇区；
+#     擦完 alive()（g_loop_count 持续自增）通过 ⇒ qspi_enter_mmap 生效、内核未卡死；
+#     退回桌面重进相册：g_img_board_count=0（示例态）。
+#   caption 视觉（build/g_clear_cap_before.png 人工核对）：实拍到
+#     "1 / 4 · 剩1772KB"，末字「B」完整、不再被裁 ← 修复确认。
+#   ⚠ 判据更正：主机 probe-rs 读 XIP 窗口 0x90000000 只报
+#     "Only supports RAM addresses" 并返回全 FF，**绝不能当判据**（曾误解析出
+#     "清空后仍有 6 张"的幻影）。改用片上权威计数 g_img_board_count +
+#     g_img_qspi_rc 哨兵 + alive() 三个确定性量。
+#
+# FLASH 1 647 056 B（78.54%），比第二十七版 +864 B。
+97969343c704b13698a330ae95cb4992eae0c0070133fbe08ad69d8611d20401  ymgui-h743.bin
+5016d784fe5c1dc4e0aec8c70acedc3b69189eef06e16ad3a1f8ffb224588fea  ymgui-h743.elf

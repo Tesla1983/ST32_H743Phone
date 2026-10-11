@@ -19,16 +19,21 @@
 typedef struct
 {
 	GYOBJ gallery_panel, gallery_caption;
-	GYOBJ btn_del;          /* 删除按钮（要改它的文字/底色做二次确认） */
+	GYOBJ btn_del;          /* 删除按钮（两段式二次确认） */
+	GYOBJ btn_clear;        /* 清空图库按钮（两段式二次确认） */
 	GYOBJ hint;             /* 图片下方那行提示（复用它显示"再点一次…"） */
 	int gallery_index;
 	int gallery_total;
 	int del_arm;            /* 1 = 删除已按过一次，等二次确认 */
+	int clear_arm;          /* 1 = 清空已按过一次，等二次确认 */
 } AppState;
 static AppState state;
 
 static void on_gallery(GYOBJ btn);
 static void on_delete(GYOBJ btn);
+static void on_clear(GYOBJ btn);
+static void gallery_refresh_state(void);   /* 按 QSPI 真实图库状态刷新 UI（首建 + 每次打开共用） */
+static void app_show(const char* argument); /* PhoneApp.show：打开相册时刷新计数，避免陈旧计数 */
 
 /* 删除按钮的两种外观（二次确认用：点一次变红并改字，再点才真删） */
 #define DEL_BTN_IDLE  RGB(147, 112, 136)
@@ -68,19 +73,29 @@ static void gallery_draw_photo(GYOBJ obj, GYSURFACE surface, const GYrect* area)
 	/* 取不到像素（例如导入中）：保持底色，不画花屏 */
 }
 
+/* 把 0..9999 的十进制无前导零（但 0 输出 "0"）写进 p，返回末尾指针。 */
+static char* put_uint(char* p, int v)
+{
+	int d = 1, t = v;
+	if (v == 0) { *p++ = '0'; return p; }
+	while (t >= 10) { d *= 10; t /= 10; }
+	while (d > 0) { *p++ = (char)('0' + v / d); v %= d; d /= 10; }
+	return p;
+}
+
 static void refresh_caption(void)
 {
-	static char buf[32];
+	static char buf[64];
 	if (state.gallery_total > 0)
 	{
 		/* 手工拼：本工程不引入 snprintf（省体积，也避免 newlib 的堆依赖）。
+		 * 中文必须整段写成字符串常量再 memcpy，绝不能逐字节写 `*p++ = '卡';`，
+		 * 否则多字节字符常量会被截断成非法字节（2026-10-08 实测）。
 		 *
-		 * ⚠ 中文部分**必须**整段写成字符串常量再 memcpy，绝不能逐字节写
-		 *   `*p++ = '卡';` —— 多字节字符常量（UTF-8 的"卡"= E5 8D A1）赋给 char
-		 *   只会留下**最低一个字节**（0xA1），把 UTF-8 序列截断成非法字节，
-		 *   YMGUI 的文本控件渲染出来就是残缺/空白。
-		 *   2026-10-08 实测踩到：相册页只显示出 "1 / 1"，"卡上图片"四个字整段不见。 */
-		static const char suffix[] = " 张卡上图片";
+		 * ⚠ 不再缀「 张卡上图片」（2026-10-11 上板实测）：caption 标签 276 px、
+		 *   title 字体（数字步进 17 / 空格 8），原串 "1 / 4 张卡上图片 · 剩1772KB"
+		 *   文本实测 ~294 px 超出标签 ⇒ 末尾单位 "B" 被**整字裁掉**，屏幕上只剩
+		 *   「剩1772K」。去掉 5 个汉字后 ~196 px，即便索引/总数都是 2 位也远 <276。 */
 		char* p = buf;
 		int   n = state.gallery_index + 1;
 		if (n >= 10) { *p++ = (char)('0' + n / 10); }
@@ -89,7 +104,27 @@ static void refresh_caption(void)
 		n = state.gallery_total;
 		if (n >= 10) { *p++ = (char)('0' + n / 10); }
 		*p++ = (char)('0' + (n % 10));
-		memcpy(p, suffix, sizeof(suffix));       /* 含结尾 '\0' */
+		*p = 0;                                  /* 先收尾：容量段取不到时也不留野字节 */
+
+		{
+			int fr = BoardGallery_FreeBytes();
+			if (fr >= 0)
+			{
+				if (fr < 1024)
+				{
+					/* 中文走字符串常量 + memcpy，安全 */
+					static const char full[] = " · 已满";
+					memcpy(p, full, sizeof(full));
+				}
+				else
+				{
+					static const char sep[] = " · 剩";
+					memcpy(p, sep, sizeof(sep)); p += sizeof(sep) - 1;
+					p = put_uint(p, fr / 1024);
+					*p++ = 'K'; *p++ = 'B'; *p = 0;
+				}
+			}
+		}
 		PhoneUI_text_set(state.gallery_caption, buf);
 	}
 }
@@ -101,13 +136,16 @@ static void next_of(int from)
 	state.gallery_index = (s < 0) ? 0 : s;
 }
 
-/* 把删除按钮恢复成常态（未按下）。切图、删完、删失败都要调它。 */
+/* 把删除 / 清空两个按钮都恢复成常态（解除二次确认）。切图、删完、清空完、删失败都要调它。 */
 static void delete_disarm(void)
 {
-	if (state.del_arm == 0) { return; }
+	if (state.del_arm == 0 && state.clear_arm == 0) { return; }
 	state.del_arm = 0;
+	state.clear_arm = 0;
 	PhoneUI_button_set(state.btn_del, "删除");
 	YMGUI_Obj_SetBgColor(state.btn_del, DEL_BTN_IDLE);
+	PhoneUI_button_set(state.btn_clear, "清空");
+	YMGUI_Obj_SetBgColor(state.btn_clear, DEL_BTN_IDLE);
 	PhoneUI_text_set(state.hint, "示例风景 / Yaomi 相册");
 }
 
@@ -119,10 +157,13 @@ static void on_delete(GYOBJ btn)
 
 	if (state.gallery_total <= 0) { return; }   /* 示例图模式：没有可删的真图 */
 
-	/* ---- 第一次按：只进入确认态，不动数据 ---- */
+	/* ---- 第一次按：只进入确认态，不动数据（同时解除清空确认态）---- */
 	if (state.del_arm == 0)
 	{
 		state.del_arm = 1;
+		state.clear_arm = 0;
+		PhoneUI_button_set(state.btn_clear, "清空");
+		YMGUI_Obj_SetBgColor(state.btn_clear, DEL_BTN_IDLE);
 		PhoneUI_button_set(state.btn_del, "确认删除?");
 		YMGUI_Obj_SetBgColor(state.btn_del, DEL_BTN_ARMED);
 		PhoneUI_text_set(state.hint, "再点一次删除当前这张");
@@ -162,12 +203,53 @@ static void on_delete(GYOBJ btn)
 	YMGUI_Obj_Invalidate(state.gallery_panel);
 }
 
+static void on_clear(GYOBJ btn)
+{
+	(void)btn;
+	int rc;
+
+	if (state.gallery_total <= 0) { return; }   /* 示例图模式：没有可清的真图 */
+
+	/* ---- 第一次按：只进入确认态，不动数据（同时解除删除确认态）---- */
+	if (state.clear_arm == 0)
+	{
+		state.clear_arm = 1;
+		state.del_arm = 0;
+		PhoneUI_button_set(state.btn_del, "删除");
+		YMGUI_Obj_SetBgColor(state.btn_del, DEL_BTN_IDLE);
+		PhoneUI_button_set(state.btn_clear, "确认清空?");
+		YMGUI_Obj_SetBgColor(state.btn_clear, DEL_BTN_ARMED);
+		PhoneUI_text_set(state.hint, "再点一次清空全部图片");
+		return;
+	}
+
+	/* ---- 第二次按：真清（擦索引扇区，数据区不擦）---- */
+	rc = BoardGallery_Clear();
+	state.clear_arm = 0;
+	PhoneUI_button_set(state.btn_clear, "清空");
+	YMGUI_Obj_SetBgColor(state.btn_clear, DEL_BTN_IDLE);
+
+	if (rc != 0)
+	{
+		PhoneUI_text_set(state.hint, rc == 1 ? "图库忙，稍后再试" : "清空失败");
+		return;
+	}
+
+	/* 清空成功：退回示例态（与删空同一套） */
+	state.gallery_total = 0;
+	state.gallery_index = 0;
+	state.gallery_panel->draw_cb = PhoneUI_gallery_draw;
+	PhoneUI_text_set(state.gallery_caption, "01 / 珊瑚");
+	PhoneUI_text_set(state.hint, "示例风景 / Yaomi 相册");
+	YMGUI_Obj_Invalidate(state.gallery_panel);
+}
+
 static void on_gallery(GYOBJ btn)
 {
 	(void)btn;
 	state.gallery_total = BoardGallery_Count();
 
-	delete_disarm();                    /* 切图 = 放弃删除，顺手解除确认态 */
+	delete_disarm();                    /* 切图 = 放弃删除 / 清空，顺手解除确认态 */
 
 	if (state.gallery_total <= 0)
 	{
@@ -191,29 +273,54 @@ static void on_gallery(GYOBJ btn)
 	YMGUI_Obj_Invalidate(state.gallery_panel);
 }
 
+/* 按 QSPI 真实图库状态刷新 UI（首建 + 每次打开共用）。
+ * ⚠ 必须每次打开都重算：打开 App 只显隐 view，.create 只在开机跑一次，
+ *   若在 .create 算一次就完事，计数会陈旧，使 on_clear/on_delete 的
+ *   `gallery_total<=0` 早退 —— 清空/删除功能直接失效。 */
+static void gallery_refresh_state(void)
+{
+	delete_disarm();                            /* 复位两段式确认态 */
+	state.gallery_total = BoardGallery_Count();
+	state.gallery_index = 0;
+
+	if (state.gallery_panel)
+		state.gallery_panel->draw_cb = (state.gallery_total > 0)
+		                               ? gallery_draw_photo
+		                               : PhoneUI_gallery_draw;
+
+	if (state.gallery_total > 0)
+		refresh_caption();
+	else
+		PhoneUI_text_set(state.gallery_caption, "01 / 珊瑚");
+
+	YMGUI_Obj_Invalidate(state.gallery_panel);
+}
+
+/* PhoneApp.show：打开相册时刷新计数（避免陈旧计数阻塞清空/删除） */
+static void app_show(const char* argument)
+{
+	(void)argument;
+	gallery_refresh_state();
+}
+
 static void app_create(GYOBJ view)
 {
 	state = (AppState){0};
 	PhoneUI_app_header(view, "相册", "收藏安静的风景");
-	state.gallery_total = BoardGallery_Count();
 
 	state.gallery_panel = PhoneUI_panel(view, 18, 65, 284, 230, RGB(196, 105, 113));
-	/* 有真图就用自己的绘制回调（从 XIP 取像素）；没有就用原来的矢量日落画 */
-	state.gallery_panel->draw_cb = (state.gallery_total > 0)
-	                               ? gallery_draw_photo
-	                               : PhoneUI_gallery_draw;
+	/* 默认给矢量日落画，刷新时再按真实计数决定是否切到 XIP 取像素的回调 */
+	state.gallery_panel->draw_cb = PhoneUI_gallery_draw;
 	state.gallery_panel->event_cb = NULL;
 	state.gallery_caption = PhoneUI_left_label(view, 22, 307, 276, "01 / 珊瑚", INK, 3);
 	state.hint = PhoneUI_left_label(view, 23, 345, 275, "示例风景 / Yaomi 相册", MUTED, 2);
-	/* 底部一行拆成两个：左"下一张"、右"删除"（各 138 宽 + 8 间距 = 284，与原单行等宽） */
-	PhoneUI_button(view, 18, 373, 138, 34, "下一张 >", on_gallery, RGB(147, 112, 136));
-	state.btn_del = PhoneUI_button(view, 164, 373, 138, 34, "删除", on_delete, DEL_BTN_IDLE);
+	/* 底部一行拆成三个：左"下一张"、中"删除"、右"清空"
+	 * （各 88 宽 + 10 间距 ×2：18→106→116→204→214→302，正好铺满 284） */
+	PhoneUI_button(view, 18, 373, 88, 34, "下一张", on_gallery, RGB(147, 112, 136));
+	state.btn_del = PhoneUI_button(view, 116, 373, 88, 34, "删除", on_delete, DEL_BTN_IDLE);
+	state.btn_clear = PhoneUI_button(view, 214, 373, 88, 34, "清空", on_clear, DEL_BTN_IDLE);
 
-	if (state.gallery_total > 0)
-	{
-		state.gallery_index = 0;
-		refresh_caption();
-	}
+	gallery_refresh_state();                     /* 按真实计数刷新面板绘制回调 / 下标 / 计数 */
 }
 
 static void app_destroy(void)
@@ -235,4 +342,4 @@ static intptr_t app_inspect(const char* name, int index)
 }
 
 const PhoneApp PhoneApp_gallery = {
-	.key = "gallery", .title = "相册", .color = RGB(239, 165, 72), .icon = ICON_GALLERY, .create = app_create, .inspect = app_inspect, .destroy = app_destroy};
+	.key = "gallery", .title = "相册", .color = RGB(239, 165, 72), .icon = ICON_GALLERY, .create = app_create, .show = app_show, .inspect = app_inspect, .destroy = app_destroy};

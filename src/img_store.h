@@ -237,6 +237,13 @@ const void *img_store_pixels(uint32_t slot);
  *   代价大且需长时间关映射，对"最多 256 张、总量 2 MB"的相册不划算。 */
 int  img_store_delete(uint32_t slot);
 
+/* 当前还能存下的单张最大图字节数（空洞优先分配下 = 最大连续空闲块）；
+ * -1 = 导入中（XIP 不可读）。相册 UI 用它显示剩余容量 / 已满。 */
+int  img_store_free_bytes(void);
+
+/* 清空整本图库（擦索引扇区，数据区不擦）。返回 0=成功；1=忙；3=flash 失败。 */
+int  img_store_clear(void);
+
 /* 从 from 开始找下一个有效槽位（含 from 自身，回绕一圈）；没有返回 -1。 */
 int  img_store_next_valid(int from);
 

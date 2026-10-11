@@ -75,6 +75,13 @@ int         BoardGallery_Delete(int slot, int *next_valid);
  *   一旦有人删过中间的图，索引就会出现空洞，取模算法会落在空槽上（画面空白）。 */
 int         BoardGallery_Next(int from);
 
+/* 当前还能存下的单张最大图字节数；-1 = 导入中（XIP 不可读）。
+ * 相册 UI 拿它显示「剩余容量」或「已满」。 */
+int         BoardGallery_FreeBytes(void);
+
+/* 清空整本图库（两段式确认在 UI 层做）。返回 0=成功；1=忙；3=flash 失败。 */
+int         BoardGallery_Clear(void);
+
 /* ---- 文件管理器：照片 / 笔记分类的真实文件（2026-10-09）----
  * 同一套分层（不让 phone_shell 认识 FatFs）。
  *
