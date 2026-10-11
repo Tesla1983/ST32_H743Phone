@@ -73,13 +73,15 @@ SDL_VIDEODRIVER=dummy build/rgb565/project_Demo/phone_shell/phone_shell --selfte
 
 `--home-menu` / `--home-drag` 可预览长按菜单与拖拽中途。自检覆盖长按不误开、同页与跨页移动、取消恢复、新位置启动、信息弹窗、卸载取消/确认/快照释放/拒绝打开及恢复入口。
 
-![桌面长按](../../docs/shots/phone_shell_home-menu.png) ![桌面拖动](../../docs/shots/phone_shell_home-drag.png)
+![桌面长按](../../docs/shots/phone_shell_home-menu.png)
+
+![桌面拖动](../../docs/shots/phone_shell_home-drag.png)
 
 ## 统一输入法
 
 默认 `YAOMI_IME=ON`。笔记标题/正文、设备名称、号码、短信、搜索和示例地址栏共用一套底部键盘：点击/聚焦输入框自动弹出，切换输入框重新定位输入目标并清空未提交拼音；按返回先收键盘，再按返回才离开应用。进入后台/桌面、打开关机面板、隐藏或销毁输入目标都会解除输入法。软键按下/取消不丢焦点，点击拼音栏也不会关闭键盘。
 
-底行依次为「符号 / 123 / 空格 / 中英 / 回车」。「符号」打开独立分类页，与桌面输入法共用 [ime_symbols.h](../chinese_ime/ime_symbols.h)：常用、数学、角标、序号、希腊、拼音、箭头七类共 489 项，另有 72 项英文常用符号；每页 3×5 项、两行分类键，末页隐藏空位。符号页的 `< >` 用于符号翻页，中英键切换常用符号表并回第一页，ABC 返回字母键盘；打开符号页先提交未完成拼音的首候选。`123` 独立保留快捷数字/标点输入。
+底行依次为「符号 / 123 / 空格 / 中英 / 回车」。「符号」打开独立分类页，与桌面输入法共用 [ime\_symbols.h](../chinese_ime/ime_symbols.h)：常用、数学、角标、序号、希腊、拼音、箭头七类共 489 项，另有 72 项英文常用符号；每页 3×5 项、两行分类键，末页隐藏空位。符号页的 `< >` 用于符号翻页，中英键切换常用符号表并回第一页，ABC 返回字母键盘；打开符号页先提交未完成拼音的首候选。`123` 独立保留快捷数字/标点输入。
 
 普通候选栏没有未提交拼音时，右侧合为「收起」；有拼音时显示 `< >` 翻页（即使尚无匹配候选也不变成收起）。回车先上屏当前页首选词，无候选时上屏原拼音，再执行多行换行或单行提交；多行框保持键盘打开。输入框已有文字不会妨碍收起，判断依据仅为未提交拼音。`--ime` 预览候选状态，`--ime-idle` 预览收起状态，`--symbols` 预览分类符号。
 
@@ -87,7 +89,7 @@ SDL_VIDEODRIVER=dummy build/rgb565/project_Demo/phone_shell/phone_shell --selfte
 
 服务实现在 `phone_ime.c/.h`，不是给 Notes 写死的键盘：各 APP 包含公共 `phone_ui.h` 时已统一启用 `PHONE_IME_AUTO_INPUTS`，常规 `YMGUI_Creat_TextInput_Creat` / `YMGUI_Creat_EditView_Creat` 自动经过服务创建入口，新输入框无需再写弹出逻辑。其他源文件可采用相同入口或显式使用 `PhoneIME_TextInput/EditView`。服务保留原生私有数据/事件，包装析构以安全注销。每帧调用 `PhoneIME_Update`，销毁 context 前调用 `PhoneIME_Shutdown`。服务当前是应用级单 context 实例，使用全局按键过滤器，不改变 YMGUI 核心及其他应用的默认行为。
 
-候选引擎已从原桌面输入法抽为共用的 [ime_candidates.inc](../chinese_ime/ime_candidates.inc)，两种界面使用同一实现而非复制两套算法。保留原词典模式，手机首版只加载中文单字/词组，不加载英文联想词库。中文单字、词组和字模约 2.7 MB；词典整文件及索引驻 RAM，不是流式查询。缺词典可降级为原样拼音/英文直接输入；字模默认通过构建时的源码路径读取，部署时需安排资源路径，尚未验收 Android 打包。
+候选引擎已从原桌面输入法抽为共用的 [ime\_candidates.inc](../chinese_ime/ime_candidates.inc)，两种界面使用同一实现而非复制两套算法。保留原词典模式，手机首版只加载中文单字/词组，不加载英文联想词库。中文单字、词组和字模约 2.7 MB；词典整文件及索引驻 RAM，不是流式查询。缺词典可降级为原样拼音/英文直接输入；字模默认通过构建时的源码路径读取，部署时需安排资源路径，尚未验收 Android 打包。
 
 输入法和动效独立裁剪：
 
@@ -113,24 +115,68 @@ cmake -S project_Demo/phone_shell -B build/checks/phone-noime -DYAOMI_IME=OFF
 
 `--shade` / `--screenshot` 提供控制中心与截屏预览，`--shade-clear-mid` / `--shade-clear-done` 查看通知右滑中途/清空结果。回归覆盖下拉取消/收起、设置同步、飞行联动、静音开关、通知跳转/清空、截屏像素与底层一致性；面板过渡加入局部刷新/完整重绘比较。
 
-![通知右滑中途](../../docs/shots/phone_shell_shade-clear-mid.png) ![通知清空](../../docs/shots/phone_shell_shade-clear-done.png)
+![通知右滑中途](../../docs/shots/phone_shell_shade-clear-mid.png)
 
-![控制中心](../../docs/shots/phone_shell_shade.png) ![截屏预览](../../docs/shots/phone_shell_screenshot.png)
+![通知清空](../../docs/shots/phone_shell_shade-clear-done.png)
 
-![中文输入](../../docs/shots/phone_shell_ime.png) ![键盘空闲](../../docs/shots/phone_shell_ime-idle.png) ![分类符号](../../docs/shots/phone_shell_symbols.png)
+![控制中心](../../docs/shots/phone_shell_shade.png)
 
-![左右散开中途](../../docs/shots/phone_shell_clear-mid.png) ![清理后](../../docs/shots/phone_shell_clear-done.png)
+![截屏预览](../../docs/shots/phone_shell_screenshot.png)
 
-![开机](../../docs/shots/phone_shell_boot.png) ![桌面](../../docs/shots/phone_shell.png) ![任务应用](../../docs/shots/phone_shell_tasks.png) ![最近任务](../../docs/shots/phone_shell_recents.png) ![关机](../../docs/shots/phone_shell_power.png)
+![中文输入](../../docs/shots/phone_shell_ime.png)
 
-![音乐](../../docs/shots/phone_shell_music.png) ![设置](../../docs/shots/phone_shell_settings.png) ![关机确认](../../docs/shots/phone_shell_dialog.png)
+![键盘空闲](../../docs/shots/phone_shell_ime-idle.png)
 
-![第二页桌面](../../docs/shots/phone_shell_home2.png) ![时钟](../../docs/shots/phone_shell_clock.png) ![天气](../../docs/shots/phone_shell_weather.png) ![便签](../../docs/shots/phone_shell_notes.png) ![计算器](../../docs/shots/phone_shell_calculator.png)
+![分类符号](../../docs/shots/phone_shell_symbols.png)
+
+![左右散开中途](../../docs/shots/phone_shell_clear-mid.png)
+
+![清理后](../../docs/shots/phone_shell_clear-done.png)
+
+![开机](../../docs/shots/phone_shell_boot.png)
+
+![桌面](../../docs/shots/phone_shell.png)
+
+![任务应用](../../docs/shots/phone_shell_tasks.png)
+
+![最近任务](../../docs/shots/phone_shell_recents.png)
+
+![关机](../../docs/shots/phone_shell_power.png)
+
+![音乐](../../docs/shots/phone_shell_music.png)
+
+![设置](../../docs/shots/phone_shell_settings.png)
+
+![关机确认](../../docs/shots/phone_shell_dialog.png)
+
+![第二页桌面](../../docs/shots/phone_shell_home2.png)
+
+![时钟](../../docs/shots/phone_shell_clock.png)
+
+![天气](../../docs/shots/phone_shell_weather.png)
+
+![便签](../../docs/shots/phone_shell_notes.png)
+
+![计算器](../../docs/shots/phone_shell_calculator.png)
 
 ![第三页应用桌面](../../docs/shots/phone_shell_home3.png)
 
-![电话](../../docs/shots/phone_shell_phone.png) ![短信](../../docs/shots/phone_shell_messages.png) ![通讯录](../../docs/shots/phone_shell_contacts.png) ![录音机](../../docs/shots/phone_shell_recorder.png)
+![电话](../../docs/shots/phone_shell_phone.png)
 
-![文件管理器](../../docs/shots/phone_shell_files.png) ![陀螺仪](../../docs/shots/phone_shell_gyroscope.png) ![相机](../../docs/shots/phone_shell_camera.png) ![浏览器](../../docs/shots/phone_shell_browser.png)
+![短信](../../docs/shots/phone_shell_messages.png)
 
-![相机演示弹窗](../../docs/shots/phone_shell_camera-dialog.png) ![浏览器演示弹窗](../../docs/shots/phone_shell_browser-dialog.png)
+![通讯录](../../docs/shots/phone_shell_contacts.png)
+
+![录音机](../../docs/shots/phone_shell_recorder.png)
+
+![文件管理器](../../docs/shots/phone_shell_files.png)
+
+![陀螺仪](../../docs/shots/phone_shell_gyroscope.png)
+
+![相机](../../docs/shots/phone_shell_camera.png)
+
+![浏览器](../../docs/shots/phone_shell_browser.png)
+
+![相机演示弹窗](../../docs/shots/phone_shell_camera-dialog.png)
+
+![浏览器演示弹窗](../../docs/shots/phone_shell_browser-dialog.png)
