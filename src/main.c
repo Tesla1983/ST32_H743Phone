@@ -58,6 +58,17 @@
 #include "img_store.h"
 #include "uart_link.h"
 #include "rtc_clock.h"
+
+/* ⚠ 2026-10-12 起 es8311 驱动是**常驻**的（音量滑杆 + 音乐播放都要用），
+ * 不再是 YMGUI_AUDIO_TEST 的附属品 —— 只有 audio_test.c（SWD 自检）还受那个开关管。 */
+#include "es8311.h"
+#include "audio_out.h"
+#include "wav_play.h"
+#if defined(YMGUI_AUDIO_TEST)
+/* ES8311 音频链路自检（方案 A 验收）：默认不编译，见 CMakeLists 的
+ * YMGUI_AUDIO_TEST 与 src/audio_test.h 顶部的触发/判据说明。 */
+#include "audio_test.h"
+#endif
 #include "spi_link.h"
 #include "bt_recv.h"
 #include "app_config.h"
@@ -69,6 +80,13 @@
  *   读回来是空；加 __attribute__((retain)) 在本机 ld 上也无效）。
  *   运行时写一次即让 main 引用它，段自然保留；语义也更准（= main 已进入）。 */
 volatile uint32_t g_boot_magic = 0;
+/* UI 音量的**唯一权威值**（0..100，出厂 70）。
+ * 为什么单独放一个全局量而不是只读 AppConfig_GetVolume()：es8311.c 不认识
+ * app_config（与 phone_shell 那边"库侧不许 include src/"同一套分层），
+ * 它起播时要拿到当前音量 ⇒ 只能读这里的镜像。
+ * ⚠ 必须与 AppConfig_GetVolume() 同源：开机在这里同步一次，之后由
+ *   app_volume_persist（音量滑杆松手）两边一起更新。 */
+volatile uint32_t g_audio_volume = 70;
 volatile uint32_t g_loop_count = 0;
 volatile uint32_t g_lcd_id     = 0;
 volatile int32_t  g_port_rc    = 99;          /* ymgui_port_init 的返回值，0 = 成功 */
@@ -576,6 +594,27 @@ static void app_brightness_persist(uint8_t brightness)
     AppConfig_Save();
 }
 
+/* 音量持久化回调（2026-10-12 新增，第四份同构桥）。
+ *
+ * 与亮度完全同款：滑杆拖动过程中会连续回调，但 AppConfig_SetVolume 内有
+ * "值相同则不写"、AppConfig_Save 内有整块 memcmp ⇒ 实际擦写只在最终值上。
+ *
+ * ⚠⚠ 与亮度唯一的差别：这里**还要顺手把音量写进 ES8311**（REG32），
+ *   让拖动过程即时可听 —— 而 ES8311 驱动只在 YMGUI_AUDIO_TEST=ON 时才编进来
+ *   （出货形态没有 I2C1/SPI 资源占用），所以那句必须条件编译。
+ *   es8311_set_volume_ui 内部有"codec 未初始化就直接返回"的守卫，
+ *   所以在没跑过自检、codec 还没起来的构建里调它只是空转，不会污染 I2C 计数。 */
+static void app_volume_persist(uint8_t volume)
+{
+    g_audio_volume = (uint32_t)volume;
+    AppConfig_SetVolume((uint32_t)volume);
+    AppConfig_Save();
+    /* 顺手把音量写进 ES8311（REG32）：拖动过程即时可听。
+     * es8311_set_volume_ui 内部有"codec 没起来就不动总线"的守卫，
+     * 所以没接模块 / 还没开始播放时调它只是空转，不会污染 I2C 失败计数。 */
+    (void)es8311_set_volume_ui((uint32_t)volume);
+}
+
 /* 注：阶段 2/3 的"最小界面 + 按钮点击计数"已被 phone_shell 取代，
  * 原来的 g_click_cnt / on_click 一并删除（否则是引用不到的死代码）。
  * 阶段 5 的交互证据改为"抓屏序列"：开机 → 桌面 → 打开应用 → 最近任务。 */
@@ -645,6 +684,14 @@ int main(void)
      * PhoneHost_SetBrightness 的"值相同直接 return"会把它挡掉，不触发落盘。 */
     PhoneHost_SetBrightness((int)AppConfig_GetBrightness());
     PhoneShell_SetBrightnessPersistCallback(app_brightness_persist);
+
+    /* 音量：出厂默认 70（用户可在控制中心调），同样必须在 PhoneShell_BoardInit
+     * **之前**应用 —— 那之后 codec 一旦起播就会读 g_audio_volume。
+     * ⚠ 顺序：先灌 g_audio_volume 镜像，再走 PhoneHost_SetVolume（后者值相同
+     *   会直接 return，不会触发落盘回调，靠的就是开机 dirty=0 那条判据）。 */
+    g_audio_volume = AppConfig_GetVolume();
+    PhoneHost_SetVolume((int)AppConfig_GetVolume());
+    PhoneShell_SetVolumePersistCallback(app_volume_persist);
 
     PhoneLocale_SetExternalFontReady((int)g_font_ok);
     PhoneLocale_Init();
@@ -996,6 +1043,24 @@ int main(void)
          * 用真实 DMA（DMA1 MEM2MEM）验证"CPU→DMA 通、DMA→CPU 需 invalidate"，
          * 为引入 TF 卡 / 任何 DMA 外设之前先把这条风险量清楚。见 src/dma_bench.c。 */
         run_dma_bench();
+
+#if defined(YMGUI_AUDIO_TEST)
+        /* ES8311 音频链路自检：写 g_audio_test=1 触发（I2C 扫描+读 ID，不出声），
+         * =2 触发全链路提示音（阻塞约 1.2 s）。默认不编译，见 audio_test.h。 */
+        audio_test_poll();
+#endif
+
+        /* 内置正弦自检：写 g_ao_demo=1 触发 3 秒 977 Hz（不依赖 TF 卡）。
+         * 用来单验"codec + I2S + DMA"这条出声链路，与卡/文件无关。 */
+        if (g_ao_demo != 0u)
+        {
+            g_ao_demo = 0u;
+            (void)audio_out_demo_start();
+        }
+
+        /* 音乐播放：驱动 I2S 的 DMA 补数（从 TF 卡读下一段）+ 播完自动收尾。
+         * ⚠ 必须每拍调：半缓冲只有 42 ms，漏一拍以上就会听到卡顿。 */
+        wav_play_tick();
 
         /* 亮度 → 背光 PWM 桥（步骤 2a 硬件版）。
          *

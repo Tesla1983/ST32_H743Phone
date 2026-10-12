@@ -15,27 +15,27 @@
 
 YMGUI 是嵌入式 / 裸机优先的保留模式 GUI：C99 + GNU 扩展、软件光栅化、对象树、脏矩形和分块刷新。桌面端以 SDL 模拟 LCD；核心不依赖 SDL、GPU 或 OS 消息泵。视频剪辑器等应用可以有独立的语言、平台和外部依赖要求。
 
-| 目录 | 放什么 / 什么时候读 |
-| --- | --- |
-| `YMGUI/CONFIG/` | 公共类型、像素格式、功能宏、内存适配；改色深或移植内存时读 |
-| `YMGUI/DEBUG/` | 断言和日志；错误处理时读 |
-| `YMGUI/COMMON/` | 纯几何、Q15 三角查表；不依赖控件的算法 |
-| `YMGUI/OPOBJ/` | 对象树、上下文、创建 / 释放、顶层容器 |
-| `YMGUI/CORE/` | 对 surface 画填充、文字、线、图片、圆弧；字体数据 |
-| `YMGUI/GUI/` | 失效、刷新、事件、焦点、一次性布局 |
-| `YMGUI/ANIM/` | context 级属性补间；移动、尺寸、颜色、滚动、通用整数值与外部缓动后端 |
-| `YMGUI/HAL/` | 显示、输入、Tick、剪贴板的接口 |
-| `YMGUI/WIDGET/` | 控件及其私有数据和回调 |
-| `YMGUI/STATE/` | subject、observer 和控件绑定 |
-| `YMGUI/PLUGIN/` | 静态插件注册、生命周期和可选动态加载 |
-| `SDL_LCD/` | 桌面 / Android 的显示和输入桥接 |
-| `sdk/` | 独立 lib 包的构建、CMake 接入、最小示例与手册；产物在 `build/sdk/YMGUI_libs/` |
-| `releases/` | 随仓库提交的压缩包和校验文件；用 `./sdk/build.sh --release` 更新，勿误认为 `build/` 产物已经入库 |
-| `Demo/` | 单控件和机制的用法示例，由根 CMake 构建 |
-| `project_Demo/` | 独立应用，每个子目录单独配置 / 构建 |
-| `extern_lib/` | **供 project_Demo 应用按需使用的第三方依赖**，如 FFmpeg；产物放到对应 build 目录 |
-| `tests/` | 核心行为规格；修改机制时找对应断言 |
-| `tools/` | 字库生成、资源校验、文档检查和构建矩阵 |
+| 目录              | 放什么 / 什么时候读                                                         |
+| --------------- | ------------------------------------------------------------------- |
+| `YMGUI/CONFIG/` | 公共类型、像素格式、功能宏、内存适配；改色深或移植内存时读                                       |
+| `YMGUI/DEBUG/`  | 断言和日志；错误处理时读                                                        |
+| `YMGUI/COMMON/` | 纯几何、Q15 三角查表；不依赖控件的算法                                               |
+| `YMGUI/OPOBJ/`  | 对象树、上下文、创建 / 释放、顶层容器                                                |
+| `YMGUI/CORE/`   | 对 surface 画填充、文字、线、图片、圆弧；字体数据                                       |
+| `YMGUI/GUI/`    | 失效、刷新、事件、焦点、一次性布局                                                   |
+| `YMGUI/ANIM/`   | context 级属性补间；移动、尺寸、颜色、滚动、通用整数值与外部缓动后端                              |
+| `YMGUI/HAL/`    | 显示、输入、Tick、剪贴板的接口                                                   |
+| `YMGUI/WIDGET/` | 控件及其私有数据和回调                                                         |
+| `YMGUI/STATE/`  | subject、observer 和控件绑定                                              |
+| `YMGUI/PLUGIN/` | 静态插件注册、生命周期和可选动态加载                                                  |
+| `SDL_LCD/`      | 桌面 / Android 的显示和输入桥接                                               |
+| `sdk/`          | 独立 lib 包的构建、CMake 接入、最小示例与手册；产物在 `build/sdk/YMGUI_libs/`            |
+| `releases/`     | 随仓库提交的压缩包和校验文件；用 `./sdk/build.sh --release` 更新，勿误认为 `build/` 产物已经入库 |
+| `Demo/`         | 单控件和机制的用法示例，由根 CMake 构建                                             |
+| `project_Demo/` | 独立应用，每个子目录单独配置 / 构建                                                 |
+| `extern_lib/`   | **供 project_Demo 应用按需使用的第三方依赖**，如 FFmpeg；产物放到对应 build 目录            |
+| `tests/`        | 核心行为规格；修改机制时找对应断言                                                   |
+| `tools/`        | 字库生成、资源校验、文档检查和构建矩阵                                                 |
 
 新增业务逻辑放应用层：Canvas 不负责图层融合，Grid 不解析电子表格公式，BarChart 不计算音频频谱，Image 不解码视频。需要多个应用共用的 GUI 行为再提炼到库；平台调用放 HAL 后端或应用桥接。核心移植范围是 `YMGUI/`，不需携带 `extern_lib/`。
 
@@ -43,25 +43,25 @@ YMGUI 是嵌入式 / 裸机优先的保留模式 GUI：C99 + GNU 扩展、软件
 
 当前有 27 个具名控件，另有 base 容器。所有控件头文件均在 [WIDGET](../YMGUI/WIDGET)，以下按任务查找。
 
-| 需求 | 控件 / 机制 | 使用提示 |
-| --- | --- | --- |
-| 简单文字、按钮、图标操作 | Label、Button | Label 适合短文本；Button 可显示图片、关闭背景、按住连发 |
-| 表单与数值输入 | Checkbox、Switch、Slider | Slider 目前只验收水平实现；先设范围再设值 / 绑定 |
-| 状态和仪表 | Bar、Arc、Spinner、Meter | Bar 显示进度；Spinner 依赖 Tick |
-| 二维方向输入 | Joystick | 死区、圆形限位、松手回中 / 保持、可自定义皮肤 |
-| 单行输入 | TextInput | UTF-8 光标 / 选区 / 剪贴板；创建时给容量 |
-| 多行编辑 | EditView | 插入、选区、撤销、查找替换、折行和内边距 |
-| 多行只读说明 / 日志 | TextView | 支持分行、折行和滚动；长文本别硬塞进 Label |
-| 列表、下拉选项、滚轮选择 | List、Dropdown、Roller | Dropdown 用 top_layer；Roller 可吸附并平滑滚动 |
-| 表格、树形导航、分页 | Table、Grid、TreeView、Tabview | Table 偏行展示；Grid 支持单元格选区；TreeView 支持懒加载 |
-| 趋势 / 柱状图 | Chart、BarChart | 应用侧提供数据；BarChart 支持峰值顶标 |
-| 图片 / 视频帧 | Image | `GY_IMG_NONE` 原尺寸；`GY_IMG_FIT` 保持比例；`GY_IMG_FILL` 拉伸铺满 |
-| 画布和取色 | Canvas、ColorPicker | Canvas 自持像素、整数缩放 / 平移；图层与绘画工具在应用侧 |
-| 消息确认 / 文件选择 | MsgBox、FileDialog | 使用异步结果回调；FileDialog 需注入文件系统实现；可用 SetTranslator 翻译界面文案 |
-| 特殊视图 / 时间线 | base + `draw_cb` / `event_cb` | 复用图元和事件捕获，应用自己保存模型 |
-| 多控件同步 | subject / bind | Label、Bar、Arc、Meter 单向；Slider、Switch、Checkbox、TextInput 双向 |
-| UI 过渡和反馈 | ANIM | 用 MoveTo/ResizeTo/BgColorTo/ValueTo；同属性新动画会替换旧动画；不用时可设 `YMGUI_ANIM=OFF` 裁剪 |
-| 扩展模块 | PLUGIN | 静态注册适合固件；动态插件通过宿主函数表使用 UI |
+| 需求           | 控件 / 机制                       | 使用提示                                                                       |
+| ------------ | ----------------------------- | -------------------------------------------------------------------------- |
+| 简单文字、按钮、图标操作 | Label、Button                  | Label 适合短文本；Button 可显示图片、关闭背景、按住连发                                         |
+| 表单与数值输入      | Checkbox、Switch、Slider        | Slider 目前只验收水平实现；先设范围再设值 / 绑定                                              |
+| 状态和仪表        | Bar、Arc、Spinner、Meter         | Bar 显示进度；Spinner 依赖 Tick                                                   |
+| 二维方向输入       | Joystick                      | 死区、圆形限位、松手回中 / 保持、可自定义皮肤                                                   |
+| 单行输入         | TextInput                     | UTF-8 光标 / 选区 / 剪贴板；创建时给容量                                                 |
+| 多行编辑         | EditView                      | 插入、选区、撤销、查找替换、折行和内边距                                                       |
+| 多行只读说明 / 日志  | TextView                      | 支持分行、折行和滚动；长文本别硬塞进 Label                                                   |
+| 列表、下拉选项、滚轮选择 | List、Dropdown、Roller          | Dropdown 用 top_layer；Roller 可吸附并平滑滚动                                       |
+| 表格、树形导航、分页   | Table、Grid、TreeView、Tabview   | Table 偏行展示；Grid 支持单元格选区；TreeView 支持懒加载                                     |
+| 趋势 / 柱状图     | Chart、BarChart                | 应用侧提供数据；BarChart 支持峰值顶标                                                    |
+| 图片 / 视频帧     | Image                         | `GY_IMG_NONE` 原尺寸；`GY_IMG_FIT` 保持比例；`GY_IMG_FILL` 拉伸铺满                     |
+| 画布和取色        | Canvas、ColorPicker            | Canvas 自持像素、整数缩放 / 平移；图层与绘画工具在应用侧                                          |
+| 消息确认 / 文件选择  | MsgBox、FileDialog             | 使用异步结果回调；FileDialog 需注入文件系统实现；可用 SetTranslator 翻译界面文案                      |
+| 特殊视图 / 时间线   | base + `draw_cb` / `event_cb` | 复用图元和事件捕获，应用自己保存模型                                                         |
+| 多控件同步        | subject / bind                | Label、Bar、Arc、Meter 单向；Slider、Switch、Checkbox、TextInput 双向                 |
+| UI 过渡和反馈     | ANIM                          | 用 MoveTo/ResizeTo/BgColorTo/ValueTo；同属性新动画会替换旧动画；不用时可设 `YMGUI_ANIM=OFF` 裁剪 |
+| 扩展模块         | PLUGIN                        | 静态注册适合固件；动态插件通过宿主函数表使用 UI                                                  |
 
 暂未提供持续约束布局、通用 flex/grid 布局引擎、Dropdown / Table 索引绑定、FileDialog 内建复制粘贴或删除。不要把应用已经实现的能力误写成核心控件 API。
 
@@ -149,7 +149,7 @@ SDL_VIDEODRIVER=dummy ./build/rgb565/project_Demo/my_app/my_app 30
 ./build/rgb565/project_Demo/my_app/my_app
 ```
 
-`dummy` 用于无头验证；最后一条打开真实窗口。模板以 RGB565 / RGB888 验证，内存紧张的目标可按实际屏幕和色深调整 buffer。完整交互示例见 [demo_button.c](../Demo/demo_button.c) 和 [demo_bind.c](../Demo/demo_bind.c)。
+`dummy` 用于无头验证；最后一条打开真实窗口。模板以 RGB565 / RGB888 验证，内存紧张的目标可按实际屏幕和色深调整 buffer。完整交互示例见 [demo\_button.c](../Demo/demo_button.c) 和 [demo\_bind.c](../Demo/demo_bind.c)。
 
 ## 5. 常用技巧与生命周期
 
@@ -191,7 +191,7 @@ TextInput / EditView 有聚焦和编辑两种状态；程序设置焦点不一�
 
 ### 中文、图片与色深
 
-中文源码用 UTF-8；内建 CJK 只覆盖精简字集，不能假定所有汉字都有字模。完整 GB2312 和扩展符号使用 [demo_font_gb2312.c](../Demo/demo_font_gb2312.c) 的运行期字体回退方式，读取 `tools/gb2312_glyphs.bin`。字体对象、读取回调和数据源要保持存活，退出时解除回退再关闭数据源。新增字形需同步生成字模和码点索引，并运行资源校验。
+中文源码用 UTF-8；内建 CJK 只覆盖精简字集，不能假定所有汉字都有字模。完整 GB2312 和扩展符号使用 [demo\_font\_gb2312.c](../Demo/demo_font_gb2312.c) 的运行期字体回退方式，读取 `tools/gb2312_glyphs.bin`。字体对象、读取回调和数据源要保持存活，退出时解除回退再关闭数据源。新增字形需同步生成字模和码点索引，并运行资源校验。
 
 `GYcolor` 是 API 的 ARGB 颜色，`GYpx` 是当前色深的存储格式。用 `GY_ARGB` 造颜色，需写原生像素时用 `GY_ColorToPx`；RGB888 的 `GYpx` 是三字节结构，不能统一按 `uint16_t` 或整数比较处理。编译库、应用和插件必须使用相同色深。
 
@@ -207,15 +207,15 @@ ctest --test-dir build/rgb565/Demo --output-on-failure
 
 针对机制可选测，例如 `ctest --test-dir build/rgb565/Demo -R 'test_(event|focus|bind)$' --output-on-failure`；需先构建对应测试可执行文件。改应用则重新构建该应用的独立目录，并运行它自己的测试 / 自测与启动检查。
 
-| 入口 | 范围 |
-| --- | --- |
-| `tools/check_repo.sh` | 文档链接、资源一致性、计数和 diff 空白检查；不编译 |
-| `tools/test.sh --depth 16` | 根工程单色深构建与测试，默认 `build/rgb565/Demo` |
-| `tools/test_matrix.sh` | 根工程 RGB565 + RGB888；`--all-depths` 加入 1 / 8 bpp |
-| `tools/test_anim_interactions.sh` | RGB565 / RGB888 动画核心和七个交互场景的重复操作/手势自检 |
-| `./sdk/build.sh` | 原生 Linux 二进制 SDK，双色深核心 / 可选 SDL 库及脱离源码的接入验证 |
-| `./build_all.sh` | 按色深分组构建 Demo 和完整应用；默认 RGB565，`--depth 24` 跳过 video_stidio；`-t` 跑根工程 CTest |
-| `./capture_shots.sh` | 从统一构建目录批量截图；`--depth` 选择色深，`--output` 指定验证输出目录 |
+| 入口                                | 范围                                                                        |
+| --------------------------------- | ------------------------------------------------------------------------- |
+| `tools/check_repo.sh`             | 文档链接、资源一致性、计数和 diff 空白检查；不编译                                              |
+| `tools/test.sh --depth 16`        | 根工程单色深构建与测试，默认 `build/rgb565/Demo`                                        |
+| `tools/test_matrix.sh`            | 根工程 RGB565 + RGB888；`--all-depths` 加入 1 / 8 bpp                           |
+| `tools/test_anim_interactions.sh` | RGB565 / RGB888 动画核心和七个交互场景的重复操作/手势自检                                     |
+| `./sdk/build.sh`                  | 原生 Linux 二进制 SDK，双色深核心 / 可选 SDL 库及脱离源码的接入验证                               |
+| `./build_all.sh`                  | 按色深分组构建 Demo 和完整应用；默认 RGB565，`--depth 24` 跳过 video_stidio；`-t` 跑根工程 CTest |
+| `./capture_shots.sh`              | 从统一构建目录批量截图；`--depth` 选择色深，`--output` 指定验证输出目录                            |
 
 像素、字体、渲染等通用变化应覆盖 RGB565 / RGB888；修改裁减路径再验证相关宏或其他色深。每种色深用独立 build 目录，勿覆盖另一种 ABI 的产物。功能开关定义在 [PubDefine](../YMGUI/CONFIG/YMGUI_PubDefine.h)，像素类型在 [PubType](../YMGUI/CONFIG/YMGUI_PubType.h)。`-DYMGUI_COLOR_DEPTH=24` 是已接入的 CMake 变量；其他头文件宏并非都能直接作为 CMake 参数，先查 CMake 是否会传给编译器。裁减控件时应用也要避开被裁掉的调用。
 
@@ -224,6 +224,8 @@ ctest --test-dir build/rgb565/Demo --output-on-failure
 应用特例：
 
 - `chinese_ime` 的字词库有独立 EXTERNAL / EMBEDDED / OFF 等选项和自测，具体以其 [README](../project_Demo/chinese_ime/README.md) 与 CMake 为准。
+
+
 - `music_studio` 是中文音乐制作应用，仅桌面 Linux / RGB565 / RGB888；模型、音频与界面分层，导入需 FFmpeg CLI，内置播放和 WAV 导出仅用 SDL / libm。独立构建目录中运行 2 项 CTest 或 `--selftest`，详见其 [架构与 AI 说明](../project_Demo/music_studio/ARCHITECTURE.md)。
 - 修改音乐工坊钢琴/轨道交互前，先读 [编辑操作指南](../project_Demo/music_studio/docs/编辑操作.md)：Ctrl＋滚轮只缩放显示，步长/音长才影响时值；保持缩放后的绘制、命中、放置、拉长、框选和鼓机点击使用同一坐标映射。视口与选择不写工程历史，相关输入注入回归在 `project_Demo/music_studio/tests/ui_test.c`。
 - 音乐工坊的可编辑曲库由 [离线转换脚本](../project_Demo/music_studio/tools/build_library.py) 和 `library/catalog.json` 维护，仅需 Python 3 标准库；运行 `python3 project_Demo/music_studio/tests/test_library.py` 检查转换回归。新增曲目、源文件校验、配置字段及能力边界先读 [曲库说明](../project_Demo/music_studio/library/README.md)，不要把它当作应用内通用 MIDI 导入器。
@@ -232,38 +234,38 @@ ctest --test-dir build/rgb565/Demo --output-on-failure
 
 ## 7. 定位问题的最短路径
 
-| 现象 | 先检查 |
-| --- | --- |
-| 修改后看起来没变化 | 构建的是否为当前应用及色深目录；对象是否标脏；是否运行了旧二进制 |
-| 窗口初始化失败 | `SDL_LCD_Init` 返回值、显示会话 / SDL 驱动、SDL2 依赖；无头用 dummy，不据此认定真实窗口成功 |
-| 控件不响应点击 / 输入 | 注入上下文、命中层级、Hidden / 模态层、焦点 / 编辑态，是否覆盖了原事件回调 |
-| 更新数值但绑定没动 | 是否调用 Set / Touch；是否覆盖 changed 回调；subject 是否存活 |
-| 文字被截断或中文空白 | 控件字节容量 / 宽度、UTF-8 边界、字库覆盖、blob 路径和全局 fallback |
-| 图片花屏、颜色错误 | `GYimg` 与像素生命周期、stride、`GYpx` 色深一致性、原地更新是否标脏 |
-| 拖动坐标偏移或残影 | 屏幕 / 父坐标转换、父滚动、捕获状态、旧区域是否失效 |
-| DMA 刷新卡住 | `buf2`、flush_busy、DMA 完成后的 `YMGUI_Disp_FlushReady`、wait_cb；参照 `test_async` |
-| 关闭 / 卸载后崩溃 | 后台任务未停、observer 未摘链、图片 / 字符串悬空、父子重复释放、动态库回调仍被对象引用 |
-| 断言后仍继续执行 | `gy_assert` 是项目日志断言，不能代替显式错误返回 |
+| 现象           | 先检查                                                                        |
+| ------------ | -------------------------------------------------------------------------- |
+| 修改后看起来没变化    | 构建的是否为当前应用及色深目录；对象是否标脏；是否运行了旧二进制                                           |
+| 窗口初始化失败      | `SDL_LCD_Init` 返回值、显示会话 / SDL 驱动、SDL2 依赖；无头用 dummy，不据此认定真实窗口成功             |
+| 控件不响应点击 / 输入 | 注入上下文、命中层级、Hidden / 模态层、焦点 / 编辑态，是否覆盖了原事件回调                                |
+| 更新数值但绑定没动    | 是否调用 Set / Touch；是否覆盖 changed 回调；subject 是否存活                              |
+| 文字被截断或中文空白   | 控件字节容量 / 宽度、UTF-8 边界、字库覆盖、blob 路径和全局 fallback                              |
+| 图片花屏、颜色错误    | `GYimg` 与像素生命周期、stride、`GYpx` 色深一致性、原地更新是否标脏                               |
+| 拖动坐标偏移或残影    | 屏幕 / 父坐标转换、父滚动、捕获状态、旧区域是否失效                                                |
+| DMA 刷新卡住     | `buf2`、flush_busy、DMA 完成后的 `YMGUI_Disp_FlushReady`、wait_cb；参照 `test_async` |
+| 关闭 / 卸载后崩溃   | 后台任务未停、observer 未摘链、图片 / 字符串悬空、父子重复释放、动态库回调仍被对象引用                          |
+| 断言后仍继续执行     | `gy_assert` 是项目日志断言，不能代替显式错误返回                                             |
 
 先复现最小路径，再改所属层。搜索示例：`rg -n 'YMGUI_Image_SetScaleMode' YMGUI Demo project_Demo`；不要默认扫描整个 `extern_lib/FFmpeg`。
 
 ## 8. 值得直接读的示例
 
-| 学什么 | 入口 |
-| --- | --- |
-| band 刷新与显示闭环 | [demo_flush_band.c](../Demo/demo_flush_band.c)、[test_band.c](../tests/test_band.c)、[test_async.c](../tests/test_async.c) |
-| 表单 / 状态联动 | [demo_form.c](../Demo/demo_form.c)、[demo_bind.c](../Demo/demo_bind.c)、[test_bind.c](../tests/test_bind.c) |
-| 自绘 / 布局 | [demo_draw.c](../Demo/demo_draw.c)、[demo_layout.c](../Demo/demo_layout.c) |
-| UI 属性补间 / 动效场景 | [demo_anim.c](../Demo/demo_anim.c)、[二十个交互 Demo](../Demo/ANIM_DEMOS.md) |
-| 多行文本 / 编辑器 | [demo_textview.c](../Demo/demo_textview.c)、[txt_edit](../project_Demo/txt_edit/README.md) |
-| 右键 / 触摸长按 / 拖动取消 | [context_gesture](../project_Demo/context_gesture/README.md)、[test_event.c](../tests/test_event.c) |
-| 文件系统回调与对话框 | [FileDialog 头文件](../YMGUI/WIDGET/YMGUI_FileDialog.h)、[test_filedialog.c](../tests/test_filedialog.c) |
-| 树 / 电子表格 / 图层画布 | [files_manager](../project_Demo/files_manager/README.md)、[excel_edit](../project_Demo/excel_edit/README.md)、[image_edit](../project_Demo/image_edit/README.md) |
-| 后台媒体任务与 UI 分离 | [video_stidio 架构](../project_Demo/video_stidio/ARCHITECTURE.md) |
-| 实体 / 虚拟键盘与 CJK | [chinese_ime](../project_Demo/chinese_ime/README.md)、[test_sdl_context.c](../tests/test_sdl_context.c) |
-| 插件宿主与生命周期 | [plugin_host](../project_Demo/plugin_host/README.md)、[test_plugin.c](../tests/test_plugin.c) |
-| 竖屏应用与可裁剪 UI 动效 | [pocket_tasks](../project_Demo/pocket_tasks/README.md)、[动效示例](../Demo/ANIM_DEMOS.md) |
-| 手机界面流程与应用级皮肤 | [phone_shell](../project_Demo/phone_shell/README.md) |
+| 学什么              | 入口                                                                                                                                                                |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| band 刷新与显示闭环     | [demo\_flush\_band.c](../Demo/demo_flush_band.c)、[test\_band.c](../tests/test_band.c)、[test\_async.c](../tests/test_async.c)                                      |
+| 表单 / 状态联动        | [demo\_form.c](../Demo/demo_form.c)、[demo\_bind.c](../Demo/demo_bind.c)、[test\_bind.c](../tests/test_bind.c)                                                      |
+| 自绘 / 布局          | [demo\_draw.c](../Demo/demo_draw.c)、[demo\_layout.c](../Demo/demo_layout.c)                                                                                       |
+| UI 属性补间 / 动效场景   | [demo\_anim.c](../Demo/demo_anim.c)、[二十个交互 Demo](../Demo/ANIM_DEMOS.md)                                                                                           |
+| 多行文本 / 编辑器       | [demo\_textview.c](../Demo/demo_textview.c)、[txt\_edit](../project_Demo/txt_edit/README.md)                                                                       |
+| 右键 / 触摸长按 / 拖动取消 | [context\_gesture](../project_Demo/context_gesture/README.md)、[test\_event.c](../tests/test_event.c)                                                              |
+| 文件系统回调与对话框       | [FileDialog 头文件](../YMGUI/WIDGET/YMGUI_FileDialog.h)、[test\_filedialog.c](../tests/test_filedialog.c)                                                             |
+| 树 / 电子表格 / 图层画布  | [files\_manager](../project_Demo/files_manager/README.md)、[excel\_edit](../project_Demo/excel_edit/README.md)、[image\_edit](../project_Demo/image_edit/README.md) |
+| 后台媒体任务与 UI 分离    | [video\_stidio 架构](../project_Demo/video_stidio/ARCHITECTURE.md)                                                                                                  |
+| 实体 / 虚拟键盘与 CJK   | [chinese\_ime](../project_Demo/chinese_ime/README.md)、[test\_sdl\_context.c](../tests/test_sdl_context.c)                                                         |
+| 插件宿主与生命周期        | [plugin\_host](../project_Demo/plugin_host/README.md)、[test\_plugin.c](../tests/test_plugin.c)                                                                    |
+| 竖屏应用与可裁剪 UI 动效   | [pocket\_tasks](../project_Demo/pocket_tasks/README.md)、[动效示例](../Demo/ANIM_DEMOS.md)                                                                             |
+| 手机界面流程与应用级皮肤     | [phone\_shell](../project_Demo/phone_shell/README.md)                                                                                                             |
 
 ## 9. 完成修改后维护哪些文档
 

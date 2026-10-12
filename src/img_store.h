@@ -166,11 +166,13 @@ extern char g_img_path[IMG_PATH_MAX];
 
 #define IMG_PIC_DIR   "/YMGUI/PIC"
 #define IMG_NOTE_DIR  "/YMGUI/NOTE"
+/* 音乐（2026-10-12）：TF 卡上的 .wav 放这里，与照片/笔记同一套扫描表。 */
+#define IMG_MUSIC_DIR "/YMGUI/MUSIC"
 
 extern volatile uint32_t g_scan_n;       /* 上次扫描到的条目数 */
 extern volatile uint32_t g_scan_cyc;     /* 上次扫描耗时的 DWT 周期数 */
 extern volatile uint32_t g_scan_fs_rc;   /* 最后一个 FRESULT */
-extern volatile uint32_t g_scan_kind;    /* 上次扫的是哪个分类：1=照片 2=笔记 */
+extern volatile uint32_t g_scan_kind;    /* 上次扫的是哪个分类：1=照片 2=笔记 3=音乐 */
 
 /* ---- JPEG 解码诊断（2026-10-09）----
  * g_jpeg_diag[0..3]  **第一块**的三个平面首字节（用来确认 Y/Cb/Cr 的排列顺序）与行号；

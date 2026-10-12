@@ -2003,6 +2003,81 @@ void PhoneHost_SetBrightness(int value)
 	}
 }
 int PhoneHost_GetBrightness(void) { return display_brightness; }
+
+/* ---------------------------------------------------------------------------
+ * 音量（2026-10-12 新增，与亮度**同构**：控制中心滑杆 + 持久化回调）
+ *
+ * 【与亮度的三处不同，别照抄亮度】
+ *   1. 下限是 **0 而不是 1**：0 = 静音，是用户会主动选择的合法值
+ *      （亮度 0 是全屏黑罩、与"屏坏了"无法区分，所以亮度禁止 0；音量没有这个歧义）。
+ *   2. 出厂默认 **70**（不是 50）：音量 50 在 ES8311 上约 -47 dB，偏小；
+ *      70 ≈ -28 dB，接上模块就能听见。
+ *   3. **不需要整屏重画**：音量不进 framebuffer，界面上也没有显示音量数值的
+ *      文本 ⇒ volume_apply 只改内存值 + 同步抽屉滑杆，不 Invalidate(ctx->root)，
+ *      也不发 PhoneApps_Command(SETTINGS,"sync")（设置页没有音量项，发了无意义）。
+ *
+ * 【仍然照抄亮度的部分】两段式提交（拖动 Preview / 松手 Set）+ s_vol_dirty 粘滞
+ *   标志，理由与 s_bright_dirty 完全相同：松手时传的正是 Preview 刚设好的值，
+ *   若 Set 里写"值相同直接 return"，落盘回调永远不会被调用。
+ * ------------------------------------------------------------------------- */
+static int display_volume = 70;
+static void (*s_vol_persist_cb)(uint8_t) = NULL;
+static uint8_t s_vol_dirty = 0u;
+
+void PhoneShell_SetVolumePersistCallback(void (*cb)(uint8_t))
+{
+	s_vol_persist_cb = cb;
+}
+
+/* 音量钳位 0..100（0 = 静音，合法）。 */
+static int volume_clamp(int value)
+{
+	return (value < 0) ? 0 : (value > 100) ? 100 : value;
+}
+
+static void volume_apply(int nv)
+{
+	display_volume = nv;
+	/* ⚠ 与亮度一样要防 ctx 为 NULL：main.c 在 PhoneShell_BoardInit **之前**
+	 *   就用配置里的值调 SetVolume 同步首值。 */
+	if (ctx == NULL)
+	{
+		return;
+	}
+	PhoneShade_Sync();   /* 把两个滑杆（亮度/音量）都拉回真实值 */
+}
+
+void PhoneHost_SetVolumePreview(int value)
+{
+	int nv = volume_clamp(value);
+
+	if (display_volume == nv)
+	{
+		return;
+	}
+	s_vol_dirty = 1u;
+	volume_apply(nv);
+}
+
+void PhoneHost_SetVolume(int value)
+{
+	int nv = volume_clamp(value);
+
+	if ((display_volume == nv) && (s_vol_dirty == 0u))
+	{
+		return;                 /* 开机同步首值：值与默认相同 ⇒ 不落盘 */
+	}
+	s_vol_dirty = 0u;
+	if (display_volume != nv)
+	{
+		volume_apply(nv);
+	}
+	if (s_vol_persist_cb != NULL)
+	{
+		s_vol_persist_cb((uint8_t)display_volume);
+	}
+}
+int PhoneHost_GetVolume(void) { return display_volume; }
 /* WiFi 开关（2026-10-10 改真）：WiFi 射频在对端 ESP32 上，所以这里**必须**
  * 下发 $?RADIO,<ON|OFF>，不能再只改本地假状态。
  * ⚠ 不再调 PhoneShade_SetWifi（那只是本地选项位）：抽屉的 WiFi 瓦片与设置页

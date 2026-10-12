@@ -47,7 +47,6 @@ ymgui_add_app(my_app my_app.c)
 ## 现有项目
 
 - **music_studio（音乐工坊）** —— 中文多轨音乐制作工作台，鼓机、钢琴卷帘、音频编排、基础混音、保存和 WAV 导出；Linux / RGB565 / RGB888，带内置演示与独立测试（见 [说明](music_studio/README.md)）。
-
 - **txt_edit** —— 行式文本编辑器。第一个验证项目,产出了第一份缺口清单(见 `txt_edit/README.md`)。
 - **files_manager** —— 沙箱文件管理器。第二个验证项目,催生库控件 `TreeView`(见 `files_manager/README.md`)。
 - **excel_edit** —— 电子表格。第三个验证项目,催生库控件 `Grid`,公式引擎在 app 侧(见 `excel_edit/README.md`)。
@@ -55,5 +54,4 @@ ymgui_add_app(my_app my_app.c)
 - **music_player** —— 音乐播放器。第五个验证项目,催生库控件 `Roller`(居中高亮平滑滚动列表) + `BarChart`(通用柱状图,此处当频谱用);音乐语义(ffmpeg 解码 / SDL2 声卡 / .lrc 解析 / 频段分析)全在 app 侧(见 `music_player/README.md`)。
 - **context_gesture** —— 上下文手势实验室。用基础对象、自定义绘制和 top_layer 菜单验证右键/触摸长按、捕获式拖动及取消恢复；不新增控件(见 `context_gesture/README.md`)。
 - **chinese_ime** —— 中英文虚拟键盘。中文单字、中文词语和英文单词三份数据独立外挂，支持拼音/英文前缀候选、动态分页、点击或数字选择、用户频率学习和 CJK 字体回退。
-
 - **video_stidio** —— Linux 视频剪辑器，素材导入、8 条视频轨、修剪/分割、撤销重做、项目保存和后台 H.264 导出；独立编译 FFmpeg，仅支持 RGB565，使用 `--frames N` 无头退出（见 [说明](video_stidio/README.md)）。

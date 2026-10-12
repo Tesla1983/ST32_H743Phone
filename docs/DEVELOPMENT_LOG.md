@@ -23,6 +23,7 @@
 | **4** | 只读常量上 W25Q128（memory-mapped）             | ✅ 完成：XIP 与 indirect 逐字节一致（比对 64 KB、覆盖全部 16 MB）              |
 | **5** | phone_shell 降配并上板                        | ✅ 完成：`g_shell_rc = 0`，中文字库走 XIP，桌面/应用/最近任务均出画，**板上中文输入法可用** |
 | **6** | 整机验收 A1–A5                               | ✅ 完成：**A1–A5 全部达成**（详见下节）                                   |
+| **7** | ES8311 音频模块接入（方案 A：I2C1+I2S2）        | ✅ 完成：**喇叭出声**，控制中心音量滑杆同步落地（详见 2026-10-12 那节）      |
 
 ### 阶段 5 + 6 状态（✅ 完成，2026-10-03）—— 验收判据 A1–A5
 
@@ -2864,3 +2865,133 @@ YMGUI_Draw_CircleFill(surface, cx+14, cy-15, 8, RGB(66,209,180));   /* 右上小
 ⚠ 教训：**E: 盘删的东西进的是 `E:\$Recycle.Bin` 而不是 `C:`** —— 查错盘会拿到
 "$I 记录 0 → 0"的**假阴性**，把"真的进了回收站"误读成"被永久删除"。判据要看**目标盘**的
 回收站目录，并核对 `$I` 记录里的原始路径与原大小。
+
+---
+
+## 2026-10-12 · ES8311 音频模块接入（方案 A）— 可行性阶段结束，硬件已落地出声
+
+> 原 `docs/ES8311_PIN_FEASIBILITY.md`（可行性报告）**已删除**，内容并入本节；
+> 排针 P1/P2 网络全表并入 `docs/HEADER_PINOUT.md`。硬件既已落地，就不再以"待验证方案"形态存在。
+
+### 结论：能不能接、怎么接
+
+模块 = **鹿小班 ES8311 + NS4150B**（I2C 配寄存器 + I2S 传音频，NS4150B 直接推喇叭，
+**无使能脚**，不需要像 ESP32 板那样额外拉 PA_EN）。官方 9 脚顺序（上→下）：
+`SDA SCL MCLK SCLK DOUT LRCK DIN 5V GND`。
+
+⚠ **用户最初给的接线表（SCLK=PB13 / LRCK=PB12 / DIN=PB14）不可行** —— 这三颗全在
+电容触摸 GT9xxx 上（本机实测映射 **SCL=PB11 / SDA=PB14 / RST=PB12 / INT=PB13**，
+判据：这组脚能读出产品 ID ASCII `"1158"`）。**PB11~PB14 四颗一颗都不能动**（比厂商手册说的还多占一颗）。
+
+**最终接线（方案 A，已出声）**：
+
+| 模块脚 | STM32 | AF | 排针 | 备注 |
+|---|---|---|---|---|
+| SCL | **PB6** | I2C1_SCL (AF4) | P1-19 | 摄像头 D5，未插摄像头即空闲 |
+| SDA | **PB7** | I2C1_SDA (AF4) | P1-20 | 摄像头 VSYNC；⚠ **实测这对线是交叉的**（见下） |
+| MCLK | **PC6** | I2S2_MCK (AF5) | P1-45 | LQFP100 上 I2S2_MCK 只有这一颗 |
+| SCLK | **PD3** | I2S2_CK (AF5) | P1-27 | 其余候选 PB13(触摸)/PB10(QSPI)/PA9/PA12 全占 |
+| LRCK | **PB9** | I2S2_WS (AF5) | P1-18 | 代价：UART4 回退彻底作废（RX 线第十八版本就拆了，只剩半边） |
+| **DIN** | **PB15**（或 PC1） | I2S2_SDO (AF5) | P2-37（或 P2-8） | ⚠ STM32 的 **SDO 要接模块的 DIN**，不是 DOUT |
+| DOUT | PC2 | I2S2_SDI (AF5) | P2-9 | 录音才接；另一颗 PB14 是触摸 |
+| 5V / GND | — | — | P1-3/4 / P1-1/2 | **模块官方要求 5V**（给 NS4150B 功放供电） |
+
+**时钟**：SystemCoreClock 400 MHz，PLL1_Q = 200 MHz，`SPI123SEL=0` ⇒ I2S 内核时钟取 PLL1_Q，
+分频后 **MCLK = 12.5 MHz / SCK = 3.125 MHz / LRCK = 48.828 kHz**（I2SCFGR 回读，非推算）。
+12.5 MHz ÷ 48.828 kHz = **256**，满足手册"≥256 且 16 的整数倍"，两侧同源，不挑 MCLK 绝对精度。
+
+⚠ **SPI123SEL 是 SPI1/2/3 与 I2S1/2/3 共用的内核时钟源域**（RM0433 RCC_D2CCIP1R 位 14:12）
+⇒ 改 I2S 时钟源会同时改 SPI1（ESP32 链路）频率，**改完必须复测 SPI 链路**。
+I2S_CKIN 在 PC9（被 SDIO_D1 占）⇒ I2S 只能走 PLL，不能走外部时钟输入。
+
+### 两次接反（这类坑的第一嫌疑永远是线，不是固件）
+
+1. **SDA/SCL 交叉**：接好后 I2C 全地址段无应答，寄存器逐条审计也无错。
+   用 `python tools/audio_check.py 3`（**交叉位拍普查**：把 SDA/SCL 当开漏 IO 逐根 toggle，
+   在另一根上读回）一秒分清"线接反 vs 模块坏"——本次就是接反，对调两根线即通，ES8311 一直完好。
+2. **DIN/DOUT 方向反**：模块按**模块自身视角**命名（业界惯例）——
+   **DIN = 数据输入（芯片 DSDIN，放音数据）**、**DOUT = 数据输出（芯片 ASDOUT，录音数据）**。
+   原接法把 STM32 SDO 怼在模块 DOUT 上 = **两路输出对撞**，DAC 从未收到数据 ⇒ I2C/时钟/寄存器全对却完全无声。
+   改到 DIN 后立刻出声。同样的坑：M5Paper + ES8311 社区方案的注释也是"ESP32 DIN 接 ES8311 的 DOUT"（两边视角相反）。
+
+### H7 I2S 三个代码级坑（已固化进 `src/audio_test.c` 注释与 MEMORY.md）
+
+1. **置 SPE 不开始传输**：`HAL_I2S_Init` / `__HAL_I2S_ENABLE` 只配好 I2SCFGR，
+   必须再置 **CR1.CSTART**(bit9) 才真正起传 —— 否则 TXP 永远亮着、写满 8 包 FIFO 后挂死（frames 停在 4）。
+2. **欠载 UDR 会把 TXP 永久压 0**：`SR` bit5(UDR)=1 后引擎停吃 FIFO，**必须写 `IFCR.UDRC` 清掉**才恢复
+   （FIFO 只有 8 包 ≈ 82 µs @48.8 k，CPU 一停顿就欠载；HAL 每次写都清一次 UDR）。
+   本自检里 `at_tx_wait()` 检测 UDR 后清 UDRC 并 `g_at_udr++`，实测自恢复 4~13 次，不挂死。
+3. **I2SDIV 位域在 I2SCFGR bits 23:16**（不是 7:0）—— 按 7:0 读会误判"HAL 时钟函数算错"，
+   实际分频是对的（这个误判已撤回）。SR 位图（本 CMSIS 头）：bit5=UDR、bit11=SUSP。
+
+顺带：`es8311_i2c_timing()` 里 `(presc+1)*1000000000` 曾 **uint32 溢出**，算出错误 TIMINGR `0x90FF4187`；
+重写后 100 kHz 正确值 **0x90522C36**。
+
+### ES8311 关键寄存器（对照官方 User Guide Rev1.11 审计，放不出声时先查这几条）
+
+| 寄存器 | 值 | 含义 |
+|---|---|---|
+| 0x00 | 0x80 | bit7 CSM_ON=1 上电（默认 0=掉电）；bit6 MSC=0 **从机**（本板 STM32 是 I2S 主机） |
+| 0x01 | 0x3F | bit5 MCLK_ON=1 开 MCLK 引脚时钟（0 = 时钟断了）；bit7 MCLK_SEL=0 取 MCLK 引脚 |
+| 0x09/0x0A | 0x0C | WL=011(16 bit)、FMT=00(I2S)、SDP_MUTE=0 不静音 |
+| 0x32 | 音量 | DAC_VOLUME：0x00=-95.5 dB（**默认≈静音**）、**0xBF=0 dB**、0xFF=+32 dB |
+| 0x0D | 0x01 | PDN_ANA(bit7)=0 ⇒ 模拟电路使能（默认 0xFC 全掉电） |
+| 0x13 | 0x10 | 手册未公开（esp-adf / ESPHome 同值，HP 输出使能） |
+
+寄存器序列移植自 Espressif esp-adf `es8311.c`，只改两处：8 位地址 0x30/0x32 → 7 位 0x18/0x19；
+`mode = SLAVE`。
+
+### 自检脚本（不用万用表/示波器也能定位）
+
+```bash
+python tools/audio_check.py 3   # 交叉位拍普查：分清"线接反 vs 模块坏"（先跑这个）
+python tools/audio_check.py 1   # I2C 扫描 + 读 ID（期望 0x18 应答、ID=0x83/0x11/0x01）
+python tools/audio_check.py 2   # 全链路：五音提示音
+python tools/audio_check.py 4   # 3 秒连续长音（≈977 Hz）
+python tools/i2s_wire_toggle.py # 逐根验 I2S 四根线（开漏 toggle，跑完自动恢复）
+```
+固件侧由 CMake option `YMGUI_AUDIO_TEST`（**默认 OFF**，出货形态不编入）控制，
+板上由 `g_audio_test=1..4` 触发。
+
+### 实测结果（2026-10-12 深夜，方案 A + 两次对调线之后）
+
+- case1：ES8311 在 **0x18 应答，ID = 83 / 11 / 01**（esp-adf 期望值）。
+- case2：五音 **195 367 帧**全部送入 I2S（理论 3×350 ms×48.8 k = 51 269 ×… 同量级），hang=0，欠载 13 次自恢复。
+- case4：**3 秒长音 146 489 帧 = 3.000 s × 48.828 kHz**，hang=0，欠载 4 次自恢复。
+- **用户确认：喇叭出声 ✅** —— 至此"可行性"问题关闭。
+
+### 落地到 UI：控制中心音量滑杆（同日）
+
+控制中心（下拉抽屉）在**亮度卡片下面、通知上面**新增一条**音量**滑杆，样式与亮度完全一致：
+`phone_shade.c` 建第二个 slider_panel + `YMGUI_Creat_Slider_Creat`，回调走 `PhoneHost_SetVolume`；
+`phone_shell.c` 侧与亮度同构（`display_volume` + 1..100 钳位 + 松手才落盘的持久化回调）；
+`src/app_config.c` 把音量落在配置 blob 里；`main.c` 的持久化回调把值写给 ES8311（REG32）。
+⚠ 音量是**出货形态**的 UI，但 ES8311 驱动只在 `YMGUI_AUDIO_TEST=ON` 时才编进来
+⇒ 桥接处必须条件编译，出货构建下只做持久化、不碰 I2C。
+⚠ 抽屉高度因此从 448 提到 **480（全屏）**：448 里从亮度排到"收起"按钮只剩 2 px，
+塞不下新的一行；抬到全屏就能**元素尺寸一个都不改**，只把通知区块整体下移 38 px。
+代价是 overlay 现在盖住底部导航栏那 32 px（抽屉开着时点导航 = 收抽屉，语义不变）。
+全部展开/收起坐标改走常量 `SHADE_H / SHADE_HIDDEN_Y`，不要再写 `-448` 字面量。
+
+### 板上验收（同夜，出货构建，已烧录）
+
+| 判据 | 工具 | 实测 |
+|---|---|---|
+| 音量滑杆真的改变音量 | `python tools/volume_check.py` | **S1 PASS**：开机 `display_volume=70` ⇒ 点 (155,280) 后 **70 → 32** |
+| 三处镜像一致（UI / 音频 / 配置） | 同上 | **S2 PASS**：`display_volume == g_audio_volume == g_cfg_volume` |
+| 落盘通路 | 同上 | **S3 PASS**：`g_cfg_save_cnt` 0 → 1 |
+| 抽屉布局无回归 | `python tools/shade_radio_check.py --static` | **S0/S1/S2 全 PASS**（开合手势、瓦片发 `$?RADIO`、颜色跟随 `$RD`） |
+| 视觉 | 抓屏 | `build/_shade_volume.png`：亮度面板下面多一条同样式的"音量"，通知在它下面，"收起"在底部 |
+
+### ⚠⚠ 配置项新增字段的两个坑（这次实际踩到，已修）
+
+1. **新字段不能复用 blob 里的 `reserved`**。旧固件是按 `sizeof(blob)` **整块写盘**的，
+   `memset` 之后没设过的 `reserved` 在扇区里存的是 **0 而不是 0xFF**。
+   第一次把音量放进 `reserved[0]` ⇒ 旧扇区读出 0 ⇒ **开机音量 = 0（静音）**，
+   板上实测 `display_volume=0`（期望 70）才暴露出来。
+   ⇒ 修法：音量字段**追加到 blob 尾部（crc 之后）**，那里旧固件从没写过（= 0xFFFFFFFF）
+   ⇒ 越界 ⇒ 回默认 70。`APP_CFG_BLOB_LEN` 32 → 36。CRC 只覆盖 crc 之前的字节，
+   所以旧扇区照样校验通过，**不需要迁移、不需要升版本**。
+2. **`AppConfig_Load` 成功路径末尾漏同步诊断量**。只给失败路径补了 `g_cfg_volume = s_cur.volume;`，
+   成功路径没补 ⇒ `g_cfg_volume` 一直停在编译期初值 70，看起来"一切正常"。
+   判据教训：**诊断量与真值不一致时，先怀疑"漏同步"，别怀疑读值工具。**

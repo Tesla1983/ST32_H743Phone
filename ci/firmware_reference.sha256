@@ -1101,5 +1101,66 @@
 #     g_img_qspi_rc 哨兵 + alive() 三个确定性量。
 #
 # FLASH 1 647 056 B（78.54%），比第二十七版 +864 B。
-97969343c704b13698a330ae95cb4992eae0c0070133fbe08ad69d8611d20401  ymgui-h743.bin
-5016d784fe5c1dc4e0aec8c70acedc3b69189eef06e16ad3a1f8ffb224588fea  ymgui-h743.elf
+# 97969343c704b13698a330ae95cb4992eae0c0070133fbe08ad69d8611d20401  ymgui-h743.bin
+# 5016d784fe5c1dc4e0aec8c70acedc3b69189eef06e16ad3a1f8ffb224588fea  ymgui-h743.elf
+
+# ---- 第二十九版（2026-10-12）：控制中心「音量」滑杆 + ES8311 音频文档合并 ----
+# 变更（功能改动 ⇒ 允许更新基准）：
+#   ① 下拉抽屉在**亮度下面、通知上面**新增"音量"滑杆，样式与亮度逐项对齐；
+#      通知区块整体下移 38 px；抽屉高度 448 → 480（全屏，坐标改用 SHADE_H）。
+#   ② app_config 配置 blob 32 → 36 B：音量字段**追加在 crc 之后**
+#      （⚠ 不能复用 blob 里的 reserved —— 旧固件整块写盘时把那格写成了 0，
+#        新固件会把它读成合法值 0 = 静音；详见 src/app_config.c 顶部长注释）。
+#   ③ docs/ES8311_PIN_FEASIBILITY.md 已删除并入 docs/DEVELOPMENT_LOG.md；
+#      P1/P2 排针全表并入 docs/HEADER_PINOUT.md。
+# 板上验收（出货构建，已烧录）：
+#   tools/volume_check.py              → S1/S2/S3 全 PASS
+#       （开机 display_volume=70；点 (155,280) 后 70→32；display/g_audio/g_cfg 三处一致；
+#        g_cfg_save_cnt 0→1 ⇒ 落盘通路实测走通）
+#   tools/shade_radio_check.py --static → S0/S1/S2 全 PASS（抽屉开合、瓦片发命令、
+#       颜色跟随状态 —— 布局改动没有回归）
+# 抓屏：build/_shade_volume.png（音量滑杆在亮度下面、通知上面，"收起"在底部可见）
+# FLASH 1 647 548 B（78.56%），比第二十八版 +492 B。
+# 旧哈希（第二十八版，留档备查，已停用）：
+# 97969343c704b13698a330ae95cb4992eae0c0070133fbe08ad69d8611d20401  ymgui-h743.bin
+# 5016d784fe5c1dc4e0aec8c70acedc3b69189eef06e16ad3a1f8ffb224588fea  ymgui-h743.elf
+# 旧哈希（第二十九版，留档备查，已停用）：
+# 50916c66a70f16e42c944b8efa00ede5636293d3319cd738880cb483bc0e3ec0  ymgui-h743.bin
+# 6aa6c353e7e36a451163b1dfc10367293329480b42f0697f8bb71c7605098b4f  ymgui-h743.elf
+
+# ============================================================================
+# 第三十版（2026-10-13）· 修掉音频出声链路冻结（TIM6 向量表开槽）+ 诊断量按次清零 + WAV 验收
+# ============================================================================
+# 为什么变（按「更新时机」的 a：有意为之的功能改动；工具链 14.3.rel1 未变）：
+#   出声链路此前**板子直接冻结**——TIM6 周期中断（I2S TX FIFO 滴灌）的中断向量落在
+#   Default_Handler：startup_gcc.s 的向量表 IRQ53..IRQ70 原本整块 `.rept` 成 Default_Handler，
+#   而 TIM6_DAC_IRQn=54 正好落在这块里 ⇒ 中断一触发就跳死循环 ⇒ 内核 freeze。
+#   audio_out.c 的 TIM6_DAC_IRQHandler 是强符号但向量表里写死的是 Default_Handler 字面量，
+#   强符号压不过字面量 ⇒ 必须给 IRQ54 单独开槽。修法：
+#     1. startup_gcc.s：把 IRQ53..IRQ70 的 `.rept 18` 拆成
+#        UART5(Default) / **TIM6_DAC（指向 TIM6_DAC_IRQHandler）** / `.rept 16`
+#        （49+1+2+1+1+1+16+1+49+1+28 = 150，顺序由 CMSIS IRQn 决定，未破坏其他槽位）；
+#        并在文件尾补 `.weak TIM6_DAC_IRQHandler / .thumb_set ... Default_Handler` 兜底。
+#     2. 复用已有的 linker EXTERN(TIM6_DAC_IRQHandler) 保活（防 --gc-sections 回收）。
+#   ⚠ 顺手修掉的同类隐患：音频诊断量 g_ao_frames/g_ao_push/g_ao_isr 只在 ISR/主循环里
+#     **只增不减**，audio_out_start() 里**不复位** ⇒ 多次播放跨次累加（上一次 3 s 的 14 万帧
+#     带进下一次），验收脚本算不出单次播放的精确量 ⇒ 在 audio_out_start() 末尾按本次播放
+#     清零这六个量（frames/push/isr/isr_dry/udr/underrun，另加 pump）。
+#   ⚠ 验收脚本本身的坑：audio_out_check.py 每个变量一次 probe-rs 子进程（~0.4–0.7 s/次），
+#     8 次调用累计 > 3 s，把"播放中"窗口读成了"播完之后"（codec/playing 已被 stop 清零）
+#     ⇒ 误报 A1。本版把 g_ao_stage..g_ao_codec 这 11 个连续全局量一次性读回，并对"没赶上
+#     播放窗口"做重触发重试。
+#   另：新增 g_wav_test 诊断触发（写 1 起播 /YMGUI/MUSIC/TOKYOHOT.WAV、=2 停播），
+#     供 tools/wav_play_check.py 走**音乐 app 真实路径**（FatFs 读卡 + WAV 头解析 + feeder）
+#     验收，与内置正弦自检分开。
+# 验收（全部 PASS，烧录后探针读 RAM，无需目视）：
+#   · tools/audio_out_check.py：A1 codec 起（rc=0,codec=1）· A2 TIM6 心跳（isr +98602,
+#     push +190632 半字）· A3 140309 帧 ≈ 2.87 s（±10%）· A4 UDR=5/underrun=0 · A5 播完收尾。
+#   · tools/wav_play_check.py：B1 rc=0（文件打开+头解析+起播）· B2 在播 ·
+#     B3 pos +217088 B（卡在供给）· B4 frames +95933 · B5 单次补数 1 ms < 42 ms · B6 rate=48828/ch=1。
+#     WAV 实测在卡上（total=15056212 B），与 I2S 采样率一致 ⇒ 无需重采样。
+#   · 板上核验：tools/verify_board_image.py 全量读回 1 656 316 字节与 .bin 逐字节一致。
+#   ⚠ 听不听得见仍由耳朵判定（数据通路已证）；音量默认 70，下限 0=静音。
+# FLASH 1 656 316 B（78.97%），比第二十九版 +8768 B（主要是音频引擎常驻 + 诊断）。
+89e4744703212193ad3fb375c73f706e7b64145e67dcb7400fd9566cef9dc407  ymgui-h743.bin
+572ba65396c1c52cb9953b5a16fa5e0bb610431e2c0949b9a4b8f4b556d63ba3  ymgui-h743.elf

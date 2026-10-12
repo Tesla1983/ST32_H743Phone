@@ -52,7 +52,10 @@ __Vectors:
      *   PC6 那根命令线始终不通（双向发波验证过与对端无电气连接），而 USART6 在
      *   LQFP100 上只有 PC6/PC7 一组，⇒ 换脚只能换外设。UART4_IRQn = 52。
      *   USART6 槽位保留（已停用，弱别名兜底）。
-     * 拆成 49 + 1 + 2 + 1 + 18 + 1 + 49 + 1 + 28 = 150，顺序不能错：位置由 CMSIS 的 IRQn 决定。 */
+     * 2026-10-13（第五次）为 TIM6_DAC 开槽：音频出声用 TIM6 周期中断在 ISR 里滴灌 I2S TX FIFO
+     *   （主循环一帧 ~16ms 远慢于 FIFO 82µs 预算，必须靠高频中断）。TIM6_DAC_IRQn = 54。
+     *   若落 Default_Handler 会死循环冻结内核。强定义在 src/audio_out.c，弱别名兜底。
+     * 拆成 49 + 1 + 2 + 1 + 1 + 1 + 16 + 1 + 49 + 1 + 28 = 150，顺序不能错：位置由 CMSIS 的 IRQn 决定。 */
     .rept  49                           /* IRQ0..IRQ48 */
     .word  Default_Handler
     .endr
@@ -61,7 +64,9 @@ __Vectors:
     .word  Default_Handler
     .endr
     .word  UART4_IRQHandler             /* IRQ52 = UART4（上行链路，见 uart_link.c） */
-    .rept  18                           /* IRQ53..IRQ70 */
+    .word  Default_Handler              /* IRQ53 = UART5 */
+    .word  TIM6_DAC_IRQHandler          /* IRQ54 = TIM6/DAC（音频滴灌，强定义在 src/audio_out.c） */
+    .rept  16                           /* IRQ55..IRQ70 */
     .word  Default_Handler
     .endr
     .word  USART6_IRQHandler            /* IRQ71 = USART6（已改 UART4，槽位保留备用） */
@@ -146,3 +151,8 @@ Default_Handler:
 /* USART6（IRQ71）：上行链路已改用 UART4，此槽位保留备用（弱别名兜底）。 */
 .weak USART6_IRQHandler
 .thumb_set USART6_IRQHandler, Default_Handler
+
+/* TIM6_DAC（IRQ54）：音频滴灌用的高频定时中断，强定义在 src/audio_out.c。
+ * 这里给弱别名兜底 —— 万一 audio_out.c 没编进来，也不会链接失败，只会落回死循环。 */
+.weak TIM6_DAC_IRQHandler
+.thumb_set TIM6_DAC_IRQHandler, Default_Handler

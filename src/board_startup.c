@@ -21,6 +21,8 @@ extern uint32_t _sdma_bss; /* DMA 台架缓冲区段（.bss_dma → SRAM1）起�
 extern uint32_t _edma_bss; /* 同上，结束 */
 extern uint32_t _ssd_bss;  /* TF 卡数据缓冲段（.bss_sd → SRAM1）起始 */
 extern uint32_t _esd_bss;  /* 同上，结束 */
+extern uint32_t _saudio_bss; /* 音频缓冲段（.bss_audio → SRAM1）起始 */
+extern uint32_t _eaudio_bss; /* 同上，结束 */
 
 void board_init_memory(void)
 {
@@ -58,6 +60,14 @@ void board_init_memory(void)
      * 这里做是为了让"没跑过自检时读到的内容"是确定的全 0，而不是上电随机值，
      * 免得把随机内容误读成"卡里读出的数据"。 */
     for (dst = &_ssd_bss; dst < &_esd_bss;)
+    {
+        *dst++ = 0u;
+    }
+
+    /* 6) 清音频缓冲段（NOLOAD → SRAM1）：I2S2 的 DMA 循环双缓冲 + 单声道展开暂存。
+     * ⚠ 这一条**必须清**：DMA 循环缓冲在没有喂数时会被直接送出去，
+     *   上电随机值 = 一耳朵白噪声（而且响度不可控）。清零后是确定的静音。 */
+    for (dst = &_saudio_bss; dst < &_eaudio_bss;)
     {
         *dst++ = 0u;
     }

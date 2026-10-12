@@ -30,6 +30,20 @@ int PhoneHost_GetBrightness(void);
  *   而跳过落盘（这个坑 2026-10-04 实际踩过，现象是亮度永远存不下来）。
  * ⚠ 允许在 ctx 还没建立时调用（内部有 NULL 守卫）。 */
 void PhoneHost_SetBrightnessPreview(int value);
+
+/* 音量（2026-10-12 新增，与亮度**同构**：控制中心滑杆 + 1..100 + 松手才落盘）
+ *
+ * 【语义】0..100，出厂默认 70。与亮度一样由 board 侧的持久化回调落盘
+ *   （见 PhoneShell_SetVolumePersistCallback），并把值写给 ES8311 的 DAC
+ *   音量寄存器；出货构建下 ES8311 驱动没编进来 ⇒ 只落盘、不碰 I2C。
+ * 【与亮度的差别】音量**没有**"预览/正式"两档分离的强制要求（它不擦扇区之外的
+ *   代价），但为了与亮度共用同一套滑杆回调语义，这里照样提供 Preview：
+ *   拖动中调 Preview（只改内存值），松手调 SetVolume（落盘 + 写寄存器）。
+ * ⚠ 与亮度一样带"值相同直接 return"和 0..100 钳位。 */
+void PhoneHost_SetVolume(int value);
+int  PhoneHost_GetVolume(void);
+void PhoneHost_SetVolumePreview(int value);
+
 void PhoneHost_SetWifi(int on);
 int PhoneHost_GetWifi(void);
 

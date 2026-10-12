@@ -31,6 +31,22 @@ MEMORY
 /* 栈顶 = DTCM 末端，向下生长（Cortex-M 满递减栈） */
 _estack = ORIGIN(DTCM) + LENGTH(DTCM);
 
+/* ⚠⚠ 自定义中断处理函数必须在这里 EXTERN（2026-10-12 实测踩坑）
+ *
+ * 现象：`DMA1_Stream2_IRQHandler` 定义在 src/audio_out.c 里、startup 的向量表
+ *   里也有对应项，但 `arm-none-eabi-nm` **查不到这个符号** —— 它没有链接进 elf，
+ *   于是中断根本没接上（表现为"缓冲只有起播时那一轮，之后永远播同一段"）。
+ *
+ * 根因：`-ffunction-sections` + `--gc-sections` 下，**对 weak 符号的引用不会
+ *   阻止回收**。startup 里向量表项是弱引用（同一符号还有 Default_Handler 的弱
+ *   定义），链接器据此判定"没人真的需要这个 handler"，连同它所在的 .text 段一起
+ *   删掉。KEEP(*(.isr_vector)) 只保住向量表本身，保不住它指向的函数。
+ *
+ * 修法（ST 官方链接脚本同款）：用 EXTERN 显式告诉链接器"这个符号一定有人要"，
+ *   gc-sections 就会把它的输入段留下。以后每新增一个自定义 ISR，都要在这里加一行，
+ *   否则现象是**静默的**（编译链接全绿、跑起来才发现中断不响应）。 */
+EXTERN(TIM6_DAC_IRQHandler)
+
 SECTIONS
 {
   /* ---- 向量表：必须落在 flash 起始，复位后硬件从 0x0800_0000 取 MSP 与 PC ---- */
@@ -238,6 +254,31 @@ SECTIONS
     . = ALIGN(32);
     _esram3_bss = .;
   } > SRAM3
+
+  /* ---- 音频缓冲（2026-10-12，音乐播放）----
+   * 两块内容，都放 **D2 域 SRAM1（已被 MPU region0 配成非缓存）**：
+   *   src/audio_out.c  s_dma_buf  2 × 8 KB = 16 KB  I2S2 的 DMA 循环双缓冲
+   *   src/wav_play.c   s_mono             4 KB  单声道展开成交错流的暂存
+   * 合计 20 KB。SRAM1 共 128 KB，此前已用 .bss_dma 512 B + .bss_prov 16 KB
+   * + .bss_sd 4 KB + .bss_img 6 KB ⇒ 余量充足。
+   *
+   * 【为什么必须放 SRAM1 而不是 .bss（DTCM）】
+   *   **DMA1/DMA2 访问不到 DTCM**（TCM 挂在 CPU 专有端口上，不在总线矩阵从设备侧），
+   *   缓冲放 DTCM 的话 DMA 一个字节都搬不动（与 SDMMC IDMA 那个坑是同一类原因）：
+   *   SDMMC 的 IDMA 反过来只认 AXI，所以 TF 卡的 IDMA 缓冲在 .bss_sd_dma；
+   *   音频走 DMA1 ⇒ 放 D2 域的 SRAM1。
+   *
+   * ⚠ 位置陷阱同前：必须在 `.bss` 输出段**之前**（否则被 `*(.bss*)` 通配
+   *   静静吃掉），且 NOLOAD（20 KB 不占 bin 体积），由 board_startup.c 清零。 */
+  .bss_audio (NOLOAD) :
+  {
+    . = ALIGN(32);
+    _saudio_bss = .;
+    *(.bss_audio)
+    *(.bss_audio.*)
+    . = ALIGN(32);
+    _eaudio_bss = .;
+  } > SRAM1
 
   /* ---- 零初始化数据 ---- */
   .bss :

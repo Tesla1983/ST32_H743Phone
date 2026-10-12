@@ -6,6 +6,22 @@
 #include "phone_quick_builtin.h"
 #include "phone_shell_board.h"   /* BoardNet_*：控制中心顶部的日期/时间也走上行链路 */
 
+/* 控制中心（下拉抽屉）的高度与"收起"时的 y 坐标。
+ *
+ * 【为什么 2026-10-12 从 448 改成 480（= 全屏 H）】亮度下面新增了**音量**滑杆
+ *   （一整行 36 px + 4 px 间距），而 448 高的 sheet 里从亮度到"收起"按钮
+ *   已经排满（收起按钮 423..446，只剩 2 px）。硬塞只有两条路：把通知卡片
+ *   和快捷瓦片一起压小（改第三方 demo 的视觉比例），或者把 sheet 放满屏。
+ *   选后者：**元素尺寸一个都不变**，只把通知区块整体下移 38 px。
+ *
+ * ⚠ 代价：overlay 现在覆盖 y=448..480，会压住底部导航栏（navigation）。
+ *   抽屉开着时点底部导航栏 ⇒ 命中 overlay ⇒ 只是收起抽屉（与"先关抽屉"
+ *   的既有语义一致，不影响自检断言）；抽屉一收起导航栏就恢复可点。
+ *
+ * ⚠ 所有展开/收起坐标必须走这两个常量 —— 别再写 -448 / 448 字面量。 */
+#define SHADE_H        480
+#define SHADE_HIDDEN_Y (-SHADE_H)
+
 static GYCTX ctx;
 /* 控制中心顶部的日期与时间。原来是硬编码的 "09:41" / "9月29日 星期二"，
  * 而 sheet 只在 PhoneShade_Init 里建一次 ⇒ 不改就是**永远停在初始值**。
@@ -13,7 +29,7 @@ static GYCTX ctx;
 static GYOBJ shade_clock, shade_date;
 static char s_shade_hm[8], s_shade_date[40];
 static uint32 s_shade_acc;
-static GYOBJ trigger, overlay, sheet, tiles[PHONE_QUICK_CAPACITY], bright, cards[2], empty, preview, preview_image;
+static GYOBJ trigger, overlay, sheet, tiles[PHONE_QUICK_CAPACITY], bright, volume, cards[2], empty, preview, preview_image;
 static int enabled, visible, closing, start_y, drag_origin, dragging;
 static int notices[2] = {1, 1}, quick_page;
 static int clearing;
@@ -168,6 +184,14 @@ static void brightness_changed(GYOBJ obj, int32 value)
 	(void)obj;
 	PhoneHost_SetBrightness(value);
 }
+/* 音量滑杆（2026-10-12 新增，与亮度同构：拖动中走 Preview、松手走 Set 落盘）。
+ * ⚠ 这里调的是 PhoneHost_SetVolume —— 与 YMGUI_Slider 的"changed 回调在松手时
+ *   也发一次"的语义一致（亮度那条走的就是这条路，验过）。 */
+static void volume_changed(GYOBJ obj, int32 value)
+{
+	(void)obj;
+	PhoneHost_SetVolume(value);
+}
 /* 收起中途也提交清空，取消动画后复位隐藏卡片，重开不留下半截卡片。 */
 static void finish_clear(void)
 {
@@ -221,7 +245,7 @@ static void drag_event(GYOBJ obj, GYEvent event)
 	if (event == GY_EVENT_Pressed)
 	{
 		start_y = ctx->point_y;
-		drag_origin = visible ? sheet->area.y : -448;
+		drag_origin = visible ? sheet->area.y : SHADE_HIDDEN_Y;
 		dragging = 0;
 #if YMGUI_ANIM
 		YMGUI_Anim_CancelObject(sheet);
@@ -241,8 +265,8 @@ static void drag_event(GYOBJ obj, GYEvent event)
 			YMGUI_Obj_SetHidden(overlay, 0);
 		}
 		int y = drag_origin + delta;
-		if (y < -448)
-			y = -448;
+		if (y < SHADE_HIDDEN_Y)
+			y = SHADE_HIDDEN_Y;
 		if (y > 0)
 			y = 0;
 		PhoneUI_set_pos(sheet, 0, y);
@@ -251,7 +275,7 @@ static void drag_event(GYOBJ obj, GYEvent event)
 	{
 		if (!ctx->pressed_obj)
 		{
-			if (drag_origin == -448)
+			if (drag_origin == SHADE_HIDDEN_Y)
 				PhoneShade_Close(0);
 			else
 				PhoneShade_Open();
@@ -260,7 +284,7 @@ static void drag_event(GYOBJ obj, GYEvent event)
 		else if (dragging)
 		{
 			int delta = ctx->point_y - start_y;
-			if ((drag_origin == -448 && delta > 45) || (drag_origin != -448 && delta > -65))
+			if ((drag_origin == SHADE_HIDDEN_Y && delta > 45) || (drag_origin != SHADE_HIDDEN_Y && delta > -65))
 				PhoneShade_Open();
 			else
 				PhoneShade_Close(1);
@@ -280,7 +304,7 @@ void PhoneShade_Open(void)
 		return;
 	PhoneIME_Hide();
 	if (!visible)
-		PhoneUI_set_pos(sheet, 0, -448);
+		PhoneUI_set_pos(sheet, 0, SHADE_HIDDEN_Y);
 	visible = 1;
 	closing = 0;
 	YMGUI_Obj_SetHidden(overlay, 0);
@@ -296,7 +320,7 @@ int PhoneShade_Close(int animate)
 	if (animate)
 	{
 		closing = 1;
-		PhoneUI_move(sheet, 0, -448, 200);
+		PhoneUI_move(sheet, 0, SHADE_HIDDEN_Y, 200);
 	}
 	else
 	{
@@ -322,7 +346,7 @@ void PhoneShade_Update(int allow)
 	YMGUI_Obj_SetHidden(trigger, !allow);
 	if (!allow)
 		PhoneShade_Close(0);
-	if (closing && sheet->area.y <= -448)
+	if (closing && sheet->area.y <= SHADE_HIDDEN_Y)
 		PhoneShade_Close(0);
 	if (visible)
 		for (int i = 0; i < PhoneQuick_Count(); ++i)
@@ -369,6 +393,8 @@ void PhoneShade_Sync(void)
 {
 	if (bright)
 		YMGUI_Slider_SetValue(bright, PhoneHost_GetBrightness());
+	if (volume)
+		YMGUI_Slider_SetValue(volume, PhoneHost_GetVolume());
 }
 void PhoneShade_Init(GYCTX context)
 {
@@ -379,11 +405,11 @@ void PhoneShade_Init(GYCTX context)
 	trigger->event_cb = drag_event;
 	trigger->draw_cb = transparent_draw;
 	YMGUI_Obj_SetHidden(trigger, 1);
-	overlay = YMGUI_Creat_Obj_Creat(ctx->top_layer, 0, 0, W, 448);
+	overlay = YMGUI_Creat_Obj_Creat(ctx->top_layer, 0, 0, W, SHADE_H);
 	overlay->draw_cb = backdrop_draw;
 	overlay->state |= GY_STATE_ClipChildren;
 	overlay->event_cb = drag_event;
-	sheet = YMGUI_Creat_Obj_Creat(overlay, 0, -448, W, 448);
+	sheet = YMGUI_Creat_Obj_Creat(overlay, 0, SHADE_HIDDEN_Y, W, SHADE_H);
 	YMGUI_Obj_SetBgColor(sheet, RGB(20, 28, 44));
 	sheet->event_cb = drag_event;
 	PhoneUI_left_label(sheet, 18, 4, 180, "Yaomi", RGB(162, 174, 198), 2);
@@ -420,15 +446,25 @@ void PhoneShade_Init(GYCTX context)
 	bright = YMGUI_Creat_Slider_Creat(sheet, 78, 230, 226, 24);
 	bright->draw_cb = PhoneUI_slider_draw;
 	YMGUI_Slider_SetChanged(bright, brightness_changed);
-	PhoneUI_left_label(sheet, 18, 272, 180, "通知", WHITE, 0);
-	PhoneUI_button(sheet, 242, 270, 64, 26, "清空", clear_click, RGB(55, 62, 83));
-	cards[0] = PhoneUI_button(sheet, 14, 301, 292, 51, "小雨 · 今天一起去散步吗？", notification_click, RGB(55, 62, 83));
-	cards[1] = PhoneUI_button(sheet, 14, 361, 292, 51, "天气 · 今天晴，适合出门", notification_click, RGB(55, 62, 83));
+	/* 音量（2026-10-12 新增）：亮度下面再开一块同尺寸面板，样式逐项对齐
+	 *   —— 同 x/同宽/同高/同 label 字号/同滑杆绘制回调，只是标签改成"音量"。
+	 *   ⚠ 下面"通知"那一整块（标题 + 清空 + 两张卡片 + 空态 + 收起按钮）
+	 *   因此整体下移 38 px，sheet 高度同步从 448 提到 480（见 SHADE_H）。 */
+	GYOBJ volume_panel = YMGUI_Creat_Obj_Creat(sheet, 14, 262, 292, 36);
+	volume_panel->draw_cb = slider_panel_draw;
+	PhoneUI_left_label(sheet, 18, 268, 55, "音量", WHITE, 2);
+	volume = YMGUI_Creat_Slider_Creat(sheet, 78, 268, 226, 24);
+	volume->draw_cb = PhoneUI_slider_draw;
+	YMGUI_Slider_SetChanged(volume, volume_changed);
+	PhoneUI_left_label(sheet, 18, 310, 180, "通知", WHITE, 0);
+	PhoneUI_button(sheet, 242, 308, 64, 26, "清空", clear_click, RGB(55, 62, 83));
+	cards[0] = PhoneUI_button(sheet, 14, 339, 292, 51, "小雨 · 今天一起去散步吗？", notification_click, RGB(55, 62, 83));
+	cards[1] = PhoneUI_button(sheet, 14, 399, 292, 51, "天气 · 今天晴，适合出门", notification_click, RGB(55, 62, 83));
 	cards[0]->draw_cb = cards[1]->draw_cb = notification_draw;
-	empty = PhoneUI_label(sheet, 14, 350, 292, "暂无通知", RGB(164, 174, 202));
-	GYOBJ handle = PhoneUI_button(sheet, 108, 423, 104, 23, "收起", close_click, 0);
+	empty = PhoneUI_label(sheet, 14, 388, 292, "暂无通知", RGB(164, 174, 202));
+	GYOBJ handle = PhoneUI_button(sheet, 108, 455, 104, 23, "收起", close_click, 0);
 	handle->event_cb = drag_event;
-	preview = YMGUI_Creat_Obj_Creat(overlay, 0, 0, W, 448);
+	preview = YMGUI_Creat_Obj_Creat(overlay, 0, 0, W, SHADE_H);
 	YMGUI_Obj_SetBgColor(preview, PAPER);
 	PhoneUI_label(preview, 18, 25, 284, "截屏预览", INK);
 	preview_image = YMGUI_Creat_Image_Creat(preview, 80, 75, 160, 240);
@@ -464,6 +500,10 @@ intptr_t PhoneShade_Inspect(const char* name)
 		return PhoneQuickBuiltin_State("sound");
 	if (!strcmp(name, "clearing"))
 		return clearing;
+	/* 音量滑杆当前值（2026-10-12）。自检要验"拖滑杆 → 值真的落到
+	 * PhoneHost_GetVolume" 就读它；"volume" 与 PhoneHost_GetVolume 恒等。 */
+	if (!strcmp(name, "volume"))
+		return PhoneHost_GetVolume();
 	if (!strcmp(name, "card0"))
 		return (intptr_t)cards[0];
 	if (!strcmp(name, "card1"))

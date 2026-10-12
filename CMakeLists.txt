@@ -253,7 +253,16 @@ set(APP_SRC
 	src/rtc_clock.c
 	# 图库（2026-10-08）：TF 卡上的 BMP → RGB565 → 灌 W25Q128 → XIP 直读显示。
 	# 流式处理，峰值 RAM 只有 6 KB，与图片尺寸无关（详见 src/img_store.h 顶部）。
+	# 目录扫描表 img_scan_* 也被文件管理器与**音乐**复用（表只有一张，串行使用）。
 	src/img_store.c
+	# ---- 音频（2026-10-12，出货常驻）----
+	# es8311.c   ES8311 的控制通道：I2C1（PB6/PB7）+ 寄存器序列 + 音量（REG32）。
+	# audio_out.c 出音通道：I2S2（PC6/PD3/PB9/PB15|PC1/PC2）+ DMA1_Stream2 循环双缓冲。
+	# wav_play.c  TF 卡 /YMGUI/MUSIC 下的 16 bit PCM WAV → 流式喂给 audio_out。
+	# 三者一起支撑"控制中心音量滑杆"与"音乐 app 播卡上的歌"，默认编入出货固件。
+	src/es8311.c
+	src/audio_out.c
+	src/wav_play.c
 	# QSPI 分块灌库（方案 B 配套）：源文件始终编入，但是**空壳** —— 真正的逻辑
 	# 由 option(YMGUI_QSPI_PROVISION) 里的宏决定编不编。这样 g_prov_enabled 这个
 	# 符号永远存在，tools/qspi_provision.py 能明确区分"没编进来" vs "编了但失败"。
@@ -409,10 +418,38 @@ set(HAL_SRC
 	# 的 import_jpeg）。只编 hal_jpeg —— 不用 MDMA/DMA2D：解码走 polling，
 	# YCbCr→RGB565 由 CPU 做（65k 像素约几毫秒，比引两个新外设划算得多）。
 	${TP}/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_jpeg.c
-	# ⚠ hal_jpeg 的 HAL_JPEG_IRQHandler **静态引用** HAL_MDMA_Abort_IT（哪怕本工程
-	#   不走 MDMA 传输），所以 hal_mdma 必须一起编入，否则链接期 undefined reference。
-	${TP}/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_mdma.c
+# ⚠ hal_jpeg 的 HAL_JPEG_IRQHandler **静态引用** HAL_MDMA_Abort_IT（哪怕本工程
+#   不走 MDMA 传输），所以 hal_mdma 必须一起编入，否则链接期 undefined reference。
+${TP}/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_mdma.c
+# ---- 音频：I2C（配 ES8311）+ I2S（出音）----
+# ⚠⚠ 这两个 HAL 源文件是**出货形态也要的**（2026-10-12 起）：控制中心音量滑杆
+#   与音乐播放都要走它们。此前 conf.h 里的模块开关是开的、源文件却没编进来 ——
+#   那正是"开关开着却链不到符号"的活例；现在按"要用到就编进来"补齐。
+${TP}/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_i2c.c
+${TP}/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_i2s.c
 )
+
+# ---- ES8311 音频链路自检（2026-10-12，方案 A 接线验收）----
+# 默认关：与 YMGUI_XIP_BENCH 同口径，纯自检代码不进出货固件。
+# 打开：cmake -B build -DYMGUI_AUDIO_TEST=ON && cmake --build build --target ymgui-bin
+# 触发与判据：src/audio_test.h 顶部 + tools/audio_check.py。
+# 引脚：I2C1 PB6/PB7 + I2S2 PC6/PD3/PB9/PB15(或PC1)/PC2，
+#       接线表与踩坑（含为什么不能用原表 PB12/PB13/PB14）见
+#       docs/DEVELOPMENT_LOG.md 的「2026-10-12 · ES8311 音频模块接入」。
+#
+# ⚠ 与常驻部分的界线（2026-10-12 重划）：
+#   常驻（默认 ON）= src/es8311.c（codec 控制 + 音量）+ src/audio_out.c（I2S/DMA
+#     出音）+ src/wav_play.c（TF 卡 WAV 播放）—— 控制中心音量滑杆与音乐 app 需要；
+#   自检（默认 OFF）= src/audio_test.c（SWD 触发的扫描/提示音/长音/交叉位拍普查）。
+option(YMGUI_AUDIO_TEST "编入 ES8311 音频链路自检（I2C1+I2S2 扫描与提示音，默认关）" OFF)
+if(YMGUI_AUDIO_TEST)
+	add_compile_definitions(YMGUI_AUDIO_TEST=1)
+	list(APPEND APP_SRC
+		src/audio_test.c)
+	message(STATUS "音频自检: ON（ES8311 扫描/提示音；常驻的 es8311+audio_out+wav_play 不受此开关影响）")
+else()
+	message(STATUS "音频自检: OFF（出货形态；常驻音频播放与音量控制仍编入）")
+endif()
 
 # ---- YMGUI 库本体（12 个可移植层，GLOB 与官方同口径）----
 file(GLOB YMGUI_SRC
@@ -442,6 +479,15 @@ target_compile_options(ymgui-h743.elf PRIVATE
 	-Wall
 	-Wno-unused-parameter
 	-Wno-sign-compare
+)
+
+# ⚠⚠ 链接脚本必须显式登记成链接依赖（2026-10-12 实测踩坑）
+# 现象：改了 linker/*.ld 之后 `cmake --build build` 只重跑"生成 bin"，**elf 不重新链接**
+#   ⇒ 改动静默不生效（那次是给自定义 ISR 加 EXTERN，改完以为生效了，nm 一查符号还在消失）。
+# 根因：ninja 的依赖里只有 .o 与库，链接脚本只是 `-T` 的一个参数，CMake 默认不跟踪它。
+# ⇒ 用 LINK_DEPENDS 把它钉住；以后改链接脚本一定触发重链。
+set_target_properties(ymgui-h743.elf PROPERTIES
+	LINK_DEPENDS "${ROOT}/linker/stm32h743vit6.ld"
 )
 
 # ---- 链接：自定义链接脚本 + newlib-nano（无系统调用）+ libm ----

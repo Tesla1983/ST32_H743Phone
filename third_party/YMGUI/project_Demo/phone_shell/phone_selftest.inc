@@ -816,6 +816,11 @@ static void selftest(void)
 	CHECK(!PhoneShade_Inspect("muted"), "mute tile restores ringing mode");
 	click_at(155, 242);
 	CHECK(PhoneHost_GetBrightness() > 0 && PhoneHost_GetBrightness() < 100, "shade brightness adjusts preview");
+	/* 音量滑杆（2026-10-12 新增，在亮度下面、通知上面）：同一条拖动通路，
+	 * 值落到 PhoneHost_GetVolume；出货构建下 ES8311 没编进来 ⇒ 只验内存值。 */
+	click_at(155, 280);
+	CHECK(PhoneHost_GetVolume() > 0 && PhoneHost_GetVolume() < 100, "shade volume slider adjusts volume");
+	CHECK(PhoneShade_Inspect("volume") == PhoneHost_GetVolume(), "shade inspect volume mirrors phone host");
 	CHECK(YMGUI_Slider_GetValue((GYOBJ)PhoneApps_Inspect(SETTINGS, "brightness_slider", 0)) == PhoneHost_GetBrightness(), "settings brightness follows control center");
 	PhoneHost_SetBrightness(100);
 	click_at(200, 185);
@@ -826,36 +831,40 @@ static void selftest(void)
 	CHECK(!memcmp((void*)PhoneShade_Inspect("capture"), test_reference, W * H * sizeof(GYpx)), "screenshot pixels match underlying screen without shade");
 	PhoneShade_Open();
 	step_time(260);
-	click_at(160, 326);
+	click_at(160, 364);          /* ⚠ 2026-10-12：通知卡片整体下移 38 px（音量滑杆插进来了） */
 	step_time(450);
 	CHECK(!PhoneShade_Visible() && scene == APP && current_app == MESSAGES, "message notification opens message app");
 	drag_pointer(160, 8, 0, 160);
 	step_time(260);
 	CHECK(PhoneShade_Inspect("notices") == 1, "opened notification removed without clearing others");
-	click_at(270, 282);
+	click_at(270, 320);
 #if YMGUI_ANIM
 	CHECK(PhoneShade_Inspect("clearing") && !PhoneShade_Inspect("empty"), "clear keeps cards until exit completes");
 	step_time(100);
 	GYOBJ exiting_notice = (GYOBJ)PhoneShade_Inspect("card1");
-	CHECK(exiting_notice->area.x > 14 && exiting_notice->area.x < W && exiting_notice->area.y == 361,
+	CHECK(exiting_notice->area.x > 14 && exiting_notice->area.x < W && exiting_notice->area.y == 399,
 		  "notification moves right, not upward");
 	int exit_x = exiting_notice->area.x;
-	click_at(270, 282);
+	click_at(270, 320);
 	CHECK(exiting_notice->area.x == exit_x, "duplicate clear does not restart animation");
-	click_at(exit_x + 20, 385);
+	click_at(exit_x + 20, 421);
 	CHECK(PhoneShade_Visible() && current_app == MESSAGES, "exiting notification cannot launch another app");
 #endif
 	step_time(350);
 	CHECK(!PhoneShade_Inspect("clearing") && PhoneShade_Inspect("notices") == 0 && PhoneShade_Inspect("empty"), "right exit finishes with empty state");
-	click_at(270, 282);
+	click_at(270, 320);
 	CHECK(!PhoneShade_Inspect("clearing"), "clearing empty notifications is a no-op");
-	drag_pointer(160, 434, 0, -160);
+	drag_pointer(160, 466, 0, -160);
 	step_time(260);
 	CHECK(!PhoneShade_Visible() && scene == APP, "swipe handle up dismisses shade without leaving app");
 	PhoneShade_Open();
 	step_time(260);
 	CHECK(PhoneShade_Inspect("empty") && ((GYOBJ)PhoneShade_Inspect("card1"))->area.x == 14,
 		  "reopening keeps notifications empty with hidden cards reset");
+	/* ⚠ 2026-10-12：控制中心已从 448 高扩到 480（见 phone_shade.c 的 SHADE_H），
+	 *   overlay 现在覆盖到底 ⇒ 这一下点的是**遮罩**而不是导航栏的返回键，
+	 *   结果与"返回键先收抽屉"一致（抽屉收起、app 不退），断言照旧成立；
+	 *   若将来把 sheet 缩回 448，这里才会重新命中导航栏 back。 */
 	click_at(65, 464);
 	step_time(260);
 	CHECK(!PhoneShade_Visible() && scene == APP, "back closes shade before app");

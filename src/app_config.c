@@ -7,10 +7,20 @@
 
 #include <string.h>
 
-/* 扇区里只写前 32 字节，其余保持 0xFF（便于将来在同一扇区追加配置项） */
+/* ⚠ 2026-10-12：长度从 32 改成 **36**。
+ *
+ * 【为什么追加而不是复用 reserved】blob 里的"预留格"**早就被旧固件写成 0 了**
+ *   —— 旧固件是按 sizeof(blob) 整块写盘的，memset 之后没设过的 reserved 就是 0。
+ *   所以 reserved[0] 那一格在已落盘的扇区里存的是 **0 而不是 0xFF**。
+ *   我把"音量"第一次就是放在那一格上，结果：0 落在音量合法区间 0..100 内
+ *   ⇒ 开机音量 = 0（静音），板上实测 display_volume=0（应为 70）。
+ *
+ *   ⇒ 结论：**新字段只能追加到 blob 尾部（旧固件没写过的区域，读回来是 0xFF）**。
+ *     放在 crc 之后还有个好处：CRC 只覆盖 crc 之前的字节（见 blob_crc），
+ *     所以旧扇区照样能通过 CRC 校验，不需要迁移、不需要升版本。 */
 #define APP_CFG_MAGIC     0x59434F4Eu    /* "YCON" */
 #define APP_CFG_VERSION   1u
-#define APP_CFG_BLOB_LEN  32u
+#define APP_CFG_BLOB_LEN  36u
 
 /* 屏幕亮度取值范围与出厂默认（2026-10-04 用户决策：默认 50、且可持久化）。
  * ⚠ MIN 取 1 而不是 0：brightness=0 会让 phone_flush 叠一层 alpha=160 的
@@ -19,6 +29,15 @@
 #define APP_CFG_BRIGHTNESS_DEFAULT 50u
 #define APP_CFG_BRIGHTNESS_MIN      1u
 #define APP_CFG_BRIGHTNESS_MAX    100u
+
+/* 音量取值范围与出厂默认（2026-10-12 新增，控制中心音量滑杆）。
+ * ⚠ 与亮度不同：**下限就是 0** —— 音量 0 = 静音，是用户会主动选的合法值
+ *   （亮度 0 会全屏死黑、与"屏坏了"无法区分，所以亮度禁止 0）。
+ *   默认 70 而不是 50：ES8311 上 50 约 -47 dB 偏小，70 约 -28 dB，接上就能听见。
+ *   越界（含旧扇区里从没写过的 0xFFFFFFFF）一律回退默认。 */
+#define APP_CFG_VOLUME_DEFAULT 70u
+#define APP_CFG_VOLUME_MIN       0u
+#define APP_CFG_VOLUME_MAX     100u
 
 typedef struct
 {
@@ -40,6 +59,16 @@ typedef struct
     uint32_t ribbon_translucent;   /* 0=不透明(快) 1=半透明/透光。★默认 1 */
     uint32_t reserved[1];
     uint32_t crc;           /* 覆盖 crc 之前的全部字节 */
+
+    /* ★2026-10-12 新增"音量"（0..100，出厂 70）。
+     * ⚠⚠ **必须放在 crc 之后**：见上面 APP_CFG_BLOB_LEN 的长注释 ——
+     *   crc 之前的格子（含 reserved）在旧扇区里是 0 而不是 0xFF，
+     *   复用它们会让"从没写过"被读成合法值 0（静音）。
+     *   放 crc 之后 ⇒ 旧扇区那 4 字节是 0xFF ⇒ 0xFFFFFFFF 越界 ⇒ 回默认 70。
+     * ⚠ 代价：这个字段**不在 CRC 保护范围内**（blob_crc 只算到 crc 之前），
+     *   单字节翻转无法被检出 —— 可接受：最坏结果是音量变成另一个合法值，
+     *   而亮度/语言/半透明这些"错了会明显不可用"的项仍在 CRC 里。 */
+    uint32_t volume;
 } AppConfigBlob;
 
 /* ---- 当前内存中的设置（DTCM .bss）---- */
@@ -57,6 +86,7 @@ volatile uint32_t g_cfg_save_cnt   = 0;
 volatile uint32_t g_cfg_dirty      = 0;
 volatile uint32_t g_cfg_ribbon     = 1;   /* 1=半透明（默认）；开关当前值 */
 volatile uint32_t g_cfg_brightness = APP_CFG_BRIGHTNESS_DEFAULT; /* 0..100，出厂 50 */
+volatile uint32_t g_cfg_volume     = APP_CFG_VOLUME_DEFAULT;     /* 0..100，出厂 70 */
 /* SWD 写 1 → 擦掉配置扇区（恢复出厂），完成自动清 0。结果看 g_cfg_factory_rc。 */
 volatile uint32_t g_cfg_factory_reset = 0;
 volatile uint32_t g_cfg_factory_rc    = 0xFFFFFFFFu;
@@ -114,6 +144,7 @@ static void blob_defaults(AppConfigBlob *b)
     b->brightness = APP_CFG_BRIGHTNESS_DEFAULT;
     b->theme      = 0u;
     b->ribbon_translucent = 1u;
+    b->volume     = APP_CFG_VOLUME_DEFAULT;
     b->crc        = blob_crc(b);
 }
 
@@ -202,6 +233,39 @@ uint32_t AppConfig_GetBrightness(void)
     return s_cur.brightness;
 }
 
+/* ---- 音量（2026-10-12 新增，控制中心音量滑杆）----
+ *
+ * 【语义】0..100，出厂 70；0 = 静音。与亮度同构（同一套"值相同不写"），
+ *   落盘由 main.c 的持久化回调触发；写 ES8311 REG32 的动作也在那条回调里。
+ * 【为什么不用 brightness 的"下限 1"】音量 0 没有歧义：静音就是静音，
+ *   用户能立刻拖回来；亮度 0 是"屏像坏了"，无法自证 ⇒ 两者下限不同是有意的。 */
+static uint32_t volume_valid(uint32_t v)
+{
+    if (v < APP_CFG_VOLUME_MIN || v > APP_CFG_VOLUME_MAX)
+    {
+        return APP_CFG_VOLUME_DEFAULT;
+    }
+    return v;
+}
+
+void AppConfig_SetVolume(uint32_t v)
+{
+    uint32_t nv = volume_valid(v);
+
+    if (s_cur.volume != nv)
+    {
+        s_cur.volume  = nv;
+        s_cur.crc     = blob_crc(&s_cur);
+        g_cfg_volume  = nv;
+        g_cfg_dirty   = 1u;
+    }
+}
+
+uint32_t AppConfig_GetVolume(void)
+{
+    return s_cur.volume;
+}
+
 uint32_t AppConfig_IsDirty(void)
 {
     return g_cfg_dirty;
@@ -223,6 +287,7 @@ void AppConfig_Load(void)
         g_cfg_lang = s_cur.lang;
         g_cfg_ribbon = s_cur.ribbon_translucent;
         g_cfg_brightness = s_cur.brightness;
+        g_cfg_volume     = s_cur.volume;
         return;
     }
 
@@ -240,6 +305,7 @@ void AppConfig_Load(void)
         g_cfg_lang   = s_cur.lang;
         g_cfg_ribbon = s_cur.ribbon_translucent;
         g_cfg_brightness = s_cur.brightness;
+        g_cfg_volume     = s_cur.volume;
         return;
     }
 
@@ -252,6 +318,7 @@ void AppConfig_Load(void)
         /* g_cfg_ribbon 保持默认；下面统一在成功路径末尾同步一次 */           /* 空扇区（首次上电是 0xFF）或格式不符 */
         g_cfg_lang   = s_cur.lang;
         g_cfg_brightness = s_cur.brightness;
+        g_cfg_volume     = s_cur.volume;
         return;
     }
 
@@ -262,6 +329,7 @@ void AppConfig_Load(void)
         g_cfg_crc_ok = 0u;
         g_cfg_lang   = s_cur.lang;
         g_cfg_brightness = s_cur.brightness;
+        g_cfg_volume     = s_cur.volume;
         return;
     }
 
@@ -288,6 +356,9 @@ void AppConfig_Load(void)
      *   之后 Save 的 memcmp 会认为"没变"而永不修正 ⇒ 永久黑屏。
      *   所以：越界即回退默认，并让钳制后的结果参与后面的 s_flashed 快照。 */
     s_cur.brightness = brightness_valid(s_cur.brightness);
+    /* 音量同理：旧扇区那 4 字节从没写过（=0xFFFFFFFF），必须钳回默认 70
+     *   再参与 s_flashed 快照 —— 否则开机音量会是"越界的垃圾值"。 */
+    s_cur.volume = volume_valid(s_cur.volume);
     /* ⚠ 钳制动了内容就必须重算 crc —— 否则 s_flashed 快照带着"旧 crc"，
      *   下次 Save 写出去的 blob 会 crc != blob_crc(blob)，
      *   重启后 AppConfig_Load 的 CRC 校验直接判失败 ⇒ 整套设置全丢。
@@ -301,6 +372,10 @@ void AppConfig_Load(void)
     g_cfg_lang    = s_cur.lang;
     g_cfg_ribbon  = s_cur.ribbon_translucent;
     g_cfg_brightness = s_cur.brightness;
+    /* ⚠ 成功路径**也必须**同步：少了这行，g_cfg_volume 会一直停在编译期初值 70，
+     *   即使实际值已经被 flash 里的旧内容（或钳制结果）改掉 —— 板上实测正是
+     *   靠"g_cfg_volume=70 而 display_volume=0"这个不一致才暴露出顺序问题的。 */
+    g_cfg_volume  = s_cur.volume;
 }
 
 void AppConfig_Save(void)

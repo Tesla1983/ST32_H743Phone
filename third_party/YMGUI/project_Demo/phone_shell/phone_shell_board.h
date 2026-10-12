@@ -41,6 +41,21 @@ void PhoneShell_SetRibbonPersistCallback(void (*cb)(uint8_t translucent));
  * ⚠ 同样必须在 PhoneShell_BoardInit **之前**挂好。 */
 void PhoneShell_SetBrightnessPersistCallback(void (*cb)(uint8_t brightness));
 
+/* 挂"音量"的持久化回调（2026-10-12 新增，与亮度完全同构）。
+ * phone_shell 在用户松手提交音量时回调一次，参数是 0..100 的音量值。
+ * 由板级 main.c 接到 AppConfig_Save + ES8311 音量寄存器。
+ * ⚠ 同样必须在 PhoneShell_BoardInit **之前**挂好。 */
+void PhoneShell_SetVolumePersistCallback(void (*cb)(uint8_t volume));
+
+/* 设置音量（0..100，越界自动钳位；**值相同则什么都不做**）。
+ * 与亮度同款：由 src/main.c 在 PhoneShell_BoardInit 之前用配置里的值调一次，
+ * 好让首值就是用户上次拖的那档（音量进不了 framebuffer，不存在"首帧闪一下"，
+ * 但 codec 起播时要读到正确的值）。 */
+void PhoneHost_SetVolume(int volume);
+
+/* 当前音量 0..100（board 侧每拍可读，与 PhoneHost_GetBrightness 同层同理由）。 */
+int PhoneHost_GetVolume(void);
+
 /* 设置屏幕亮度（0..100，越界自动钳位；**值相同则什么都不做**）。
  * 由 src/main.c 在 PhoneShell_BoardInit 之前用配置里的值调一次，好让首帧
  * 就用对亮度（晚一步会先画一帧错的再纠正，用户看得见闪一下）。
@@ -161,6 +176,26 @@ int PhoneHost_GetBrightness(void);
 /* 统计当前 UI 的**可见对象数**（不含 Hidden 的），并把最大树深写进 *out_max_depth。
  * 用途：每 band 的固定开销 ∝ 对象数 × 树深，数出来才知道裁剪/减 band 能省多少。 */
 int PhoneShell_BoardObjStats(int* out_max_depth);
+
+/* ---- 音乐：TF 卡 /YMGUI/MUSIC 下的 .wav（2026-10-12）----
+ * 与 BoardPic_* / BoardNote_* 同一套分层：phone_shell 不认识 FatFs，
+ * 实现在 src/wav_play.c（播放链路）与 src/img_store.c（目录扫描表）。
+ *
+ * ⚠ 扫描表只有一张、与照片/笔记共用 ⇒ 切分类必须重新 Scan，索引不能跨分类混用。
+ * ⚠ 播放是**流式**的：数据从 TF 卡边读边送 I2S，不在 RAM 里放整首歌（一首
+ *   48 828 Hz/16 bit 的歌 154 秒 ≈ 15 MB，板上 RAM 总共才 1 MB 级）。
+ * ⚠ 采样率：I2S 的 fs 由 MCLK 固定为 48 828 Hz，文件不是这个率就会变速变调
+ *   （48 k 文件快 1.7% 听不出；44.1 k 会慢 10.7%，明显不对）。 */
+int         BoardMusic_Scan(void);                  /* 扫一次，返回条目数；<0 = 目录打不开 */
+int         BoardMusic_Count(void);
+int         BoardMusic_Name(int i, char* out, int n);
+int         BoardMusic_Size(int i, uint32_t* size);
+int         BoardMusic_Play(int i);                 /* 0 = 已起播；<0 = 失败（看 g_wav_rc）*/
+void        BoardMusic_Stop(void);
+int         BoardMusic_Playing(void);               /* 1 = 在播 */
+int         BoardMusic_LastRc(void);                /* 上一次动作的返回码（UI 直接显示）*/
+uint32_t    BoardMusic_ElapsedMs(void);             /* 已播毫秒（按文件采样率折算）*/
+uint32_t    BoardMusic_TotalMs(void);               /* 总时长毫秒 */
 
 /* ---- 输入法自测（SWD 触发，无需碰屏）----
  * 板上没有物理键盘也没有 stdio，"看着屏幕上有没有候选"不算可靠判据。

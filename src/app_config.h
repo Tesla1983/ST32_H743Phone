@@ -71,6 +71,17 @@ void     AppConfig_SetRibbonTranslucent(uint32_t on);
 void     AppConfig_SetBrightness(uint32_t value);
 uint32_t AppConfig_GetBrightness(void);
 
+/* 音量（2026-10-12 新增，控制中心音量滑杆：亮度下面、通知上面）
+ *
+ * 【语义】0..100 整数，**出厂默认 70**，0 = 静音。
+ * ⚠ 与亮度刻意不同：亮度下限是 1（0 = 全屏死黑，与"屏坏了"无法区分），
+ *   音量 0 没有这种歧义 —— 静音就是静音，用户拖一下就回来。
+ * 【落到硬件】main.c 的持久化回调把它换算成 ES8311 的 DAC 音量寄存器
+ *   REG32（0..100 → 0x00..0xBF，0xBF = 0 dB）。出货构建没编 ES8311 驱动，
+ *   那种情况下只落盘、不碰 I2C。 */
+void     AppConfig_SetVolume(uint32_t value);
+uint32_t AppConfig_GetVolume(void);
+
 /* 恢复出厂设置：擦掉配置扇区，下一次上电整套设置回 blob_defaults()。
  * 由 SWD 写 1 到 g_cfg_factory_reset 触发，跑完自动清 0。
  * ⚠ 必须由固件执行 —— 配置在 XIP 只读窗口，主机侧写不进去。 */
@@ -87,6 +98,7 @@ extern volatile uint32_t g_cfg_crc_ok;      /* 1 = CRC 校验通过 */
 extern volatile uint32_t g_cfg_lang;        /* 当前语言（0 中 / 1 英） */
 extern volatile uint32_t g_cfg_ribbon;      /* 半透明开关当前值（1 半透明 / 0 不透明） */
 extern volatile uint32_t g_cfg_brightness;  /* 亮度当前值 0..100（出厂 50，越界已钳回默认） */
+extern volatile uint32_t g_cfg_volume;      /* 音量当前值 0..100（出厂 70，越界已钳回默认） */
 extern volatile uint32_t g_cfg_factory_reset; /* SWD 写 1 → 擦配置扇区（恢复出厂），跑完清 0 */
 extern volatile uint32_t g_cfg_factory_rc;    /* 上次恢复出厂的结果（0=成功） */
 extern volatile uint32_t g_cfg_save_cnt;    /* 本上电周期内实际落盘次数 */
