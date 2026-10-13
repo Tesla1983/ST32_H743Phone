@@ -65,6 +65,7 @@ volatile uint32_t g_ao_dma_half  = 0;    /* 半传中断次数 */
 volatile uint32_t g_ao_dma_cplt  = 0;    /* 全传中断次数 */
 volatile uint32_t g_ao_dma_err   = 0;    /* DMA 错误回调次数 */
 volatile uint32_t g_ao_dbg2[16];         /* DMA/SPI 现场快照（见 dbg2_snapshot）*/
+volatile uint32_t g_ao_ring_drop = 0;    /* 环形缓冲满而被丢弃的半字数（应为 0；>0 = 补数越界）*/
 
 /* ---- 环形缓冲 → SRAM1 的 .bss_audio（MPU region0：非缓存）----
  * 8192 个半字 = 16 KB = 4096 帧 ≈ 84 ms 的音频；一次补半个环（2048 帧 ≈ 42 ms）。 */
@@ -76,8 +77,15 @@ static uint16_t AUDIO_BUF_ATTR s_ring[RING_HALFWORDS];
 /* feeder 的落脚点（连续缓冲，补完再拷进 ring）—— 2048 帧 × 4 B = 8 KB */
 static int16_t  AUDIO_BUF_ATTR s_tmp[RING_HALF_FRAMES * 2u];
 
-static volatile uint32_t s_wr;          /* 写指针（半字），主循环推进 */
-static volatile uint32_t s_rd;          /* 读指针（半字），ISR 推进 */
+/* ⚠⚠ 2026-10-13 修正：s_wr/s_rd 改成**单调递增计数器**（不再每次 & RING_MASK，
+ *   只在取数组索引时才掩码）。原因：`(s_wr - s_rd) & RING_MASK` 的占用式在
+ *   **环满（差 = 8192）时会读成 0 —— 与"环空"同形**。旧代码靠"每拍只补半个环 +
+ *   消费慢"侥幸没暴露；换成 DMA 后消费变成确定性排空，一次越界补数就会把
+ *   未读数据覆盖掉，实测音源被多吃 1.62 倍（163 255 B/s vs 应有 97 656 B/s）。
+ *   单调计数器下：差 = 0 才是空、差 = 8192 就是满，语义唯一。
+ *   ⚠ 回绕在 2^32，是 8192 的整数倍 ⇒ 掩码索引仍一致（96k 半字/s 下约 12 h 才回绕）。 */
+static volatile uint32_t s_wr;          /* 写计数（半字，单调），主循环推进 */
+static volatile uint32_t s_rd;          /* 读计数（半字，单调），ISR 推进 */
 static volatile uint8_t  s_tim_pending = 0u;   /* 起播延后到下一拍再起 TIM6（见下）*/
 
 static I2S_HandleTypeDef s_hi2s;        /* I2S2 = SPI2 的 I2S 模式 */
@@ -125,7 +133,7 @@ static void dbg_snapshot(void)
     g_ao_dbg[2]  = s_hi2s.Instance->CFG1;
     g_ao_dbg[3]  = s_hi2s.Instance->I2SCFGR;
     g_ao_dbg[4]  = TIM6->ARR;
-    g_ao_dbg[5]  = (s_wr - s_rd) & RING_MASK;
+    g_ao_dbg[5]  = s_wr - s_rd;
     g_ao_dbg[6]  = g_ao_push;
     g_ao_dbg[7]  = g_ao_isr_dry;
     g_ao_dbg[8]  = g_ao_isr;
@@ -158,7 +166,7 @@ static void dbg2_snapshot(void)
     g_ao_dbg2[9]  = g_ao_dma_half;
     g_ao_dbg2[10] = g_ao_dma_cplt;
     g_ao_dbg2[11] = g_ao_dma_err;
-    g_ao_dbg2[12] = (s_wr - s_rd) & RING_MASK;
+    g_ao_dbg2[12] = s_wr - s_rd;
     g_ao_dbg2[13] = NVIC->ISER[0u];
     g_ao_dbg2[14] = RCC->AHB1ENR;
     g_ao_dbg2[15] = s_dma_ready;
@@ -323,7 +331,7 @@ static void tim6_stop(void)
 static void dma_fill_half(uint32_t half)
 {
     uint16_t *dst   = &s_dma_buf[half * DMA_HALF_HALFWORDS];
-    uint32_t  avail = (s_wr - s_rd) & RING_MASK;
+    uint32_t  avail = s_wr - s_rd;
 
     if (avail > DMA_HALF_HALFWORDS)
     {
@@ -332,7 +340,7 @@ static void dma_fill_half(uint32_t half)
     for (uint32_t i = 0u; i < avail; ++i)
     {
         dst[i] = s_ring[s_rd & RING_MASK];
-        s_rd = (s_rd + 1u) & RING_MASK;
+        s_rd++;
     }
     for (uint32_t i = avail; i < DMA_HALF_HALFWORDS; ++i)
     {
@@ -463,7 +471,7 @@ void TIM6_DAC_IRQHandler(void)
         return;
     }
 
-    if (((s_wr - s_rd) & RING_MASK) == 0u)
+    if (s_wr == s_rd)
     {
         g_ao_isr_dry++;                 /* 缓冲空了：这次什么都不做（保持上一次的值/静音）*/
         return;
@@ -475,7 +483,7 @@ void TIM6_DAC_IRQHandler(void)
      *   把整个主循环饿死 —— 2026-10-12 实测过这个后果）。 */
     for (uint32_t k = 0u; k < 8u; ++k)
     {
-        if (((s_wr - s_rd) & RING_MASK) == 0u)
+        if (s_wr == s_rd)
         {
             break;
         }
@@ -484,7 +492,7 @@ void TIM6_DAC_IRQHandler(void)
             break;
         }
         *((volatile uint16_t *)&SPI2->TXDR) = s_ring[s_rd & RING_MASK];
-        s_rd = (s_rd + 1u) & RING_MASK;
+        s_rd++;
         g_ao_push++;
         if ((g_ao_push & 1u) == 0u)      /* 2 个半字 = 1 帧 */
         {
@@ -499,8 +507,13 @@ static void ring_put(const int16_t *src, uint32_t halfwords)
 {
     for (uint32_t i = 0; i < halfwords; ++i)
     {
-        s_ring[s_wr] = (uint16_t)src[i];
-        s_wr = (s_wr + 1u) & RING_MASK;
+        if ((s_wr - s_rd) >= RING_HALFWORDS)
+        {
+            g_ao_ring_drop++;               /* 环已满：丢弃，绝不覆盖未读数据 */
+            return;
+        }
+        s_ring[s_wr & RING_MASK] = (uint16_t)src[i];
+        s_wr++;
     }
 }
 
@@ -705,6 +718,7 @@ int audio_out_start(void)
     g_ao_dma_half = 0u;
     g_ao_dma_cplt = 0u;
     g_ao_dma_err  = 0u;
+    g_ao_ring_drop = 0u;
     return 0;
 }
 
@@ -778,7 +792,7 @@ void audio_out_tick(void)
 
     /* 补数：环形缓冲里剩的不超过半个环就补半个环（≈42 ms 的量，主循环一拍 16 ms 足够）。 */
     {
-        uint32_t used = (s_wr - s_rd) & RING_MASK;
+        uint32_t used = s_wr - s_rd;
 
         if (used <= (RING_HALFWORDS / 2u))
         {

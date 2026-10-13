@@ -105,5 +105,11 @@ extern volatile uint32_t g_ao_dma_half;  /* 半传中断次数 */
 extern volatile uint32_t g_ao_dma_cplt;  /* 全传中断次数 */
 extern volatile uint32_t g_ao_dma_err;   /* DMA 错误回调次数 */
 extern volatile uint32_t g_ao_dbg2[16];  /* DMA/SPI 现场快照（索引表见 .c）*/
+extern volatile uint32_t g_ao_ring_drop; /* 环形缓冲满被丢弃的半字数（应恒 0；>0 = 补数越界、会丢音）*/
+
+/* ⚠ 2026-10-13 环形缓冲的一次语义修正（影响两条出音路径）：
+ *   s_wr/s_rd 改为**单调计数器**（只在取索引时 & RING_MASK）。旧的
+ *   `(s_wr - s_rd) & RING_MASK` 占用式在"环满"时读成 0（与"环空"同形），
+ *   DMA 路径下会越界补数、覆盖未读数据（实测音源被多吃 1.62 倍）。 */
 
 #endif /* AUDIO_OUT_H */
