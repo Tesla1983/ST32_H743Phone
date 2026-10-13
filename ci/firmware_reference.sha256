@@ -1162,5 +1162,36 @@
 #   · 板上核验：tools/verify_board_image.py 全量读回 1 656 316 字节与 .bin 逐字节一致。
 #   ⚠ 听不听得见仍由耳朵判定（数据通路已证）；音量默认 70，下限 0=静音。
 # FLASH 1 656 316 B（78.97%），比第二十九版 +8768 B（主要是音频引擎常驻 + 诊断）。
-89e4744703212193ad3fb375c73f706e7b64145e67dcb7400fd9566cef9dc407  ymgui-h743.bin
-572ba65396c1c52cb9953b5a16fa5e0bb610431e2c0949b9a4b8f4b556d63ba3  ymgui-h743.elf
+# 旧哈希（第三十版，已停用）：
+# 89e4744703212193ad3fb375c73f706e7b64145e67dcb7400fd9566cef9dc407  ymgui-h743.bin
+# 572ba65396c1c52cb9953b5a16fa5e0bb610431e2c0949b9a4b8f4b556d63ba3  ymgui-h743.elf
+
+# ============================================================================
+# 第三十版·补丁（2026-10-13）· 修掉音乐播放器「拖动进度条无效」
+# ============================================================================
+# 为什么变（按「更新时机」的 a：有意为之的功能改动；工具链 14.3.rel1 未变）：
+#   进度条是 YMGUI 的 Slider 控件，但创建时**只设了 draw_cb，没挂 changed 回调**
+#   （对照 phone_shade.c 的亮度/音量滑杆都挂了 YMGUI_Slider_SetChanged），于是拖动只动
+#   滑块、不触发任何动作；再加上 app_tick 每 250 ms 用 YMGUI_Slider_SetValue 把进度
+#   覆盖回去，拖动等于无效。
+#   修法（对照官方 music_player.c 的做法）：
+#     1. src/wav_play.c：新增 wav_play_seek_ms(ms) —— 用 f_lseek 跳到 data chunk 内
+#        「ms 折算的字节偏移」（按帧边界对齐、且不落在 data 末尾），同步 g_wav_pos；
+#        s_data_off（data chunk 起点）在 wav_play_start 解析头后记住。
+#        新增 board 层 BoardMusic_Seek(ms) 转调（phone_shell 不直接 include src/）。
+#     2. apps/music.c：给 music_seek 滑杆挂 YMGUI_Slider_SetChanged(on_seek)；on_seek
+#        把 0..100 的滑块值折算成毫秒调 BoardMusic_Seek，并实时刷新时间标签。
+#     3. apps/music.c：app_tick 里**拖动期间不回写滑块值** —— 用
+#        `!(state.music_seek->state & GY_STATE_Pressed)` 判断（官方同款做法），
+#        否则会把用户刚拖到的位置刷回去。
+#   ⚠ 已知限制：暂停态（未起播）拖动只改滑块视觉、不起播后从 0 重头——
+#     本版只修「播放中拖动跳播」这个主场景；暂停/续播保持位置是更大的重构
+#     （需保留打开的文件句柄而非 stop 时关掉），留待后续。
+# 验收（需在板目测，属触摸交互）：
+#   · 编译通过（16/16，FLASH 1 656 780 B / 79.00%，比 v30 +464 B，零新增告警）；
+#   · 逻辑自检：seek 落点按帧对齐、不越界、不落在末尾（代码静态可证）；
+#   · 实拖待测：烧录后播放中拖动进度条应即时跳播、时间标签跟随、松手后从新位置继续。
+#   ⚠ 未做在板自动化：拖动是触摸交互，SWD 无法模拟滑块按下/拖动事件，最终靠人手目测。
+# FLASH 1 656 780 B（79.00%），比第三十版 +464 B。
+bd9d88b4d2c2d55e2fb149ab71c3deef4cf3357e20de73b1854c39bf13bd8666  ymgui-h743.bin
+e0b5cb9c170b3d062728d833ff972f19f96e960875301e070885bfebb451f464  ymgui-h743.elf

@@ -50,6 +50,7 @@ volatile uint32_t g_wav_test = 0;
 static FIL  s_f;
 static char s_path[IMG_PATH_MAX];
 static uint8_t s_opened;
+static uint32_t s_data_off;   /* data chunk 在文件里的起始偏移（seek 用，0 = 还没解析头）*/
 
 /* ====================== WAV 头解析 =======================
  * 只认最朴素的 RIFF/WAVE + fmt + data。做法是**逐个 chunk 走**，
@@ -231,6 +232,7 @@ int wav_play_start(const char *path)
     g_wav_channels = ch;
     g_wav_total    = len;
     g_wav_pos      = 0u;
+    s_data_off     = off;        /* 记住 data chunk 起点，供 seek 换算绝对偏移 */
 
     path_copy(s_path, (int)sizeof(s_path), path);
 
@@ -268,6 +270,43 @@ void wav_play_stop(void)
     }
     g_wav_state = 0u;
     g_wav_pos   = 0u;
+}
+
+int wav_play_seek_ms(uint32_t ms)
+{
+    uint32_t bps;
+    uint32_t frame;
+    uint64_t b;
+
+    /* 必须文件已打开且头已解析，否则没法把毫秒换算成字节偏移。 */
+    if (s_opened == 0u || s_data_off == 0u ||
+        g_wav_total == 0u || g_wav_rate == 0u || g_wav_channels == 0u)
+    {
+        return -1;
+    }
+
+    bps   = g_wav_rate * g_wav_channels * 2u;   /* 每秒字节数（16 bit PCM）*/
+    frame = g_wav_channels * 2u;                /* 一帧字节数（对齐用）*/
+    if (bps == 0u || frame == 0u)
+    {
+        return -1;
+    }
+
+    /* 目标数据字节（相对 data chunk 起点）。 */
+    b = (uint64_t)ms * (uint64_t)bps / 1000u;
+    if (b >= (uint64_t)g_wav_total)
+    {
+        /* 别正好落在末尾 —— 否则会被"播完"判据立刻收尾。留一帧余量。 */
+        b = (g_wav_total >= frame) ? ((uint64_t)g_wav_total - frame) : 0u;
+    }
+    b -= (b % frame);                            /* 对齐到帧边界，避免半样本爆音 */
+
+    if (f_lseek(&s_f, s_data_off + (uint32_t)b) != FR_OK)
+    {
+        return -1;
+    }
+    g_wav_pos = (uint32_t)b;                     /* 同步进度量，elapsed/total 立刻反映新位置 */
+    return 0;
 }
 
 void wav_play_tick(void)
@@ -398,4 +437,9 @@ uint32_t BoardMusic_ElapsedMs(void)
 uint32_t BoardMusic_TotalMs(void)
 {
     return wav_play_total_ms();
+}
+
+int BoardMusic_Seek(uint32_t ms)
+{
+    return wav_play_seek_ms(ms);
 }

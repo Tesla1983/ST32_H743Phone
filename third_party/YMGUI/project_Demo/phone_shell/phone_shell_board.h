@@ -196,6 +196,7 @@ int         BoardMusic_Playing(void);               /* 1 = 在播 */
 int         BoardMusic_LastRc(void);                /* 上一次动作的返回码（UI 直接显示）*/
 uint32_t    BoardMusic_ElapsedMs(void);             /* 已播毫秒（按文件采样率折算）*/
 uint32_t    BoardMusic_TotalMs(void);               /* 总时长毫秒 */
+int         BoardMusic_Seek(uint32_t ms);           /* 跳播到指定毫秒（拖动进度条用；没在播返回 <0）*/
 
 /* ---- 输入法自测（SWD 触发，无需碰屏）----
  * 板上没有物理键盘也没有 stdio，"看着屏幕上有没有候选"不算可靠判据。

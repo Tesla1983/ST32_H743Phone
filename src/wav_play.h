@@ -42,6 +42,13 @@ int  wav_play_busy(void);
 uint32_t wav_play_elapsed_ms(void);
 uint32_t wav_play_total_ms(void);
 
+/**
+ * @brief  跳播：把当前播放位置移到 ms 处（f_lseek + 同步 g_wav_pos）
+ * @return 0 = 成功；<0 = 失败（没在播 / 头没解析 / lseek 失败）。
+ *         ⚠ 只在文件已打开时有效；落点会按帧边界对齐，且不落在 data 末尾。
+ */
+int      wav_play_seek_ms(uint32_t ms);
+
 /* ---- SWD 可读诊断量 ---- */
 extern volatile int32_t  g_wav_rc;       /* 0=OK；<0 = 失败（取值表见 wav_play_start 注释）*/
 extern volatile uint32_t g_wav_state;    /* 0 停 / 1 播 */
@@ -65,5 +72,6 @@ int         BoardMusic_Playing(void);
 int         BoardMusic_LastRc(void);   /* 上一次动作的返回码（UI 直接显示）*/
 uint32_t    BoardMusic_ElapsedMs(void);
 uint32_t    BoardMusic_TotalMs(void);
+int         BoardMusic_Seek(uint32_t ms);  /* 跳播到指定毫秒（拖动进度条用）*/
 
 #endif /* WAV_PLAY_H */

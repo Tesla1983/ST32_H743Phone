@@ -39,6 +39,7 @@ static void update_music(void);
 static void on_music(GYOBJ btn);
 static void on_prev(GYOBJ btn);
 static void on_next(GYOBJ btn);
+static void on_seek(GYOBJ sld, int32 v);   /* 拖动进度条 → 跳播 */
 
 static void fmt_time(char* out, int n, uint32 ms)
 {
@@ -100,15 +101,21 @@ static void app_tick(uint32 elapsed)
 		uint32 now   = BoardMusic_ElapsedMs();
 		char   a[12], b[12];
 
-		if (total > 0u)
-		{
-			YMGUI_Slider_SetValue(state.music_seek,
-								  (int32)((uint64_t)now * 100u / (uint64_t)total));
-		}
 		fmt_time(a, (int)sizeof(a), now);
 		fmt_time(b, (int)sizeof(b), total);
 		snprintf(state.time_text, sizeof(state.time_text), "%s / %s", a, b);
 		PhoneUI_text_set(state.music_time, state.time_text);
+
+		/* ⚠ 拖动进度条时不回写滑块值 —— 否则会把用户刚拖到的位置刷回去
+		 *   （见 on_seek）。判断依据 = slider 是否处于 Pressed 态（官方 music_player 同款做法）。 */
+		if (!(state.music_seek->state & GY_STATE_Pressed))
+		{
+			if (total > 0u)
+			{
+				YMGUI_Slider_SetValue(state.music_seek,
+									  (int32)((uint64_t)now * 100u / (uint64_t)total));
+			}
+		}
 	}
 }
 static void app_close(void)
@@ -207,6 +214,30 @@ static void on_next(GYOBJ btn)
 	refresh_track();
 }
 
+/* 拖动进度条：Slider 在按下/拖动中**持续**回调此函数（不是仅松手）。
+ * v 是 0..100（slider 默认范围），换算成毫秒跳播；同时把时间标签实时刷成目标时间，
+ * 这样拖动时"当前时间"跟着手走，而不是被 app_tick 的实时时钟刷回去。 */
+static void on_seek(GYOBJ sld, int32 v)
+{
+	uint32 total = BoardMusic_TotalMs();
+	uint32 now;
+	char   a[12], b[12];
+
+	(void)sld;
+	if (total == 0u)
+	{
+		return;
+	}
+	(void)BoardMusic_Seek((uint32)((uint64_t)total * (uint32)v / 100u));
+
+	/* 跳播后 g_wav_pos 立即更新 ⇒ elapsed 反映新位置，标签同步。 */
+	now = BoardMusic_ElapsedMs();
+	fmt_time(a, (int)sizeof(a), now);
+	fmt_time(b, (int)sizeof(b), total);
+	snprintf(state.time_text, sizeof(state.time_text), "%s / %s", a, b);
+	PhoneUI_text_set(state.music_time, state.time_text);
+}
+
 static void app_show(const char* argument)
 {
 	(void)argument;
@@ -234,6 +265,7 @@ static void app_create(GYOBJ view)
 	state.music_seek = YMGUI_Creat_Slider_Creat(view, 30, 289, 260, 22);
 	YMGUI_Slider_SetValue(state.music_seek, 0);
 	state.music_seek->draw_cb = PhoneUI_slider_draw;
+	YMGUI_Slider_SetChanged(state.music_seek, on_seek);   /* 拖动进度条 → 跳播 */
 	state.music_time = PhoneUI_left_label(view, 30, 313, 140, "0:00 / 0:00", MUTED, 2);
 	state.music_button = PhoneUI_button(view, 134, 344, 52, 52, "", on_music, PhoneApps_Get(MUSIC)->color);
 	PhoneUI_button_icon(state.music_button, ICON_PLAY);
