@@ -57,8 +57,14 @@ __Vectors:
      *   若落 Default_Handler 会死循环冻结内核。强定义在 src/audio_out.c，弱别名兜底。
      * 2026-10-13（第六次）为 EXTI15_10 开槽：触摸 INT=PB13 走 EXTI 边沿中断做"有触摸才读 I2C"
      *   的门控（见 src/touch_port.c）。EXTI15_10_IRQn = 40。强定义在 src/touch_port.c，弱别名兜底。
-     * 拆成 40 + 1 + 8 + 1 + 2 + 1 + 1 + 1 + 16 + 1 + 49 + 1 + 28 = 150，顺序不能错：位置由 CMSIS 的 IRQn 决定。 */
-    .rept  40                           /* IRQ0..IRQ39 */
+     * 2026-10-13（第七次）为 DMA1_Stream4 开槽：I2S2 TX 改走 DMA（半/全传中断补数），
+     *   DMA1_Stream4_IRQn = 15。强定义在 src/audio_out.c，弱别名兜底。
+     * 拆成 15 + 1 + 24 + 1 + 8 + 1 + 2 + 1 + 1 + 1 + 16 + 1 + 49 + 1 + 28 = 150，顺序不能错：位置由 CMSIS 的 IRQn 决定。 */
+    .rept  15                           /* IRQ0..IRQ14 */
+    .word  Default_Handler
+    .endr
+    .word  DMA1_Stream4_IRQHandler      /* IRQ15 = DMA1_Stream4（I2S2 TX DMA，强定义在 src/audio_out.c） */
+    .rept  24                           /* IRQ16..IRQ39 */
     .word  Default_Handler
     .endr
     .word  EXTI15_10_IRQHandler         /* IRQ40 = EXTI15_10（触摸 INT=PB13，强定义在 src/touch_port.c） */
@@ -167,3 +173,8 @@ Default_Handler:
  * 弱别名兜底 —— 万一 touch_port.c 没编进来，也不会链接失败，只会落回死循环。 */
 .weak EXTI15_10_IRQHandler
 .thumb_set EXTI15_10_IRQHandler, Default_Handler
+
+/* DMA1_Stream4（IRQ15）：I2S2 TX 的 DMA 半/全传中断，强定义在 src/audio_out.c。
+ * 弱别名兜底 —— 万一 audio_out.c 没编进来，也不会链接失败，只会落回死循环。 */
+.weak DMA1_Stream4_IRQHandler
+.thumb_set DMA1_Stream4_IRQHandler, Default_Handler

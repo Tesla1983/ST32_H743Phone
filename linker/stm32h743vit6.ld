@@ -46,6 +46,11 @@ _estack = ORIGIN(DTCM) + LENGTH(DTCM);
  *   gc-sections 就会把它的输入段留下。以后每新增一个自定义 ISR，都要在这里加一行，
  *   否则现象是**静默的**（编译链接全绿、跑起来才发现中断不响应）。 */
 EXTERN(TIM6_DAC_IRQHandler)
+/* 2026-10-13 新增的两个自定义 ISR，同样必须 EXTERN 保活（否则被 gc-sections 静默删掉）：
+ *   · EXTI15_10_IRQHandler    —— 触摸 INT=PB13 的边沿中断（src/touch_port.c）
+ *   · DMA1_Stream4_IRQHandler —— I2S2 TX DMA 的半/全传中断（src/audio_out.c）*/
+EXTERN(EXTI15_10_IRQHandler)
+EXTERN(DMA1_Stream4_IRQHandler)
 
 SECTIONS
 {

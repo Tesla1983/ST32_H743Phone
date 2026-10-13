@@ -1276,6 +1276,31 @@
 # 验收：
 #   · 二进制级：.isr_vector 偏移 0x0E0(IRQ40) = 0x0800104d = EXTI15_10_IRQHandler+thumb。
 #   · 工具：tools/touch_int_check.py（T2 空闲门控 + T3 真人碰屏验证 EXTI 触发）。
-# FLASH 1 657 468 B（79.03%），比补丁3 +184 B。
-5dc03688c6705acaa4656952c2c59a0249b92e9ad38f35eff9af9e241b907b61  ymgui-h743.bin
-24b93f9bf7739fff6ad86b8f5fd23a0ba16a8883653361ee485a01a162030f54  ymgui-h743.elf
+# 旧哈希（第三十版·补丁4，已停用）：
+# 5dc03688c6705acaa4656952c2c59a0249b92e9ad38f35eff9af9e241b907b61  ymgui-h743.bin
+# 24b93f9bf7739fff6ad86b8f5fd23a0ba16a8883653361ee485a01a162030f54  ymgui-h743.elf
+
+# ============================================================================
+# 第三十版·补丁5（2026-10-13）· I2S TX 改走 DMA（实验开关 + 根因定位诊断）
+# ============================================================================
+# 为什么变（按「更新时机」的 a：有意为之的功能改动；工具链 14.3.rel1 未变）：
+#   第一版 I2S DMA 当年结论是"SPI_SR 恒 0、NDTR 不涨"，退回 TIM6 每 20 µs 中断滴灌。
+#   但那结论是**主机侧直接读外设寄存器**得出的，而本工程自己记着"probe-rs 读 0x4000_xxxx
+#   不可信"——方法论上有隐患。本次重做，默认关闭、零回归，且全部走 RAM 快照：
+#     1. src/audio_out.c：新增 runtime 开关 g_ao_use_dma（默认 0 = TIM6 原路）。
+#        DMA 路径 = DMA1_Stream4 + DMAMUX 请求 DMA_REQUEST_SPI2_TX(40)，循环模式，
+#        .bss_audio(SRAM1 非缓存) 里 8 KB 乒乓缓冲；半/全传中断各补一半（从 s_ring 拷，
+#        只做内存拷贝、不碰文件系统）。起停顺序照抄 HAL_I2S_Transmit_DMA：
+#        Start_IT → **置 SPI_CFG1.TXDMAEN** → SPE → CSTART（缺 TXDMAEN 的猜疑见下）。
+#        新增 dbg2_snapshot()：把 SPI_CFG1/CR1/SR、DMA_SxCR/NDTR/PAR/M0AR、DMAMUX_CCR、
+#        NVIC ISER 等**拷进 RAM**（g_ao_dbg2），彻底绕开"probe-rs 读不到外设"的问题。
+#     2. src/startup_gcc.s：为 DMA1_Stream4(IRQ15) 开向量槽（.rept 40 拆成 15+1+24）。
+#     3. linker/stm32h743vit6.ld：EXTERN(DMA1_Stream4_IRQHandler) 与 EXTI15_10_IRQHandler 保活。
+#     4. tools/i2s_dma_check.py：置 g_ao_use_dma=1 跑内置正弦，按 D1~D7 判定并打印现场。
+#   ⚠ 默认 g_ao_use_dma=0 ⇒ 出货行为与补丁4 完全一致（这条改动是"加了一条可选路径"）。
+# 验收：
+#   · .isr_vector 偏移 0x7C(IRQ15) = 0x0800a081 = DMA1_Stream4_IRQHandler+thumb。
+#   · s_dma_buf @0x30007ae0（SRAM1，DMA1 可达、非缓存）。
+# FLASH 1 660 884 B（79.20%），比补丁4 +3416 B（DMA 引擎 + 8 KB 乒乓缓冲的 .bss）。
+daf2d51f9a72e51f116fce85c2f32e0ef74a91dfec78f16f1e6ead9110ae500d  ymgui-h743.bin
+da9cef62fae35704c3e457e1b9a9b67377e48a83b9650d3100617fc5f6bcc86c  ymgui-h743.elf

@@ -91,4 +91,19 @@ extern volatile uint32_t g_ao_txp_seen;  /* tick 里看到 TXP=1 的次数（时
 extern volatile uint32_t g_ao_stage;     /* 起播阶段进度（1..6，见 .c；不是错误码）*/
 extern volatile uint32_t g_ao_dbg[16];   /* 寄存器现场快照（索引表见 .c），probe 读不了外设 */
 
+/* ---- I2S TX DMA 实验开关与诊断（2026-10-13；默认全关 = 走 TIM6 滴灌，零回归）----
+ * 置 g_ao_use_dma = 1 再起播，就会改走"SPI 自己发 DMA 请求、DMA 搬 TXDR"那条路。
+ * 判据（tools/i2s_dma_check.py）：
+ *   · g_ao_dma_rc == 0 且 g_ao_dma_half / g_ao_dma_cplt 在涨；
+ *   · g_ao_frames 在涨（声音在流）而 g_ao_isr **不涨**（TIM6 已不参与）；
+ *   · g_ao_dma_err == 0；
+ *   · g_ao_dbg2[0] 的 bit15（SPI_CFG1.TXDMAEN）= 1，g_ao_dbg2[8] 低 7 位 = 40（SPI2_TX）；
+ *   · g_ao_dbg2[5]（DMA_SxNDTR）应在 0..4096 间**变化**（DMA 真在搬）。 */
+extern volatile uint32_t g_ao_use_dma;   /* 1 = 起播走 I2S TX DMA；0 = TIM6 滴灌（默认）*/
+extern volatile uint32_t g_ao_dma_rc;    /* DMA 起播返回码：0=OK 1=HAL_DMA_Init 失败 2=Start_IT 失败 */
+extern volatile uint32_t g_ao_dma_half;  /* 半传中断次数 */
+extern volatile uint32_t g_ao_dma_cplt;  /* 全传中断次数 */
+extern volatile uint32_t g_ao_dma_err;   /* DMA 错误回调次数 */
+extern volatile uint32_t g_ao_dbg2[16];  /* DMA/SPI 现场快照（索引表见 .c）*/
+
 #endif /* AUDIO_OUT_H */

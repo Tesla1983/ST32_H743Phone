@@ -51,6 +51,21 @@ volatile uint32_t g_ao_isr_dry  = 0;     /* ISR 进来却发现环形缓冲没�
  *   而 g_ao_rc 只在失败路径上写 ⇒ 靠它无法区分"卡在第几步"。 */
 volatile uint32_t g_ao_stage    = 0;
 
+/* ---- 2026-10-13：I2S TX 走 DMA 的实验开关与诊断（默认 0 = 走 TIM6 滴灌，零回归）----
+ * 第一版 DMA（DMA1_Stream2 循环双缓冲）当年结论是"SPI_SR 恒为 0、NDTR 不涨"。
+ * 但那个结论有个**方法论隐患**：当时是主机侧 probe-rs 直接读外设寄存器 —— 而本工程
+ * 自己的记录写着"probe-rs 读 0x4000_xxxx 不可信，只能读 RAM"。所以这次：
+ *   ① 外设寄存器一律**拷进 RAM（g_ao_dbg2）再用 SWD 读**，不再直接读外设；
+ *   ② 显式补上最可能漏的一步 —— **SPI_CFG1.TXDMAEN**（H7 上不置这一位，SPI 根本
+ *      不产生 TX DMA 请求，NDTR 自然一动不动；HAL 在 HAL_I2S_Transmit_DMA 里是
+ *      单独 SET_BIT 的，见 stm32h7xx_hal_i2s.c:1467-1471）。 */
+volatile uint32_t g_ao_use_dma   = 0;    /* 1 = 起播走 I2S TX DMA；0 = TIM6 滴灌（默认）*/
+volatile uint32_t g_ao_dma_rc    = 99;   /* DMA 起播返回码（0=OK）*/
+volatile uint32_t g_ao_dma_half  = 0;    /* 半传中断次数 */
+volatile uint32_t g_ao_dma_cplt  = 0;    /* 全传中断次数 */
+volatile uint32_t g_ao_dma_err   = 0;    /* DMA 错误回调次数 */
+volatile uint32_t g_ao_dbg2[16];         /* DMA/SPI 现场快照（见 dbg2_snapshot）*/
+
 /* ---- 环形缓冲 → SRAM1 的 .bss_audio（MPU region0：非缓存）----
  * 8192 个半字 = 16 KB = 4096 帧 ≈ 84 ms 的音频；一次补半个环（2048 帧 ≈ 42 ms）。 */
 #define AUDIO_BUF_ATTR   __attribute__((section(".bss_audio"), aligned(32)))
@@ -67,6 +82,16 @@ static volatile uint8_t  s_tim_pending = 0u;   /* 起播延后到下一拍再起
 
 static I2S_HandleTypeDef s_hi2s;        /* I2S2 = SPI2 的 I2S 模式 */
 static audio_out_feeder  s_feeder = NULL;
+
+/* ---- I2S TX DMA 的乒乓缓冲（放在 .bss_audio：SRAM1、非缓存、DMA1 可达）----
+ * 半缓冲 = 1024 帧 = 2048 半字 ≈ 21 ms（48 828 Hz）。DMA 循环模式跑满整个 4096 半字；
+ * 半传中断补前半、全传中断补后半。主循环仍负责把卡/正弦源补进 s_ring。 */
+#define DMA_HALF_FRAMES   1024u
+#define DMA_HALF_HALFWORDS (DMA_HALF_FRAMES * 2u)         /* 2048 */
+#define DMA_TOTAL_HALFWORDS (DMA_HALF_HALFWORDS * 2u)     /* 4096 */
+static uint16_t AUDIO_BUF_ATTR s_dma_buf[DMA_TOTAL_HALFWORDS];
+static DMA_HandleTypeDef s_hdma_tx;
+static uint8_t  s_dma_ready = 0u;
 
 /* 内置正弦自检（不依赖 TF 卡），见 audio_out.h 的 audio_out_demo_start。
  * 用 200 样本 LUT + 每帧步进 4 ⇒ 频率 = 4 × fs / 200 = 4 × 48828 / 200 ≈ 977 Hz，
@@ -109,6 +134,34 @@ static void dbg_snapshot(void)
     g_ao_dbg[11] = g_ao_txp_seen;
     g_ao_dbg[12] = RCC->APB1LENR;
     g_ao_dbg[13] = RCC->D2CCIP1R;
+}
+
+/* ---- DMA 现场快照（2026-10-13）----
+ * 与 dbg_snapshot 同一理由：主机读不到外设寄存器，必须拷进 RAM。
+ * 索引：0 SPI_CFG1（bit15 = TXDMAEN ← 重点看这一位）
+ *      1 SPI_CR1（bit0 SPE / bit9 CSTART）  2 SPI_SR（bit1 TXP）  3 SPI_I2SCFGR
+ *      4 DMA_SxCR  5 DMA_SxNDTR  6 DMA_SxPAR  7 DMA_SxM0AR
+ *      8 DMAMUX 通道 CCR（低 7 位 = 请求号，SPI2_TX 应为 40）
+ *      9 dma_half 10 dma_cplt 11 dma_err  12 ring 已用半字
+ *     13 NVIC ISER[0]（bit15 = DMA1_Stream4）14 RCC->AHB1ENR  15 s_dma_ready */
+static void dbg2_snapshot(void)
+{
+    g_ao_dbg2[0]  = SPI2->CFG1;
+    g_ao_dbg2[1]  = SPI2->CR1;
+    g_ao_dbg2[2]  = SPI2->SR;
+    g_ao_dbg2[3]  = SPI2->I2SCFGR;
+    g_ao_dbg2[4]  = DMA1_Stream4->CR;
+    g_ao_dbg2[5]  = DMA1_Stream4->NDTR;
+    g_ao_dbg2[6]  = DMA1_Stream4->PAR;
+    g_ao_dbg2[7]  = DMA1_Stream4->M0AR;
+    g_ao_dbg2[8]  = (s_hdma_tx.DMAmuxChannel != NULL) ? s_hdma_tx.DMAmuxChannel->CCR : 0u;
+    g_ao_dbg2[9]  = g_ao_dma_half;
+    g_ao_dbg2[10] = g_ao_dma_cplt;
+    g_ao_dbg2[11] = g_ao_dma_err;
+    g_ao_dbg2[12] = (s_wr - s_rd) & RING_MASK;
+    g_ao_dbg2[13] = NVIC->ISER[0u];
+    g_ao_dbg2[14] = RCC->AHB1ENR;
+    g_ao_dbg2[15] = s_dma_ready;
 }
 
 /* ====================== I2S2（SPI2）====================== */
@@ -253,6 +306,145 @@ static void tim6_stop(void)
     TIM6->DIER = 0u;
     TIM6->SR   = 0u;
     TIM6->CR1  = 0u;
+}
+
+/* ====================== I2S TX DMA（2026-10-13 实验路径）======================
+ * 目标：把"每个 20 µs 一次中断、ISR 里 CPU 写 TXDR"换成"SPI 自己发 DMA 请求、
+ * DMA 从内存搬 16 位半字到 TXDR"。CPU 只在"半缓冲发完"时被叫一次（每 21 ms），
+ * 中断频率从 5 万次/秒降到约 95 次/秒。
+ *
+ * ⚠ 两个必须先讲清的前提：
+ *   ① 缓冲放在 .bss_audio（SRAM1，D2 域）：DMA1 能访问、且 MPU 配成**非缓存**
+ *      ⇒ 不需要任何 cache 维护（SDMMC/IDMA 那条路的经验）。
+ *   ② DMA 的"SIZE"是**半字个数**（不是帧、不是字节）：16 位数据格式下 1 帧 = 2 半字。 */
+
+/* 把一个半缓冲（2048 半字 ≈ 21 ms）从环形缓冲填过去；不够就补静音。
+ * ⚠ 只做内存拷贝，**绝不碰文件系统** —— 它会在 DMA 中断里被调用。 */
+static void dma_fill_half(uint32_t half)
+{
+    uint16_t *dst   = &s_dma_buf[half * DMA_HALF_HALFWORDS];
+    uint32_t  avail = (s_wr - s_rd) & RING_MASK;
+
+    if (avail > DMA_HALF_HALFWORDS)
+    {
+        avail = DMA_HALF_HALFWORDS;
+    }
+    for (uint32_t i = 0u; i < avail; ++i)
+    {
+        dst[i] = s_ring[s_rd & RING_MASK];
+        s_rd = (s_rd + 1u) & RING_MASK;
+    }
+    for (uint32_t i = avail; i < DMA_HALF_HALFWORDS; ++i)
+    {
+        dst[i] = 0u;
+    }
+    if (avail < DMA_HALF_HALFWORDS)
+    {
+        g_ao_underrun++;                /* 供不上：这一半尾部填静音 */
+    }
+    g_ao_push   += avail;
+    g_ao_frames += (avail / 2u);        /* 2 个半字 = 1 帧 */
+}
+
+static void dma_half_cb(DMA_HandleTypeDef *h)
+{
+    (void)h;
+    g_ao_dma_half++;
+    dma_fill_half(0u);                  /* 前半刚发完 ⇒ 补前半 */
+}
+
+static void dma_cplt_cb(DMA_HandleTypeDef *h)
+{
+    (void)h;
+    g_ao_dma_cplt++;
+    dma_fill_half(1u);
+}
+
+static void dma_err_cb(DMA_HandleTypeDef *h)
+{
+    (void)h;
+    g_ao_dma_err++;
+}
+
+/* 起 I2S TX DMA。顺序照抄 HAL_I2S_Transmit_DMA：
+ *   HAL_DMA_Start_IT → 置 CFG1.TXDMAEN → 使能 SPE → 置 CR1.CSTART */
+static int i2s_dma_start(void)
+{
+    /* ⚠ DMAMUX1 与 DMA1 同在 D2-AHB1、**没有独立时钟使能位**（RCC_AHB1ENR 里只有
+     *   DMA1EN/DMA2EN）—— 所以开 DMA1 时钟就等于开 DMAMUX1。这里不要写
+     *   __HAL_RCC_DMAMUX1_CLK_ENABLE()：H7 的 HAL 根本没这个宏。 */
+    __HAL_RCC_DMA1_CLK_ENABLE();
+
+    s_hdma_tx.Instance                 = DMA1_Stream4;
+    s_hdma_tx.Init.Request             = DMA_REQUEST_SPI2_TX;      /* = 40 */
+    s_hdma_tx.Init.Direction           = DMA_MEMORY_TO_PERIPH;
+    s_hdma_tx.Init.PeriphInc           = DMA_PINC_DISABLE;
+    s_hdma_tx.Init.MemInc              = DMA_MINC_ENABLE;
+    s_hdma_tx.Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;
+    s_hdma_tx.Init.MemDataAlignment    = DMA_MDATAALIGN_HALFWORD;
+    s_hdma_tx.Init.Mode                = DMA_CIRCULAR;
+    s_hdma_tx.Init.Priority            = DMA_PRIORITY_HIGH;
+    s_hdma_tx.Init.FIFOMode            = DMA_FIFOMODE_DISABLE;     /* 直接模式 */
+    s_hdma_tx.Init.FIFOThreshold       = DMA_FIFO_THRESHOLD_FULL;
+    s_hdma_tx.Init.MemBurst            = DMA_MBURST_SINGLE;
+    s_hdma_tx.Init.PeriphBurst         = DMA_PBURST_SINGLE;
+
+    if (HAL_DMA_Init(&s_hdma_tx) != HAL_OK)
+    {
+        g_ao_dma_rc = 1u;
+        return -1;
+    }
+
+    s_hdma_tx.XferHalfCpltCallback = dma_half_cb;
+    s_hdma_tx.XferCpltCallback     = dma_cplt_cb;
+    s_hdma_tx.XferErrorCallback    = dma_err_cb;
+
+    dma_fill_half(0u);                  /* 先铺满两个半缓冲，起播第一拍就有数据 */
+    dma_fill_half(1u);
+
+    if (HAL_DMA_Start_IT(&s_hdma_tx, (uint32_t)(uintptr_t)s_dma_buf,
+                         (uint32_t)(uintptr_t)&SPI2->TXDR,
+                         DMA_TOTAL_HALFWORDS) != HAL_OK)
+    {
+        g_ao_dma_rc = 2u;
+        return -2;
+    }
+
+    /* ★★ H7 关键一步 ★★：不置 TXDMAEN，SPI **根本不会发出 TX DMA 请求**，
+     *   DMA 的 NDTR 就一动不动 —— 与当年"NDTR 不涨"的现象完全吻合。
+     *   HAL 在 HAL_I2S_Transmit_DMA 里是单独 SET_BIT 的（见 hal_i2s.c:1467-1471），
+     *   自己手搓 DMA 时最容易漏掉这一步。 */
+    SET_BIT(SPI2->CFG1, SPI_CFG1_TXDMAEN);
+
+    HAL_NVIC_SetPriority(DMA1_Stream4_IRQn, 5u, 0u);
+    HAL_NVIC_EnableIRQ(DMA1_Stream4_IRQn);
+
+    __HAL_I2S_ENABLE(&s_hi2s);
+    SET_BIT(SPI2->CR1, SPI_CR1_CSTART);
+
+    s_dma_ready = 1u;
+    g_ao_dma_rc = 0u;
+    return 0;
+}
+
+static void i2s_dma_stop(void)
+{
+    if (s_dma_ready == 0u)
+    {
+        return;
+    }
+    HAL_NVIC_DisableIRQ(DMA1_Stream4_IRQn);
+    CLEAR_BIT(SPI2->CFG1, SPI_CFG1_TXDMAEN);   /* 先关请求源，再拆 DMA */
+    (void)HAL_DMA_Abort(&s_hdma_tx);
+    HAL_DMA_DeInit(&s_hdma_tx);
+    s_dma_ready = 0u;
+}
+
+/* DMA1_Stream4（IRQ15）：强定义（弱别名在 src/startup_gcc.s 兜底）。
+ * ⚠ 与 TIM6 同样的坑：向量表若不给 IRQ15 开槽，这里定义了也接不上。 */
+void DMA1_Stream4_IRQHandler(void)
+{
+    HAL_DMA_IRQHandler(&s_hdma_tx);
 }
 
 /* ⚠ 这个 handler 定义在**本文件**而不是 stm32h7xx_it.c：让模块自带 handler，
@@ -463,20 +655,38 @@ int audio_out_start(void)
 
     s_wr = 0u;
     s_rd = 0u;
-    pump_half();                        /* 先铺满整个环，避免第一拍就断 */
-    pump_half();
+    pump_half();                        /* 先铺半环，避免第一拍就断 */
+    if (g_ao_use_dma == 0u)
+    {
+        /* TIM6 路径保持原行为（铺满整环）。DMA 路径**只铺半环**：另外半个环由
+         * i2s_dma_start 的两次 dma_fill_half 取走 —— 否则环满时写读指针相等，
+         * "已用 = (wr-rd)&MASK" 会算成 0（环满与环空同形），DMA 只会填到静音。 */
+        pump_half();
+    }
     g_ao_stage = 3u;
 
-    /* ⚠⚠ H7 铁律：SPE 只使能外设，必须再置 CSTART 才开始传输（2026-10-12 实测）。 */
-    __HAL_I2S_ENABLE(&s_hi2s);
-    SET_BIT(s_hi2s.Instance->CR1, SPI_CR1_CSTART);
-    g_ao_stage = 4u;
+    if (g_ao_use_dma != 0u)
+    {
+        /* DMA 路径：SPE / CSTART / TXDMAEN / NVIC 全在 i2s_dma_start 里按 HAL 的顺序做。 */
+        if (i2s_dma_start() != 0)
+        {
+            g_ao_rc = -5;
+            return -5;
+        }
+    }
+    else
+    {
+        /* ⚠⚠ H7 铁律：SPE 只使能外设，必须再置 CSTART 才开始传输（2026-10-12 实测）。 */
+        __HAL_I2S_ENABLE(&s_hi2s);
+        SET_BIT(s_hi2s.Instance->CR1, SPI_CR1_CSTART);
 
-    /* ⚠⚠ 心跳**不在这里起**：tim6_start 末尾的 NVIC_EnableIRQ 会让中断在
-     *   audio_out_start() 还没返回时就进来一次（即便没有 EGR_UG，也使能即可能
-     *   响应挂起标志），而那时 g_ao_playing 还是 0 —— 一旦 ISR 里再出点意料之外
-     *   的事，整个起播函数就再也回不去了。改成由 tick 在下一拍启动（见 audio_out_tick）。 */
-    s_tim_pending = 1u;
+        /* ⚠⚠ 心跳**不在这里起**：tim6_start 末尾的 NVIC_EnableIRQ 会让中断在
+         *   audio_out_start() 还没返回时就进来一次（即便没有 EGR_UG，也使能即可能
+         *   响应挂起标志），而那时 g_ao_playing 还是 0 —— 一旦 ISR 里再出点意料之外
+         *   的事，整个起播函数就再也回不去了。改成由 tick 在下一拍启动（见 audio_out_tick）。 */
+        s_tim_pending = 1u;
+    }
+    g_ao_stage = 4u;
 
     g_ao_playing = 1u;
     g_ao_rc      = 0;
@@ -492,6 +702,9 @@ int audio_out_start(void)
     g_ao_udr      = 0u;
     g_ao_underrun = 0u;
     g_ao_pump     = 0u;
+    g_ao_dma_half = 0u;
+    g_ao_dma_cplt = 0u;
+    g_ao_dma_err  = 0u;
     return 0;
 }
 
@@ -502,6 +715,7 @@ void audio_out_stop(void)
         return;
     }
     tim6_stop();
+    i2s_dma_stop();                     /* 没起 DMA 时内部直接返回 */
     i2s_stop();
     i2s_gpio_release();                 /* PB9 还给 UART4 */
     (void)es8311_stop_dac();
@@ -524,6 +738,7 @@ void audio_out_tick(void)
     if (g_ao_playing != 0u)
     {
         dbg_snapshot();
+        dbg2_snapshot();                /* DMA/SPI 现场（含 CFG1.TXDMAEN、DMA_SxNDTR）*/
     }
 
     /* 心跳延后到这一拍再起（理由见 audio_out_start 里的注释）。 */
