@@ -36,6 +36,14 @@ import bench
 FS = 48828          # I2S 的 fs（MCLK 12.5 MHz / 256）
 DEMO_SEC = 3
 
+# 自检音量：本自检播的是 977 Hz 正弦，出厂音量（70）听着太刺耳 —— 临时把
+# g_audio_volume 降到一半，自检结束再还原。只动 RAM 镜像，不碰 app_config
+# 持久化（所以对出货行为零影响）。
+# ⚠ ES8311 REG32 是 0.5 dB/LSB 的数字音量（0xBF=0dB）：UI 值 70→35 的实际
+#   衰减远不止"听感一半"（约 -33 dB）。若想要"听感小一半"（约 -6 dB），
+#   把这里改成 64 即可。
+CHECK_VOLUME = 35
+
 # g_ao_stage..g_ao_codec 在 .bss 里连续排布（见 nm 校验），一次读全：
 #   [0]stage [1]isr_dry [2]isr [3]txp_seen [4]pump [5]push [6]underrun
 #   [7]frames [8]udr [9]playing [10]codec
@@ -73,7 +81,7 @@ def trigger_and_catch():
     return None, 3
 
 
-def main():
+def _run():
     ok = True
 
     if not alive():
@@ -157,6 +165,18 @@ def main():
     print("\n[PASS] 常驻出声链路验收通过（听不听得见由耳朵判定，这里只验数据通路）"
           if ok else "\n[FAIL] 常驻出声链路验收未通过")
     return 0 if ok else 1
+
+
+def main():
+    saved_vol = bench.rd("g_audio_volume", 1)[0]
+    bench.wr("g_audio_volume", [CHECK_VOLUME])
+    print("自检音量：g_audio_volume %d → %d（自检结束还原）"
+          % (saved_vol, CHECK_VOLUME))
+    try:
+        return _run()
+    finally:
+        bench.wr("g_audio_volume", [saved_vol])
+        print("已还原 g_audio_volume = %d" % saved_vol)
 
 
 if __name__ == "__main__":

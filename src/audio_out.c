@@ -13,9 +13,10 @@
  *     从"主循环阻塞轮询"变成"定时器中断滴灌"，从而**不冻结 UI**。
  *     主循环只负责把 TF 卡/正弦源的数据补进环形缓冲（RING），不在 ISR 里碰文件系统。
  *
- *   ⚠ 为什么必须靠中断滴灌：I2S TX FIFO 只有 8 个半字，48 828 Hz × 2 声道下只够撑
- *     ~82 µs；主循环一帧 ~16 ms，远慢于 82 µs，纯主循环补数会让 FIFO 长期枯竭
- *     ⇒ 连续出声**只能**靠"高频中断"或"DMA"，DMA 在本板送不出 ⇒ 只能走 TIM6。
+ *   ⚠ 为什么必须靠中断滴灌：I2S TX FIFO 只有 16 个半字（HAL 的 FTHLV 上限即 16 可证），
+ *     48 828 Hz × 2 声道下 1 个半字 = 10.24 µs ⇒ 整 FIFO 也就 ~164 µs；主循环一帧
+ *     ~16 ms，远慢于 164 µs，纯主循环补数会让 FIFO 长期枯竭
+ *     ⇒ 连续出声**只能**靠"高频中断"或"DMA"。
  *
  *   ⚠ 为什么 20 µs：取 FIFO 预算（82 µs）的 ~1/4 做余量。ISR 每次最多填 8 个半字，
  *     开销可忽略；万一 TXP 因"时钟没起"而恒为 1，ISR 内的 8 次上限也保证它不会被
@@ -283,6 +284,9 @@ static void i2s_stop(void)
         }
     }
     __HAL_I2S_DISABLE(&s_hi2s);
+    /* 还原 TX FIFO 的 DMA 请求阈值到复位值（阈值 1）：DMA 路径会把它抬到"半满"，
+     * 这里在 SPE=0 之后写回，保证 TIM6 路径拿到的仍是它一直在用的默认值。 */
+    MODIFY_REG(s_hi2s.Instance->CFG1, SPI_CFG1_FTHLV, 0u);
     HAL_I2S_DeInit(&s_hi2s);
 }
 
@@ -423,6 +427,19 @@ static int i2s_dma_start(void)
      *   HAL 在 HAL_I2S_Transmit_DMA 里是单独 SET_BIT 的（见 hal_i2s.c:1467-1471），
      *   自己手搓 DMA 时最容易漏掉这一步。 */
     SET_BIT(SPI2->CFG1, SPI_CFG1_TXDMAEN);
+
+    /* ★★ 第二个关键位：TX FIFO 的 DMA 请求阈值 FTHLV ★★
+     *   HAL 的 I2S 初始化**从不设置** FTHLV（HAL_I2S_Init / HAL_I2S_Transmit_DMA 都不碰），
+     *   复位值 = 0 ⇒ 阈值只有 **1 个数据**：DMA 要等 FIFO 几乎空了才被叫来补。
+     *   一个半字 @48828Hz 立体声 = 10.24 µs，只要总线被 SDMMC IDMA / 渲染争用超过这么点，
+     *   TX FIFO 就断供 → 置 UDR → 而 H7 的 UDR 会**让引擎停吃 FIFO**，直到主循环
+     *   下一拍写 IFCR.UDRC 清掉（最坏 ~16 ms）⇒ 一声可闻的"断音/咔哒"。
+     *   2026-10-13 实测：FTHLV=0 时 DMA 路径 g_ao_udr 稳定 +1/s（TIM6 路径为 0）。
+     *   设成**半个 FIFO（16 深 ⇒ 阈值 8 个数据）**给 DMA 留 ~82 µs 垫子。
+     *   ⚠ SPI2.cfg1 只能在 SPE=0 时写 —— 这里在 __HAL_I2S_ENABLE 之前，合法。
+     *   ⚠ 复位值(阈值 1)由 i2s_stop() 在关掉 SPE 后还原，免得影响 TIM6 路径。 */
+    MODIFY_REG(SPI2->CFG1, SPI_CFG1_FTHLV,
+               (7u << SPI_CFG1_FTHLV_Pos));      /* 阈值 = 8 个数据（半满） */
 
     HAL_NVIC_SetPriority(DMA1_Stream4_IRQn, 5u, 0u);
     HAL_NVIC_EnableIRQ(DMA1_Stream4_IRQn);
