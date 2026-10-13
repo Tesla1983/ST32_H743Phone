@@ -67,6 +67,9 @@ volatile uint32_t g_ao_dma_cplt  = 0;    /* 全传中断次数 */
 volatile uint32_t g_ao_dma_err   = 0;    /* DMA 错误回调次数 */
 volatile uint32_t g_ao_dbg2[16];         /* DMA/SPI 现场快照（见 dbg2_snapshot）*/
 volatile uint32_t g_ao_ring_drop = 0;    /* 环形缓冲满而被丢弃的半字数（应为 0；>0 = 补数越界）*/
+volatile uint32_t g_ao_dma_gap_max = 0;  /* 相邻两次"半传输中断"之间的**最大间隔(µs)**：
+                                          * 正常 ≈ 21 000 µs（1024 帧）；若明显更大 ⇒ DMA 流
+                                          * 被总线/DMA 端口仲裁挡住过（2026-10-13 排障用）。*/
 
 /* ---- 环形缓冲 → SRAM1 的 .bss_audio（MPU region0：非缓存）----
  * 8192 个半字 = 16 KB = 4096 帧 ≈ 84 ms 的音频；一次补半个环（2048 帧 ≈ 42 ms）。 */
@@ -101,6 +104,7 @@ static audio_out_feeder  s_feeder = NULL;
 static uint16_t AUDIO_BUF_ATTR s_dma_buf[DMA_TOTAL_HALFWORDS];
 static DMA_HandleTypeDef s_hdma_tx;
 static uint8_t  s_dma_ready = 0u;
+static uint32_t s_last_half_cyc;      /* 上一次半传输中断的 DWT 周期数（量间隔用）*/
 
 /* 内置正弦自检（不依赖 TF 卡），见 audio_out.h 的 audio_out_demo_start。
  * 用 200 样本 LUT + 每帧步进 4 ⇒ 频率 = 4 × fs / 200 = 4 × 48828 / 200 ≈ 977 Hz，
@@ -362,6 +366,22 @@ static void dma_half_cb(DMA_HandleTypeDef *h)
 {
     (void)h;
     g_ao_dma_half++;
+
+    /* 量"相邻两次半中断的间隔"：正常 = 半缓冲播放时长 ≈ 1024 帧 ≈ 21 ms。
+     * 出现 UDR 的机理是"DMA 补数被总线/仲裁推迟"，推迟越久、间隔越大 ⇒ 这个最大值
+     * 直接能量出停顿幅度（TIM6 路径不涉及 DMA 端口，可作反证）。 */
+    {
+        uint32_t now = DWT->CYCCNT;
+        uint32_t gap = now - s_last_half_cyc;
+        uint32_t us  = (uint32_t)(((uint64_t)gap * 1000000u) / (SystemCoreClock ?
+                                                               SystemCoreClock : 1u));
+        if (s_last_half_cyc != 0u && us > g_ao_dma_gap_max)
+        {
+            g_ao_dma_gap_max = us;
+        }
+        s_last_half_cyc = now;
+    }
+
     dma_fill_half(0u);                  /* 前半刚发完 ⇒ 补前半 */
 }
 
@@ -395,7 +415,12 @@ static int i2s_dma_start(void)
     s_hdma_tx.Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;
     s_hdma_tx.Init.MemDataAlignment    = DMA_MDATAALIGN_HALFWORD;
     s_hdma_tx.Init.Mode                = DMA_CIRCULAR;
-    s_hdma_tx.Init.Priority            = DMA_PRIORITY_HIGH;
+    /* ⚠⚠ 必须 **VERY_HIGH**：LCD 的 band 推送也在 DMA1（Stream1，优先级 HIGH，MEM2MEM）。
+     * 两者同为 HIGH 时走轮转仲裁，界面重绘（进度条/时钟每 250 ms~1 s 一动）期间的
+     * MEM2MEM 传输会把 SPI2_TX 的补数推迟到 FIFO 垫子之外 ⇒ UDR ⇒ 引擎停吃 FIFO
+     * ⇒ 约 16 ms 的"断音"。SPI2_TX 每个请求只搬 1 个半字、间隔 ~10 µs，提到 VERY_HIGH
+     * 不会饿死 LCD（2026-10-13 实测 UDR ≈ 1 次/s 时加的这条）。 */
+    s_hdma_tx.Init.Priority            = DMA_PRIORITY_VERY_HIGH;
     s_hdma_tx.Init.FIFOMode            = DMA_FIFOMODE_DISABLE;     /* 直接模式 */
     s_hdma_tx.Init.FIFOThreshold       = DMA_FIFO_THRESHOLD_FULL;
     s_hdma_tx.Init.MemBurst            = DMA_MBURST_SINGLE;
@@ -436,10 +461,13 @@ static int i2s_dma_start(void)
      *   下一拍写 IFCR.UDRC 清掉（最坏 ~16 ms）⇒ 一声可闻的"断音/咔哒"。
      *   2026-10-13 实测：FTHLV=0 时 DMA 路径 g_ao_udr 稳定 +1/s（TIM6 路径为 0）。
      *   设成**半个 FIFO（16 深 ⇒ 阈值 8 个数据）**给 DMA 留 ~82 µs 垫子。
+     *   ⚠ 2026-10-13 实测教训：把阈值抬到 15 个数据时 DMA **完全不搬**（NDTR 不动、
+     *     半中断=0、SR.TXC 置位）—— 说明 FTHLV 并非"≤ 阈值就请求"这么简单，
+     *     阈值取太靠近满会抑制请求。8（半满）是实测可搬运的值，别乱改大。
      *   ⚠ SPI2.cfg1 只能在 SPE=0 时写 —— 这里在 __HAL_I2S_ENABLE 之前，合法。
      *   ⚠ 复位值(阈值 1)由 i2s_stop() 在关掉 SPE 后还原，免得影响 TIM6 路径。 */
     MODIFY_REG(SPI2->CFG1, SPI_CFG1_FTHLV,
-               (7u << SPI_CFG1_FTHLV_Pos));      /* 阈值 = 8 个数据（半满） */
+               (7u << SPI_CFG1_FTHLV_Pos));      /* 阈值 = 8 个数据（半满，实测可搬） */
 
     HAL_NVIC_SetPriority(DMA1_Stream4_IRQn, 5u, 0u);
     HAL_NVIC_EnableIRQ(DMA1_Stream4_IRQn);
@@ -736,6 +764,8 @@ int audio_out_start(void)
     g_ao_dma_cplt = 0u;
     g_ao_dma_err  = 0u;
     g_ao_ring_drop = 0u;
+    g_ao_dma_gap_max = 0u;
+    s_last_half_cyc  = 0u;
     return 0;
 }
 

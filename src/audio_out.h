@@ -106,6 +106,9 @@ extern volatile uint32_t g_ao_dma_cplt;  /* 全传中断次数 */
 extern volatile uint32_t g_ao_dma_err;   /* DMA 错误回调次数 */
 extern volatile uint32_t g_ao_dbg2[16];  /* DMA/SPI 现场快照（索引表见 .c）*/
 extern volatile uint32_t g_ao_ring_drop; /* 环形缓冲满被丢弃的半字数（应恒 0；>0 = 补数越界、会丢音）*/
+extern volatile uint32_t g_ao_dma_gap_max;/* 相邻两次 DMA 半传输中断的**最大间隔(µs)**：
+                                           * 正常 ≈ 21 000（1024 帧）；明显更大 ⇒ DMA 补数
+                                           * 被 DMA 端口仲裁/总线挡住过（咔哒根因线索）。*/
 
 /* ⚠ 2026-10-13 环形缓冲的一次语义修正（影响两条出音路径）：
  *   s_wr/s_rd 改为**单调计数器**（只在取索引时 & RING_MASK）。旧的
