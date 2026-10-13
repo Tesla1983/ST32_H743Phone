@@ -3,6 +3,7 @@
  * =========================================================================== */
 #include "wav_play.h"
 #include "audio_out.h"
+#include "es8311.h"           /* 相位锁存要读全部 I2C 诊断量（g_es_*）*/
 #include "fatfs_port.h"
 #include "img_store.h"        /* IMG_MUSIC_DIR / img_scan_* 扫描表 */
 
@@ -65,6 +66,80 @@ volatile uint32_t g_wav_read_ms  = 0;    /* 最近一次半缓冲补数的耗时
 /* 诊断触发：写 1 起播固定路径 /YMGUI/MUSIC/TOKYOHOT.WAV（不依赖 UI、不依赖扫描表）。
  * 与 audio_out.c 的 g_ao_demo 同构，供 tools/wav_play_check.py 用 SWD 触发验收。 */
 volatile uint32_t g_wav_test = 0;
+
+/* ====================== 验收用「相位锁存」（2026-10-13）======================
+ * 【为什么要有它】版本迭代到补丁 8 后，验收脚本要在"暂停 → 续播"之后的稳态读
+ *   十几个诊断量。每个量一次 `probe-rs read` = **一次内核 halt**；而 I2C 是阻塞式
+ *   轮询，halt 期间外设不停 ⇒ 芯片应答窗口被错过 ⇒ 读到一堆**假 NACK**（"失败风暴"）。
+ *   实测：复位后静置再起播、全程零探针 = 0 失败；密集逐符号读 = 47% 失败。
+ *   ⇒ 采样方式本身就是伪影源。修法是把"测量"从主机搬到板上：
+ *
+ *   主机写 g_wav_snap_req = <相位码>；板子在**下一拍 tick**（绝对无害的上下文）执行
+ *   该相位的动作，然后**在同一个函数里**把全部诊断量锁进一张 RAM 表 g_wav_snap[]。
+ *   主机只做 **一次** 批量读（probe-rs read -f binary，窗口 ≤ 几百字节）⇒ 一次停机
+ *   拿到整张表。表内各量是"同一时刻"的，连时间一致性都顺带解决了。
+ *
+ *   相位码：1=起播  3=暂停  4=续播  2=停止。与 g_wav_test 同义，但动作后自动锁存。
+ *   g_wav_snap[0] 锁存相位码、[1] 锁存"动作完成时的循环计数"，其余见 wav_play.h 索引表。 */
+volatile uint32_t g_wav_snap_req = 0u;
+volatile uint32_t g_wav_snap[G_WAV_SNAP_N] = {0};
+volatile uint32_t g_wav_snap_delay = 40u;     /* 动作后延迟多少拍再锁存（≈0.64 s；主机可改小做瞬态）*/
+static uint32_t   s_snap_phase = 0u;
+static uint32_t   s_snap_delay = 0u;
+
+extern volatile uint32_t g_loop_count;        /* main.c：主循环拍计数 */
+
+/* 把当前所有诊断量锁进 g_wav_snap[]。索引表与 wav_play.h 的宏一一对应，**顺序不可改**
+ * （主机按固定索引解析）。只做 32 位读，不调任何 IO ⇒ 在 tick 里调用绝对安全。
+ *
+ * 【防"读到半张表"】用 seqlock 手法：进函数先把 G_SNAP_PHASE 填成 `phase | 0x8000_0000`
+ *   （"正在写"），全部写完、魔数也落了之后，再把 G_SNAP_PHASE 写回纯 `phase`。
+ *   主机只接受"G_SNAP_PHASE == 期望相位码且 bit31 == 0"的表 ⇒ 半张表必被拒。 */
+static void wav_snap_latch(uint32_t phase)
+{
+    g_wav_snap[G_SNAP_PHASE]    = phase | 0x80000000u;  /* seqlock：标记"正在写" */
+    g_wav_snap[G_SNAP_LOOP]     = g_loop_count;          /* 板载拍计数（判"动作后过了几拍"）*/
+    g_wav_snap[G_SNAP_WSTATE]   = g_wav_state;
+    g_wav_snap[G_SNAP_WRC]      = (uint32_t)g_wav_rc;
+    g_wav_snap[G_SNAP_WPOS]     = g_wav_pos;
+    g_wav_snap[G_SNAP_WTOTAL]   = g_wav_total;
+    g_wav_snap[G_SNAP_AOPLAY]   = g_ao_playing;
+    g_wav_snap[G_SNAP_AOREADY]  = g_ao_dac_ready;
+    g_wav_snap[G_SNAP_AORAMP]   = g_ao_dac_ramp;
+    g_wav_snap[G_SNAP_AOWAKE]   = g_ao_wake_cnt;
+    g_wav_snap[G_SNAP_AOSKIP]   = g_ao_init_skips;
+    g_wav_snap[G_SNAP_AOINITRC] = (uint32_t)g_ao_init_rc;
+    g_wav_snap[G_SNAP_AORC]     = (uint32_t)g_ao_rc;
+    g_wav_snap[G_SNAP_ESWROK]   = g_es_wr_ok;
+    g_wav_snap[G_SNAP_ESWRNG]   = g_es_wr_ng;
+    g_wav_snap[G_SNAP_ESRDOK]   = g_es_rd_ok;
+    g_wav_snap[G_SNAP_ESRDNG]   = g_es_rd_ng;
+    g_wav_snap[G_SNAP_ESRETRY]  = g_es_retry_ok;
+    g_wav_snap[G_SNAP_ESFAIL]   = g_es_fail;
+    g_wav_snap[G_SNAP_ESFIX]    = g_es_fix_wr;
+    g_wav_snap[G_SNAP_ESRB]     = g_es_readback;
+    g_wav_snap[G_SNAP_ESPWR]    = g_ao_wake_retry;
+    g_wav_snap[G_SNAP_ESREG32N] = g_es_reg32_n;
+    g_wav_snap[G_SNAP_ESREG32W] = g_es_reg32_wr;
+    g_wav_snap[G_SNAP_ESRBVOL]  = g_es_rb_vol;
+    g_wav_snap[G_SNAP_ESRBPWR]  = g_es_rb_pwr;
+    g_wav_snap[G_SNAP_ESRB0E]   = g_es_rb_dac0e;
+    g_wav_snap[G_SNAP_ESWNCUR]  = g_es_ng_reg;           /* 最近一次写失败的寄存器号 */
+    g_wav_snap[G_SNAP_ESWNS]    = g_es_ng_st;            /* 该次 HAL 状态码 1=NACK 2=BUSY 3=TMO */
+    g_wav_snap[G_SNAP_ESNAK]    = g_es_ng_nack;
+    g_wav_snap[G_SNAP_ESBUSY]   = g_es_ng_busy;
+    g_wav_snap[G_SNAP_ESTMO]    = g_es_ng_tmo;
+    g_wav_snap[G_SNAP_ESNGHEAD] = g_es_ng_head;
+    g_wav_snap[G_SNAP_ESNGIDR]  = g_es_ng_idr;
+    g_wav_snap[G_SNAP_VOLUI]    = g_audio_volume;
+    g_wav_snap[G_SNAP_DMARSH]   = g_ao_dma_half;
+    g_wav_snap[G_SNAP_DMARCP]   = g_ao_dma_cplt;
+    g_wav_snap[G_SNAP_DMARERR]  = g_ao_dma_err;
+    g_wav_snap[G_SNAP_FRAMES]   = g_ao_frames;
+    g_wav_snap[G_SNAP_ESPRETRY] = g_es_probe_retry;      /* probe 首试没探到、延时后探到 */
+    g_wav_snap[G_SNAP_MAGIC]    = G_WAV_SNAP_MAGIC;      /* 最后写魔数 ⇒ 主机凭它判"表是完整的" */
+    g_wav_snap[G_SNAP_PHASE]    = phase;                 /* seqlock：清除"正在写"标记 */
+}
 
 static FIL  s_f;
 static char s_path[IMG_PATH_MAX];
@@ -303,7 +378,9 @@ int wav_play_pause(void)
     {
         return -1;                     /* 没在出声，没什么可暂停 */
     }
-    audio_out_stop();                  /* 只停音频输出；s_f 保持打开，g_wav_pos 不动 */
+    audio_out_pause();                 /* ★ 只停出音并静音 codec，**不断电**（见 audio_out_pause
+                                        * 的说明：stop 会给 codec 断电，续播撞 NACK 窗口 ⇒ 丢写）。
+                                        * s_f 保持打开、g_wav_pos 不动，故位置可续。 */
     g_wav_state = 2u;                  /* 2 = 暂停 */
     return 0;
 }
@@ -373,7 +450,9 @@ void wav_play_tick(void)
 {
     audio_out_tick();
 
-    /* 诊断触发：写 g_wav_test=1 起播固定路径；=2 停播（验收用，见文件头注释）。 */
+    /* 诊断触发：写 g_wav_test=1 起播固定路径；=2 停播（验收用，见文件头注释）。
+     * 3 = 暂停 / 4 = 续播：与 app 的"暂停→播放"按钮**走同一条** wav_play_pause/resume，
+     * 供 tools/wav_pause_resume_check.py 用 SWD 复现"续播没声音"那条链路。 */
     if (g_wav_test == 1u)
     {
         g_wav_test = 0u;
@@ -383,6 +462,50 @@ void wav_play_tick(void)
     {
         g_wav_test = 0u;
         wav_play_stop();
+    }
+    else if (g_wav_test == 3u)
+    {
+        g_wav_test = 0u;
+        (void)wav_play_pause();
+    }
+    else if (g_wav_test == 4u)
+    {
+        g_wav_test = 0u;
+        (void)wav_play_resume();
+    }
+
+    /* 验收"相位锁存"（见文件头说明）：主机写 g_wav_snap_req=<相位码>，这里在**下一拍**
+     * 执行同一套动作，随后等 g_wav_snap_delay 拍（默认 40 拍 ≈ 0.64 s，够起播那段
+     * "下一拍唤醒 DAC + 8 拍 ramp" 走完）再锁存全部诊断量。主机一次批量读即可拿到
+     * "同一时刻、零停机干扰"的完整现场 —— 取代过去"逐符号读十几次"的伪影源。
+     *   相位码：1=起播 2=停止 3=暂停 4=续播 9=不动作、只锁存（量 frames 增长用）。
+     * ⚠ 放在 g_wav_test 之后、播完收尾之前：此时 audio_out_tick() 已跑完这一拍。 */
+    if (g_wav_snap_req != 0u)
+    {
+        uint32_t phase = g_wav_snap_req;
+
+        g_wav_snap_req = 0u;
+        switch (phase)
+        {
+        case 1u: (void)wav_play_start("/YMGUI/MUSIC/TOKYOHOT.WAV"); break;
+        case 2u: wav_play_stop();            break;
+        case 3u: (void)wav_play_pause();     break;
+        case 4u: (void)wav_play_resume();    break;
+        case 9u: break;                      /* 只锁存，不动播放 */
+        default: phase = 0u; break;
+        }
+        if (phase != 0u)
+        {
+            s_snap_phase = phase;
+            s_snap_delay = (g_wav_snap_delay != 0u) ? g_wav_snap_delay : 40u;
+        }
+    }
+    if (s_snap_delay != 0u)
+    {
+        if (--s_snap_delay == 0u)
+        {
+            wav_snap_latch(s_snap_phase);
+        }
     }
 
     /* 播完（数据读完且最后一个半缓冲也出去了）就收尾。

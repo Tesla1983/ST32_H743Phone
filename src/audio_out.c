@@ -93,10 +93,22 @@ volatile uint32_t g_ao_dma_gap_max = 0;  /* 相邻两次"半传输中断"之间�
  *     统一"起播第二拍再开 DAC"，两条路径（TIM6 / DMA）都不必各写一套。 */
 volatile uint32_t g_ao_dac_ready = 0u;   /* 1 = DAC 通路已唤醒（起播初期为 0）*/
 volatile uint32_t g_ao_dac_ramp  = 0u;   /* 音量 ramp 剩余步数（0 = 已到目标音量）*/
+volatile uint32_t g_ao_wake_cnt  = 0u;   /* "唤醒 DAC + 起 ramp"这个动作执行过几次
+                                          * （每次起播/续播应当恰好 +1；>1 ⇒ 起播被重复触发）*/
+volatile int32_t  g_ao_init_rc   = 0;    /* 最近一次 codec 初始化序列的返回码（0=全写成功）*/
+volatile uint32_t g_ao_init_skips = 0u;  /* 跳过了多少次完整 codec init（续播路径应当每次 +1）*/
+volatile uint32_t g_ao_wake_retry = 0u;  /* "静音接通 DAC"这一整段因有写丢失而重试的次数 */
+volatile uint32_t g_ao_probe_n   = 0u;   /* 排障钩子：写 N ⇒ 接下来 N 拍各做一次 codec 回读体检
+                                          * （用于量"稳态下 I2C 失败率"，不依赖有没有在播放）*/
 
 /* 起播音量 ramp 的步数：8 步 × 主循环一拍（≈16 ms）≈ 130 ms 完成。
  * 步数太少压不住跳变、太多会让人听出"声音起得慢"，8 是折中。 */
 #define AO_VOL_RAMP_STEPS 8u
+
+/* 起播/续播后"音量确认期"的拍数上限：每拍一次回读（含失败重试与补写），
+ * 最多 12 拍 ≈ 190 ms。取 12 的理由：ramp 8 拍之后还要跨过一个可能的 NACK 窗口
+ * （实测窗口持续到数十毫秒），给足余量又不至于长期占用 I2C 影响播放。 */
+#define AO_RB_CONFIRM_TRIES 12u
 
 /* ---- 环形缓冲 → SRAM1 的 .bss_audio（MPU region0：非缓存）----
  * 8192 个半字 = 16 KB = 4096 帧 ≈ 84 ms 的音频；一次补半个环（2048 帧 ≈ 42 ms）。 */
@@ -120,6 +132,8 @@ static volatile uint32_t s_rd;          /* 读计数（半字，单调），ISR 
 static volatile uint8_t  s_tim_pending = 0u;   /* 起播延后到下一拍再起 TIM6（见下）*/
 static volatile uint8_t  s_dac_pending = 0u;   /* 起播后延到下一拍再唤醒 DAC（防咔哒，见上）*/
 static volatile uint8_t  s_vol_ramp_left = 0u; /* 音量 ramp 剩余步数（0 = 不动）*/
+static volatile uint8_t  s_dac_rb_pending = 0u;/* "确认期"剩余尝试次数（见 tick；0 = 不在确认期）*/
+static volatile uint32_t s_rb_tick = 0u;       /* 播放中定期回读体检的节流计数（~1 s 一次）*/
 
 static I2S_HandleTypeDef s_hi2s;        /* I2S2 = SPI2 的 I2S 模式 */
 static audio_out_feeder  s_feeder = NULL;
@@ -732,8 +746,35 @@ int audio_out_start(void)
         return -2;
     }
 
-    rc  = es8311_init();
-    rc |= es8311_config_i2s();
+    rc  = 0;
+    /* ⚠⚠ 只在**本次开机第一次**起播时跑完整初始化序列（内含 REG00 软复位）。
+     *   为什么：软复位 = 整颗芯片重启；而 codec 的 5 V 常亮、寄存器状态本来就在，
+     *   暂停时 es8311_stop_dac() 写的那些寄存器，续播时 dac_path_regs() 会原样恢复
+     *   ⇒ **续播根本不需要再复位一次芯片**。板上实测（tools/wav_pause_resume_check.py）：
+     *   复位/电源态切换后的若干毫秒里芯片会对自己的 I2C 地址回 NACK（实测 100% 是
+     *   NACK、总线电平正常 C0），而音量那几笔一丢就是用户报的"没声音 / 音量大小混乱"。
+     *   少做一次复位 = 少一个 NACK 窗口，顺带把续播的 I2C 事务从 ~55 笔降到 ~19 笔。
+     *   ⚠ 首次 init 失败（写丢了）时重试整段一次；仍失败才判起播失败。 */
+    if (es8311_is_inited() == 0)
+    {
+        rc  = es8311_init();
+        rc |= es8311_config_i2s();
+        if (rc != 0)
+        {
+            rc  = es8311_init();
+            rc |= es8311_config_i2s();
+        }
+        g_ao_init_rc = (int32_t)rc;
+    }
+    else
+    {
+        g_ao_init_skips++;              /* 续播/二次起播：跳过完整 init（诊断量）*/
+        /* 格式再确认一次（幂等、只有 2 笔 I2C）。⚠ 失败**不阻断**起播：格式在上次
+         * init 时已经配好，这里只是复核；真丢了也还有下面的回读体检兜着 —— 一个瞬时
+         * I2C 失败不该让用户"点了播放没反应"。 */
+        g_ao_init_rc = (int32_t)es8311_config_i2s();
+        rc = 0;
+    }
     /* ⚠⚠ 这里**不再**调 es8311_start_dac()：DAC 通路必须等 I2S 时钟与数据流就绪
      *   之后再唤醒（否则就是那一声"咔哒"）。唤醒 + 音量 ramp 交给下一拍 tick
      *   （s_dac_pending 分支）—— 见文件上方「起播防咔哒时序」的说明。 */
@@ -800,6 +841,7 @@ int audio_out_start(void)
     s_vol_ramp_left = 0u;
     g_ao_dac_ready  = 0u;
     g_ao_dac_ramp   = 0u;
+    s_rb_tick       = 0u;
 
     /* ⚠ 诊断量按"本次播放"清零：这些量在 ISR/主循环里只增不减，若不在这里清，
      *   多次播放会累加（上一次 3 s 的 146 k 帧会带进下一次），验收脚本算不出
@@ -836,8 +878,54 @@ void audio_out_stop(void)
     s_wr = 0u;
     s_rd = 0u;
     s_tim_pending = 0u;
-    s_dac_pending = 0u;                 /* 起播防咔哒状态一并归零 */
+    s_dac_pending   = 0u;               /* 起播防咔哒状态一并归零 */
     s_vol_ramp_left = 0u;
+    s_dac_rb_pending = 0u;
+    g_ao_dac_ready  = 0u;
+    g_ao_dac_ramp   = 0u;
+}
+
+/* 暂停：停出音链路，但**不给 codec 断电**。
+ *
+ * 【为什么必须与 audio_out_stop 分开（2026-10-13 根因）】
+ *   音乐 app 的「暂停 → 播放」是一对紧接着的操作。原来暂停走 audio_out_stop()，
+ *   末尾的 es8311_stop_dac() 会写 9 笔 I2C 并把 codec 打进 **power-down**：
+ *     REG0E=0xFF（关内部块）、REG12=0x02（power-down）。
+ *   芯片在掉电/上电窗口里**不对自己的 I2C 地址应答** ⇒ 那 9 笔写里总有几笔砸在窗口上
+ *   变成 NACK（板上实测：暂停增量 wr_ok 恰 +9，失败寄存器覆盖
+ *   0x0D/0x0E/0x0F/0x12/0x14/0x15/0x32/0x37/0x45）；而丢写又被调用方 `(void)` 忽略，
+ *   于是"音量只写进去一半"⇒ 用户报的**"音量大小混乱"**；极端情况连 REG32 都丢
+ *   ⇒ 芯片停在 0（静音）⇒ **"进度条在走但没声音"**。
+ *
+ *   但暂停根本不需要关这颗芯片：它 5 V 常亮、寄存器状态本来就在，暂停只要
+ *   **静音 + 停 I2S 时钟/心跳** 即可，续播时 dac_path_regs() 再把通路写回来。
+ *   ⇒ 本函数只发 1 笔 REG32=0（静音），芯片保持可达；实测暂停零失败，
+ *     续播那段 ~19 笔 I2C 也因此不再有 NACK 窗口。
+ *
+ * ⚠ 与 audio_out_stop 的另一处差别：**不 clear s_codec_ready**（es8311 侧的静态），
+ *   这样续播时 es8311_is_inited()==1 ⇒ 跳过完整 init（含 REG00 软复位），
+ *   又省掉一次"软复位 → 芯片不应答"的窗口。
+ * ⚠ 真正的"停"（切歌 / 播完 / 退出）仍走 audio_out_stop()：那时把 codec 断电是对的，
+ *   下次是全新起播，本来就要完整 init。 */
+void audio_out_pause(void)
+{
+    if (g_ao_playing == 0u)
+    {
+        return;
+    }
+    tim6_stop();
+    i2s_dma_stop();                     /* 没起 DMA 时内部直接返回 */
+    i2s_stop();
+    i2s_gpio_release();
+    (void)es8311_dac_mute();            /* ★ 只静音，**不** es8311_stop_dac()（断电）*/
+    g_ao_playing = 0u;
+    g_ao_codec   = 0u;
+    s_wr = 0u;
+    s_rd = 0u;
+    s_tim_pending = 0u;
+    s_dac_pending   = 0u;
+    s_vol_ramp_left = 0u;
+    s_dac_rb_pending = 0u;
     g_ao_dac_ready  = 0u;
     g_ao_dac_ramp   = 0u;
 }
@@ -849,6 +937,20 @@ int audio_out_playing(void)
 
 void audio_out_tick(void)
 {
+    /* 排障钩子（与播放状态无关）：g_ao_probe_n = N ⇒ 接下来 N 拍各读 3 个 DAC 寄存器。
+     * 用途：量**稳态**下 I2C 的失败率（不依赖有没有在播放），把"芯片电源态切换窗口里的
+     * NACK"和"平时也 NACK"分开 —— 两者的处置完全不同。只读、不留痕（失败率看
+     * g_es_rd_ng / g_es_retry_ok 的增量），也不改任何寄存器。
+     * ⚠ 必须等 I2C1 初始化过才能碰（g_es_bus_rc==0），否则 s_hi2c.Instance 还是空指针。 */
+    if ((g_ao_probe_n != 0u) && (g_es_bus_rc == 0u))
+    {
+        uint8_t v;
+        g_ao_probe_n--;
+        (void)es8311_read_reg(0x32, &v);
+        (void)es8311_read_reg(0x12, &v);
+        (void)es8311_read_reg(0x0Eu, &v);
+    }
+
     /* dbg 无条件刷新：起播卡住时 playing 往往是 0，那时才最需要看现场
      * （上一版正是"dbg 因 playing=0 而全 0"，白白多烧了一遍固件）。 */
     if (g_ao_playing != 0u)
@@ -893,10 +995,24 @@ void audio_out_tick(void)
         if (ready != 0)
         {
             s_dac_pending = 0u;
-            (void)es8311_dac_start_muted();     /* 通路接通、音量 0（静音起播）*/
+            /* 整段"静音接通 DAC"重试一次：I2C 写是**会失败**的（见 es8311.c），
+             * 而这一段的返回值以前是直接丢掉的 —— 丢一笔就可能 DAC 没上电/音量没升，
+             * 正是"续播没声音"。失败就整段重来（第二遍基本都能过）。 */
+            if (es8311_dac_start_muted() != 0)
+            {
+                g_ao_wake_retry++;
+                (void)es8311_dac_start_muted();
+            }
             s_vol_ramp_left = (uint8_t)AO_VOL_RAMP_STEPS;
             g_ao_dac_ready  = 1u;
             g_ao_stage      = 7u;
+            g_ao_wake_cnt++;
+            /* 进入"音量确认期"：不是"ramp 走完读一次"就完事，而是**逐拍确认**
+             * 直到 es8311_dac_readback() 明确回报"音量已落进芯片"（最多 AO_RB_CONFIRM_TRIES 拍）。
+             * 理由见 es8311_dac_readback 的说明与 tools/wav_pause_resume_check.py 的实测：
+             * ramp 末步写终值恰好撞上芯片 NACK 窗口时会停在中间档，而那一拍的回读
+             * 往往也失败 ⇒ 只读一次会漏掉，必须跨过窗口重试。 */
+            s_dac_rb_pending = (uint8_t)AO_RB_CONFIRM_TRIES;
         }
     }
 
@@ -915,6 +1031,43 @@ void audio_out_tick(void)
                                                           : (target * step) / AO_VOL_RAMP_STEPS);
         s_vol_ramp_left--;
         g_ao_dac_ramp = s_vol_ramp_left;
+    }
+
+    /* ---- 起播后「音量确认期」：逐拍确认音量真的落进芯片（2026-10-13 关键修复）----
+     * 【为什么不能"ramp 走完读一次"】板上实测（tools/wav_pause_resume_check.py）：
+     *   ramp 是 8 拍、每拍写一次 REG32；第 8 拍写终值（如 UI 72 ⇒ 0x89）时若正好落在
+     *   芯片"电源态/复位窗口"里，那 5 次重试可能全灭 ⇒ REG32 停在**中间档**（实测 0x78
+     *   = 第 7 步值）。此时用户听到的正是"音量大小混乱"（比设定值轻一档、每次轻重不一），
+     *   或极轻时像"没声音"。而**同一拍的回读也常失败**（同一窗口）⇒ 只读一次判定不出来。
+     * 【做法】ramp 走完后不只看一眼，而是**每拍读一次、不对就补写（readback 内分层补）**，
+     *   最多 AO_RB_CONFIRM_TRIES 拍，直到读到"音量 == 目标"才收工。确认通过后清计数,
+     *   退回原来的"每 ~1 s 体检"。
+     * ⚠ 只在"刚起播/续播后的窗口期"多花这几拍 I2C；后台稳态仍是 1 次/s，不影响播放。 */
+    if ((s_dac_rb_pending != 0u) && (s_vol_ramp_left == 0u))
+    {
+        if (es8311_dac_readback() == 0)
+        {
+            s_dac_rb_pending = 0u;      /* 确认到手：退出确认期 */
+            s_rb_tick = 0u;
+        }
+        else if (--s_dac_rb_pending == 0u)
+        {
+            /* 用尽次数仍未确认（芯片长时间不可达）：保留现场量，退回稳态体检，
+             * 不再纠缠 —— 下一次 1 s 体检还会再试。 */
+            s_rb_tick = 0u;
+        }
+    }
+    else if ((s_vol_ramp_left == 0u) && (g_ao_dac_ready != 0u))
+    {
+        /* 播放中的定期体检（每 ~1 s 一次）：以**回读值**为准确认"音量还在芯片里、
+         * DAC 还上着电"，不对就补写。为什么必须做：I2C 写是会失败的（见 es8311.c
+         * 的失败统计），漏掉一笔 REG32 就是用户那头"进度条在走但没声音 / 音量忽大忽小"，
+         * 而且自己不恢复的话，只有退出 app 重进才能好。代价 = 每秒 3 次单字节 I2C 读。 */
+        if (++s_rb_tick >= 64u)
+        {
+            s_rb_tick = 0u;
+            (void)es8311_dac_readback();
+        }
     }
 
     dbg_snapshot();

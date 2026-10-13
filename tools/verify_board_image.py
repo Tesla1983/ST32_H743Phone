@@ -102,6 +102,7 @@ def main():
         ok = True
         for off in segs:
             off = max(0, min(off, total - sampled))
+            off &= ~3            # probe-rs 要求 4 字节对齐（sampled 非 4 倍数时会算出奇数偏移）
             board = read_bytes(FLASH_BASE + off, sampled)
             part = disk[off:off + sampled]
             first, nd, _ = diff_blocks(board, part, FLASH_BASE + off)

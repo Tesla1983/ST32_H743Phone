@@ -55,6 +55,28 @@ extern volatile uint32_t g_es_wr_ng;   /* I2C 写失败次数 */
 extern volatile uint32_t g_es_rd_ok;   /* I2C 读成功次数 */
 extern volatile uint32_t g_es_rd_ng;   /* I2C 读失败次数 */
 extern volatile uint32_t g_es_bus_rc;  /* es8311_bus_init 的返回码 */
+extern volatile uint32_t g_es_reg32_wr;/* REG32（DAC 音量）最后一次**写入**的值；0xFFFF=没写过 */
+extern volatile uint32_t g_es_reg32_n; /* REG32 写入次数（每次起播/续播应约 +9：1 静音 + 8 步 ramp）*/
+extern volatile uint32_t g_es_rb_vol;  /* REG32 回读值（ramp 走完那一刻，见 es8311_dac_readback）*/
+extern volatile uint32_t g_es_rb_pwr;  /* REG12 回读值（0x00 = DAC 上电；0x02 = power-down）*/
+extern volatile uint32_t g_es_rb_dac0e;/* REG0E 回读值（0x02 = 正常；0xFF = 挂起后残留）*/
+/* ---- I2C 写失败现场（2026-10-13；暂停→续播"没声音/音量乱"排障）----
+ * 每次写失败都先复位 I2C 现场再重试（最多 3 次，g_es_retry_ok 计恢复数）；三次都失败
+ * 才计 g_es_fail。失败现场（寄存器号 / HAL 状态 / 总线电平）留在下面这几个量里。 */
+extern volatile uint32_t g_es_ng_reg;  /* 最后一次写失败的寄存器号 */
+extern volatile uint32_t g_es_ng_st;   /* 该次 HAL_StatusTypeDef：1=NACK 2=BUSY 3=TIMEOUT */
+extern volatile uint32_t g_es_ng_nack; /* 三种失败分别累计 */
+extern volatile uint32_t g_es_ng_busy;
+extern volatile uint32_t g_es_ng_tmo;
+extern volatile uint32_t g_es_ng_ring[8];/* 最近 8 次失败：高 8 位寄存器号 / 低 8 位状态码 */
+extern volatile uint32_t g_es_ng_head;
+extern volatile uint32_t g_es_ng_idr;  /* 失败瞬间 PB6/PB7 电平（IDR bit6/bit7）*/
+extern volatile uint32_t g_es_retry_ok;/* 第一次失败、重试成功 的次数 */
+extern volatile uint32_t g_es_probe_retry;/* probe 首试没探到、延时后探到的次数 */
+extern volatile uint32_t g_es_fail;    /* 重试 3 次仍失败 的次数（应恒 0）*/
+extern volatile uint32_t g_es_fix_wr;  /* 回读校验发现不对、补写 的次数 */
+extern volatile uint32_t g_es_recover_pe;/* 因 BUSY/TIMEOUT 做 I2C 软复位(PE 0→1)的次数 */
+extern volatile uint32_t g_es_readback; /* 回读体检执行次数（起播后那次 + 播放中每秒那次）*/
 
 /**
  * @brief  初始化 I2C1（PB6/PB7，AF4，100 kHz）—— 只做总线，不碰 codec
@@ -147,6 +169,22 @@ int es8311_dac_start_muted(void);
 int es8311_stop_dac(void);
 
 /**
+ * @brief  暂停用「静音」：只把 DAC 音量寄存器(REG32)写成 0，**不动电源/通路寄存器**。
+ *
+ * 【为什么需要它，而不是用 es8311_stop_dac()】
+ *   es8311_stop_dac() 是"关机"语义：REG0E=0xFF、REG12=0x02 把 codec 打进
+ *   **power-down**。芯片断电/上电的窗口里会对自己的 I2C 地址回 NACK —— 那 9 笔写
+ *   里就有若干笔砸在窗口上（2026-10-13 实测：暂停时 wr_ok 增量恰好 +9，且失败寄存器
+ *   覆盖 0x0D/0x0E/0x0F/0x12/0x14/0x15/0x32/0x37/0x45）。
+ *   而音乐 app 的「暂停」紧接着就是「续播」，**根本没有必要关掉这颗芯片**：
+ *   它的 5 V 常亮、寄存器状态本来就在，只要静音 + 停掉 I2S 时钟即可。
+ *   ⇒ 暂停改走本函数：只 1 笔 I2C、芯片保持可达，续播那段 ~19 笔 I2C 因此零 NACK 窗口。
+ *
+ * @return 0=OK；<0=失败（走 es8311_write_reg 的重试，仍失败才返回 <0）
+ */
+int es8311_dac_mute(void);
+
+/**
  * @brief  数字音量 0~255 → REG32（0=静音，0xBF≈75%，0xFF 最大）
  * @return 0=OK；<0=失败
  */
@@ -169,5 +207,43 @@ uint8_t es8311_volume_reg(uint32_t vol0_100);
  * @return 0=OK；<0=失败
  */
 int es8311_set_volume_ui(uint32_t vol0_100);
+
+/**
+ * @brief  DAC 通路"回读体检"：把 0x32/0x12/0x0E 从芯片读回，存进 g_es_rb_*
+ *
+ * 【为什么要回读】"写出去了" 不等于 "芯片收下了"。暂停→续播出现"没声音"时的第一
+ *   嫌疑是 "REG32 停在 0（静音）"，但只有回读才能区分：
+ *     · 我们没写（g_es_reg32_wr 还是旧值 / g_es_reg32_n 没涨）—— 软件时序问题；
+ *     · 写了但芯片里不是那个值（g_es_rb_vol ≠ g_es_reg32_wr）—— 复位/上电时序把写吞了。
+ *   出货路径在**起播/续播后的"音量确认期"逐拍调**（见 audio_out.c 的 audio_out_tick），
+ *   直到本函数回报 0（确认音量已落进芯片）才收工 —— 不是"读一次看一眼"。
+ *   为什么必须逐拍确认：ramp 末步写终值若撞上芯片 NACK 窗口会停在中间档（实测 0x78），
+ *   而那一拍的回读往往同样失败 ⇒ 只读一次判定不出来（见 .c 里 2026-10-13 的实测记录）。
+ * @return 0=**已确认**（读成功且音量 == 目标、REG12 未 power-down）；<0=未确认（调用方可下一拍再试）
+ */
+int es8311_dac_readback(void);
+
+/**
+ * @brief  1 = 本次开机已经成功跑过完整初始化序列（REG00 软复位 + 时钟/格式）
+ *
+ * 【为什么需要】完整 init 里含 **REG00=0x80 软复位**（整颗芯片重启）。而 codec 的 5V
+ *   常亮、寄存器状态本来就在，`es8311_stop_dac()`（暂停）写下的那些寄存器
+ *   `es8311_dac_start_muted()`（续播）会原样恢复 ⇒ **续播不需要再复位整颗芯片**。
+ *   板上实测（tools/wav_pause_resume_check.py）：复位/电源态切换后的若干毫秒里芯片
+ *   会对自己的 I2C 地址**回 NACK**（5 轮回放里 wr_ng 累计 45→77，全部是 NACK、
+ *   总线电平正常），而音量那几笔一丢就是"没声音/音量大小混乱"。少做一次复位 = 少一个
+ *   NACK 窗口 ⇒ 出货路径改成"只在开机第一次起播时跑完整 init"。
+ *   ⚠ 首次 init 失败时 s_codec_ready 不置位 ⇒ 下次起播会自动重试完整序列。
+ */
+int es8311_is_inited(void);
+
+/**
+ * @brief  以当前 UI 音量**重写整条 DAC 通路**（`dac_path_regs` 的对外封装）
+ *
+ * 回读体检（es8311_dac_readback）发现终态不对时用它补写：只补 REG32/REG12 不够 ——
+ * 实测丢写随机落在 0x09/0x0A/0x0E/0x12/0x14/0x17/0x32/0x37/0x45 各处，整段重写才闭合。
+ * @return 0=全部写成功；<0=仍有写失败（g_es_fail 会涨）
+ */
+int es8311_dac_repair(void);
 
 #endif /* ES8311_H */

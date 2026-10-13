@@ -51,6 +51,18 @@ int  audio_out_start(void);
 /** 停止出声：停 TIM6 心跳 → I2S 挂起 → 回收 PB9 给 UART4_TX → codec 挂起 */
 void audio_out_stop(void);
 
+/**
+ * @brief  暂停出声：与 audio_out_stop 相同，**但只把 codec 静音、不断电**。
+ *
+ * 【为什么与 stop 分开】stop 末尾的 es8311_stop_dac() 会把 codec 打进 power-down
+ *   （REG0E=0xFF / REG12=0x02），芯片掉电窗口里会 NACK 掉那 9 笔写中的若干笔；
+ *   而音乐 app「暂停 → 播放」紧接着续播，续播那 ~19 笔 I2C 就会撞上这个窗口
+ *   ⇒ 丢写（音量写一半 = "音量大小混乱"，全丢 = REG32 停在 0 = "没声音"）。
+ *   暂停只要静音就够，无需断电 ⇒ 本函数只发 1 笔 REG32=0，芯片保持可达。
+ * ⚠ 「切歌 / 播完 / 退出」仍走 audio_out_stop()（那时断电是对的，下次是全新起播）。
+ */
+void audio_out_pause(void);
+
 /** 1 = 正在出声 */
 int  audio_out_playing(void);
 
@@ -121,7 +133,13 @@ extern volatile uint32_t g_ao_dma_gap_max;/* 相邻两次 DMA 半传输中断的
  *   g_ao_dac_ramp   音量 ramp 剩余步数（0 = 已到 UI 音量；ramp 期间 8→1）*/
 extern volatile uint32_t g_ao_dac_ready;
 extern volatile uint32_t g_ao_dac_ramp;
-
+extern volatile uint32_t g_ao_wake_cnt;  /* "静音接通 DAC + 起 ramp"执行了几次
+                                          * （每次起播/续播恰 +1；>1 ⇒ 起播被重复触发）*/
+extern volatile int32_t  g_ao_init_rc;   /* 最近一次 codec 初始化序列的返回码（0=全写成功）*/
+extern volatile uint32_t g_ao_init_skips;/* 跳过完整 codec init 的次数（续播路径应每次 +1）*/
+extern volatile uint32_t g_ao_wake_retry;/* "静音接通 DAC"整段因丢写而重试的次数 */
+extern volatile uint32_t g_ao_probe_n;   /* 排障钩子：写 N ⇒ 接下来 N 拍各读 3 个 codec 寄存器
+                                          * （量稳态 I2C 失败率用，只读不改）*/
 /* ⚠ 2026-10-13 环形缓冲的一次语义修正（影响两条出音路径）：
  *   s_wr/s_rd 改为**单调计数器**（只在取索引时 & RING_MASK）。旧的
  *   `(s_wr - s_rd) & RING_MASK` 占用式在"环满"时读成 0（与"环空"同形），

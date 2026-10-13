@@ -12,6 +12,40 @@ volatile uint32_t g_es_wr_ng  = 0;
 volatile uint32_t g_es_rd_ok  = 0;
 volatile uint32_t g_es_rd_ng  = 0;
 volatile uint32_t g_es_bus_rc = 99;
+/* REG32（DAC 音量）**最后一次写进去的值** + 写入次数。
+ * ⚠ 为什么必须有：本工程主机侧 probe-rs 读不到外设、也调不了 C 函数，而"暂停后续播
+ *   没声音"这个现象的第一嫌疑就是"DAC 音量停在 0（静音）"。把每次 REG32 写入记在
+ *   RAM 里，SWD 一次就能看到起播/续播后音量的**真实落点**（0xFFFF = 本次开机没写过）。*/
+volatile uint32_t g_es_reg32_wr = 0xFFFFu;
+volatile uint32_t g_es_reg32_n  = 0u;
+
+/* ---- I2C 写失败诊断 + 恢复（2026-10-13：暂停→续播"没声音/音量乱"根因排障）----
+ * 【现象】板上实测：一次"起播→暂停→续播"里 wr_ng 会涨几次，且**逐次恶化**
+ *   （5 个循环里 wr_ng 累计 3→13→29→50→94），到后面连音量寄存器 REG32 都写不进去
+ *   ⇒ 芯片音量停在 0（静音）⇒ "进度条在走但没声音"；只写进去一部分 ⇒ "音量大小混乱"。
+ *   而所有失败**都被调用方忽略**（dac_path_regs / ramp 的返回值都是 (void)），
+ *   所以既没声音也没人能发现。这两点叠起来就是用户报的那个现象。
+ * 【对策】① 每次写失败先**复位 I2C 外设 + 复位 HAL 句柄状态**再重试（最多 3 次）；
+ *         ② 记下失败现场（寄存器号 / HAL 状态码 / 最近 8 次）供 SWD 复盘；
+ *         ③ ramp 结束后**回读校验**，不对就补写（见 audio_out 的 s_dac_rb_pending）。*/
+volatile uint32_t g_es_ng_reg  = 0xFFFFu;  /* 最后一次写失败的寄存器号 */
+volatile uint32_t g_es_ng_st   = 0xFFFFu;  /* 该次的 HAL_StatusTypeDef（1=NACK 2=BUSY 3=TIMEOUT）*/
+volatile uint32_t g_es_ng_nack = 0u;       /* 三种失败分别计数 */
+volatile uint32_t g_es_ng_busy = 0u;
+volatile uint32_t g_es_ng_tmo  = 0u;
+volatile uint32_t g_es_ng_ring[8];         /* 最近 8 次失败：高 8 位=寄存器号，低 8 位=状态码 */
+volatile uint32_t g_es_ng_head = 0u;
+volatile uint32_t g_es_retry_ok = 0u;      /* 重试后成功（第一次失败过）的次数 */
+volatile uint32_t g_es_probe_retry = 0u;   /* probe 首试没探到、延时后探到的次数 */
+volatile uint32_t g_es_fail    = 0u;       /* 重试 3 次仍失败的次数（>0 = 真丢写）*/
+volatile uint32_t g_es_fix_wr  = 0u;       /* "回读发现不对 → 补写"的次数 */
+volatile uint32_t g_es_recover_pe = 0u;    /* 因 BUSY/TIMEOUT 而做 I2C 软件复位(PE 0→1)的次数 */
+volatile uint32_t g_es_readback = 0u;      /* 回读体检执行次数（含起播后那次与每秒那次）*/
+volatile uint32_t g_es_ng_idr  = 0xFFFFu;  /* 失败瞬间 PB6(SCL)/PB7(SDA) 的电平（GPIOB->IDR bit6/bit7）
+                                            * 0x40/0x80 = 已释放（有上拉）；缺 0x80 ⇒ SDA 被从机压住 = 总线卡死*/
+
+/* 写失败后的 I2C 现场复位（只动 I2C1 自己的寄存器 + HAL 句柄，不碰任何 GPIO 电气；
+ * 定义放在 s_hi2c 声明之后，见下面 es8311_write_reg 之前）。 */
 
 static I2C_HandleTypeDef s_hi2c;
 static uint8_t           s_addr7 = ES8311_I2C_ADDR_CE0;   /* 当前选定的 7 位地址 */
@@ -123,16 +157,41 @@ uint32_t es8311_i2c_timing(uint32_t pclk)
 
 /* ====================== 寄存器读写 ====================== */
 
+/* 重试次数与间隔：实测 NACK 是"芯片有几十毫秒不响应"这种窗口 ⇒ 间隔取 2 ms
+ * （比 1 ms 明显更容易熬过窗口）。全失败才算真丢写 / 真探不到。 */
+#define ES8311_WR_TRIES     5u
+#define ES8311_TRY_MS       2u
+#define ES8311_PROBE_TRIES  3u
+
 int es8311_probe(uint8_t addr7)
 {
     return es8311_probe_to(addr7, 20u);
 }
 
+/* ⚠⚠ 探测**必须重试**（2026-10-13 板上定位，第二个真根因）：
+ *   `wav_play_start()` 第一行就是 `wav_play_stop()` —— 若当时正在播，它会调
+ *   `es8311_stop_dac()` 把 codec 打进 **power-down**；紧接着 `audio_out_start()` 就
+ *   `es8311_probe()`。芯片在掉电/上电窗口里**不对自己的 I2C 地址应答**，而旧写法
+ *   **一次 NACK 就判"总线上没有 ES8311"** ⇒ `audio_out_start` 返回 -2 ⇒
+ *   `wav_play_start` 返回 -22、**I2C 一笔都不写**（实测 g_es_wr_ok 增量为 0）。
+ *   表现正是用户报的"点了播放没反应/没声音"；而"第二发就好"也正是因为第二发时
+ *   芯片已经走出那个窗口。
+ *   ⇒ 与写/读同一套处置：失败先按类型自愈、延时 2 ms 再试，共 3 次；仍失败才判没探到。
+ *   ⚠ HAL_I2C_IsDeviceReady 内部那 3 次 Trials 是**背靠背**的（同一窗口内全灭），
+ *     所以这里的外层"延时后重试"才是真正起作用的那个。 */
 int es8311_probe_to(uint8_t addr7, uint32_t timeout_ms)
 {
-    if (HAL_I2C_IsDeviceReady(&s_hi2c, (uint16_t)(addr7 << 1), 3u, timeout_ms) == HAL_OK)
+    for (uint32_t att = 0u; att < ES8311_PROBE_TRIES; ++att)
     {
-        return 0;
+        if (HAL_I2C_IsDeviceReady(&s_hi2c, (uint16_t)(addr7 << 1), 3u, timeout_ms) == HAL_OK)
+        {
+            if (att != 0u)
+            {
+                g_es_probe_retry++;      /* 首试没探到、延时后探到了（诊断量）*/
+            }
+            return 0;
+        }
+        HAL_Delay(ES8311_TRY_MS);
     }
     return -1;
 }
@@ -142,35 +201,122 @@ void es8311_set_addr(uint8_t addr7)
     s_addr7 = addr7;
 }
 
+/* 写/读失败后的 I2C 现场处置。**按失败类型分开处理**（2026-10-13 板上实测的分类）：
+ *   · HAL_ERROR(NACK)：从机不应答地址 —— 板上实测**总线电平是正常释放的**
+ *     （g_es_ng_idr = 0xC0，SCL/SDA 都被上拉拉高），说明不是"总线卡死"，而是
+ *     **芯片在那一小段时间里不响应 I2C**（正在处理软复位/电源态切换）。这种失败
+ *     **不能靠复位外设解决**，只能"等一等再重试" ⇒ 这里只延时，不动外设。
+ *   · HAL_BUSY / HAL_TIMEOUT：外设状态机或总线时序出了问题（HAL 句柄可能停在
+ *     BUSY_xx，HAL_I2C_Master_Transmit 开头就判 State==READY）⇒ 才做 I2C 软件复位
+ *     （PE 0→1，只动 I2C1 自己的寄存器，不碰 GPIO 电气）+ 句柄状态归位。
+ *   ⚠ PE 必须**拉低至少 3 个 APB 时钟周期**才算有效复位（RM0433 I2C 章），
+ *     所以中间读回一次 CR1 再空转几拍，别写成"两条指令连着写"。 */
+static void es8311_i2c_recover(HAL_StatusTypeDef st)
+{
+    if (st == HAL_ERROR)
+    {
+        return;                       /* NACK：从机不应答，等调用方的延时即可 */
+    }
+    CLEAR_BIT(I2C1->CR1, I2C_CR1_PE);
+    (void)I2C1->CR1;                  /* 读回：保证写已到达外设 */
+    for (volatile uint32_t i = 0u; i < 32u; ++i) { }   /* ≥3 个 APB 周期 */
+    SET_BIT(I2C1->CR1, I2C_CR1_PE);
+    s_hi2c.State     = HAL_I2C_STATE_READY;
+    s_hi2c.ErrorCode = HAL_I2C_ERROR_NONE;
+    s_hi2c.Lock      = HAL_UNLOCKED;
+    g_es_recover_pe++;
+}
+
+/* 重试次数与间隔定义已上移到 es8311_probe_to 之前（probe/write/read 共用）。 */
+
 int es8311_write_reg(uint8_t reg, uint8_t val)
 {
-    uint8_t buf[2];
+    uint8_t           buf[2];
+    HAL_StatusTypeDef st = HAL_ERROR;
 
     buf[0] = reg;
     buf[1] = val;
-    if (HAL_I2C_Master_Transmit(&s_hi2c, (uint16_t)(s_addr7 << 1), buf, 2u, 50u) == HAL_OK)
+
+    /* 最多写 ES8311_WR_TRIES 次：失败后按类型处置再重试（理由见上）。
+     * ⚠ 只在**第一次**失败时记账（否则重试会把失败现场冲掉，复盘时就看不到真因）。
+     * ⚠ 失败**必须重试**：调用方（dac_path_regs / 音量 ramp）的历史写法是忽略返回值的，
+     *   一旦这几个字节丢了，DAC 通路/音量就会"只写了一半"—— 表现正是用户报的
+     *   "没声音"和"音量大小混乱"。 */
+    for (uint32_t att = 0u; att < ES8311_WR_TRIES; ++att)
     {
-        g_es_wr_ok++;
-        return 0;
+        st = HAL_I2C_Master_Transmit(&s_hi2c, (uint16_t)(s_addr7 << 1), buf, 2u, 50u);
+        if (st == HAL_OK)
+        {
+            if (att != 0u)
+            {
+                g_es_retry_ok++;          /* 第一次失败、重试成功 */
+            }
+            if (reg == 0x32u)             /* DAC 音量：记值 + 计数（暂停/续播排障用）*/
+            {
+                g_es_reg32_wr = val;
+                g_es_reg32_n++;
+            }
+            g_es_wr_ok++;
+            return 0;
+        }
+
+        if (att == 0u)
+        {
+            g_es_ng_reg = reg;
+            g_es_ng_st  = (uint32_t)st;
+            if (st == HAL_TIMEOUT)      { g_es_ng_tmo++;  }
+            else if (st == HAL_BUSY)    { g_es_ng_busy++; }
+            else                        { g_es_ng_nack++; }
+            g_es_ng_ring[g_es_ng_head & 7u] =
+                ((uint32_t)reg << 8) | ((uint32_t)st & 0xFFu);
+            g_es_ng_head++;
+            g_es_wr_ng++;
+            /* 顺手量一眼总线电平（只读 IDR，不改任何电气）：SDA 若被从机压住，
+             * 说明是"总线卡死"而不是"从机 NACK 一包"，两者的处置完全不同。 */
+            g_es_ng_idr = GPIOB->IDR & (GPIO_PIN_6 | GPIO_PIN_7);
+        }
+
+        es8311_i2c_recover(st);
+        HAL_Delay(ES8311_TRY_MS);         /* NACK：给芯片一点时间走出"不应答"窗口 */
     }
-    g_es_wr_ng++;
+
+    g_es_fail++;
     return -1;
 }
 
 int es8311_read_reg(uint8_t reg, uint8_t *val)
 {
-    if (HAL_I2C_Master_Transmit(&s_hi2c, (uint16_t)(s_addr7 << 1), &reg, 1u, 50u) != HAL_OK)
+    HAL_StatusTypeDef st = HAL_ERROR;
+
+    /* 与写同样要重试：读失败会让调用方**跳过**后续写（config_i2s 就是
+     * `if (read == 0) write(...)`），结果是数据格式没配却"看起来成功"——又是
+     * 一类只有耳朵能发现的静默故障。 */
+    for (uint32_t att = 0u; att < ES8311_WR_TRIES; ++att)
     {
-        g_es_rd_ng++;
-        return -1;
+        st = HAL_I2C_Master_Transmit(&s_hi2c, (uint16_t)(s_addr7 << 1), &reg, 1u, 50u);
+        if (st == HAL_OK)
+        {
+            st = HAL_I2C_Master_Receive(&s_hi2c, (uint16_t)(s_addr7 << 1), val, 1u, 50u);
+        }
+        if (st == HAL_OK)
+        {
+            g_es_rd_ok++;
+            return 0;
+        }
+        if (att == 0u)
+        {
+            g_es_ng_reg = (uint32_t)reg | 0x100u;   /* 高位置 1 标记"这是读失败" */
+            g_es_ng_st  = (uint32_t)st;
+            g_es_ng_ring[g_es_ng_head & 7u] =
+                (0x01u << 16) | ((uint32_t)reg << 8) | ((uint32_t)st & 0xFFu);
+            g_es_ng_head++;
+            g_es_rd_ng++;
+            g_es_ng_idr = GPIOB->IDR & (GPIO_PIN_6 | GPIO_PIN_7);
+        }
+        es8311_i2c_recover(st);
+        HAL_Delay(ES8311_TRY_MS);
     }
-    if (HAL_I2C_Master_Receive(&s_hi2c, (uint16_t)(s_addr7 << 1), val, 1u, 50u) != HAL_OK)
-    {
-        g_es_rd_ng++;
-        return -1;
-    }
-    g_es_rd_ok++;
-    return 0;
+    return -1;
 }
 
 int es8311_read_id(uint8_t id[3])
@@ -268,8 +414,7 @@ int es8311_init(void)
     return rc;
 }
 
-int es8311_config_i2s(void)
-{
+int es8311_config_i2s(void){
     uint8_t v;
     int rc = 0;
 
@@ -346,6 +491,19 @@ int es8311_dac_start_muted(void)
     return dac_path_regs(0x00u);
 }
 
+int es8311_dac_mute(void)
+{
+    int rc;
+
+    /* 只写音量 = 静音。**不写 0x0E/0x12/0x0D/0x14/0x15/0x37/0x45** —— 那些是
+     * "关机"序列（es8311_stop_dac）的一部分，会制造 power-down 的 NACK 窗口。
+     * 暂停后芯片仍保持通电与通路就绪，所以续播时 dac_path_regs 全是"有效时钟下的写"。
+     * ⚠ 仍要过 es8311_write_reg 的重试：单笔也可能撞上别的窗口（比如 probe halt）。 */
+    rc = es8311_write_reg(0x32, 0x00);
+    g_es_rc = rc;
+    return rc;
+}
+
 int es8311_stop_dac(void)
 {
     int rc = 0;
@@ -391,4 +549,90 @@ int es8311_set_volume_ui(uint32_t vol0_100)
     rc = es8311_write_reg(0x32, es8311_volume_reg(vol0_100));
     g_es_rc = rc;
     return rc;
+}
+
+/* ---- DAC 通路"回读体检"（2026-10-13 排障用）----
+ * 把 DAC 关键寄存器**从芯片里读回来**存进 RAM，供 SWD 查看：
+ *   g_es_rb_vol (0x32 DAC 音量) / g_es_rb_pwr (0x12 power) / g_es_rb_dac0e (0x0E)
+ * 为什么需要：写出去了 ≠ 芯片收下了。"续播没声音"的第一嫌疑就是"REG32 停在 0"，
+ * 但只有回读才能区分"我们没写"和"写了但被芯片/复位吞掉"。
+ * 返回 0 = 三次读都成功；<0 = 至少一次 I2C 读失败（-1 表示芯片根本没应答）。*/
+volatile uint32_t g_es_rb_vol  = 0xFFFFu;
+volatile uint32_t g_es_rb_pwr  = 0xFFFFu;
+volatile uint32_t g_es_rb_dac0e = 0xFFFFu;
+
+int es8311_dac_readback(void)
+{
+    uint8_t  v;
+    uint32_t target = es8311_volume_reg(g_audio_volume);
+    int      confirmed = 0;
+
+    g_es_readback++;
+
+    /* 最多 3 轮"读 → 不对就补 → 再读"。之所以要补写：I2C 写是**会失败**的（见
+     * es8311_write_reg 的说明），而 volume ramp / dac_path_regs 的返回值历史上被忽略
+     * ⇒ 一旦音量那几笔丢了，芯片就停在 0（静音）—— 用户听到的"进度条在走但没声音"；
+     * 丢一半就是"音量大小混乱"（实测停在 0x78 = ramp 第 7 步）。这里以**回读值为准**做闭环。
+     * ⚠ 返回语义：0 = **确认音量已落进芯片**（读成功且值 == 目标、REG12 已上电）；
+     *   <0 = 未确认成功。调用方（audio_out 的"确认期"）靠它决定要不要下一拍再来一次。 */
+    for (uint32_t round = 0u; round < 3u; ++round)
+    {
+        int vol_ok = (es8311_read_reg(0x32, &v) == 0);
+        if (vol_ok) { g_es_rb_vol = v; } else { g_es_rb_vol = 0xFFFFu; }
+
+        int pwr_ok = (es8311_read_reg(0x12, &v) == 0);
+        if (pwr_ok) { g_es_rb_pwr = v; } else { g_es_rb_pwr = 0xFFFFu; }
+
+        if (es8311_read_reg(0x0Eu, &v) == 0) { g_es_rb_dac0e = v; } else { g_es_rb_dac0e = 0xFFFFu; }
+
+        /* 终态判据：音量 == 目标 且 REG12 的 power-down 位(bit1)为 0。*/
+        if (vol_ok && pwr_ok && (g_es_rb_vol == target) && ((g_es_rb_pwr & 0x02u) == 0u))
+        {
+            confirmed = 1;
+            break;
+        }
+
+        /* ---- 分层补写：先便宜、后昂贵（2026-10-13 板上实测定的层次）----
+         * 【为什么不能"读失败就整段重写"】I2C 读**会失败**（探针 halt、芯片电源态窗口），
+         *   一旦 read != 0 就把回读值当 0xFFFF、立刻 dac_repair() 整段重写（11 笔写）
+         *   ⇒ 一次读 NACK 换来 11 笔写，是"写放大"，而写风暴又更容易再丢写。
+         * 【为什么也不能"读失败就不补"】实测（tools/wav_pause_resume_check.py，2026-10-13）：
+         *   音量 ramp 的**第 8 步（写终值 0x89）**若砸进 NACK 窗口、5 次重试全灭，
+         *   REG32 会停在**中间档**（实测 0x78 = 第 7 步值），而那一拍的回读往往也在同一
+         *   窗口里失败 ⇒ 此时若不补，音量就**永久停在中间值** —— 这正是用户报的
+         *   "音量大小混乱"（表现为听起来比设定音量轻一档，且每次续播轻重不一）。
+         * 【所以】第 1、2 轮各补**单笔**（REG32 / REG12 这两个决定听感的寄存器，最省），
+         *   末轮仍不对才 dac_repair() 整段重写（覆盖"丢写落在通路别的寄存器"的少见情形）。 */
+        if (round < 2u)
+        {
+            g_es_fix_wr++;              /* 单笔补写也计入修补次数，避免掩盖问题 */
+            if (!vol_ok || (g_es_rb_vol != target))
+            {
+                (void)es8311_write_reg(0x32, (uint8_t)target);
+            }
+            if (!pwr_ok || ((g_es_rb_pwr & 0x02u) != 0u))
+            {
+                (void)es8311_write_reg(0x12, 0x00u);
+            }
+        }
+        else
+        {
+            /* 用"只补那两个寄存器"不够的情形：丢写随机落在 0x09/0x0A/0x0E/0x12/
+             * 0x14/0x17/0x32/0x37/0x45 各处，末轮整段重写才闭合得住（计数在
+             * es8311_dac_repair 里）。 */
+            (void)es8311_dac_repair();
+        }
+    }
+    return confirmed ? 0 : -1;
+}
+
+int es8311_dac_repair(void)
+{
+    g_es_fix_wr++;                     /* 补写计数：回读发现终态不对才会走到这里 */
+    return dac_path_regs(es8311_volume_reg(g_audio_volume));
+}
+
+int es8311_is_inited(void)
+{
+    return (s_codec_ready != 0u) ? 1 : 0;
 }
