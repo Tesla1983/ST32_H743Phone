@@ -66,8 +66,9 @@ IDX = {
     "ESRB0E": 26, "ESWNCUR": 27, "ESWNS": 28, "ESNAK": 29, "ESBUSY": 30,
     "ESTMO": 31,     "ESNGHEAD": 32, "ESNGIDR": 33, "VOLUI": 34, "DMARSH": 35,
     "DMARCP": 36, "DMARERR": 37, "FRAMES": 38, "MAGIC": 39, "ESPRETRY": 40,
+    "PAUSECALL": 41, "PAUSEWR": 42, "RESUMECALL": 43,
 }
-N_WORDS = 41
+N_WORDS = 44
 MAGIC = 0x5A4D4731
 
 
@@ -179,9 +180,16 @@ def main():
         # ① 起播（锁存表 A）
         A = latch_snap(1, wait=2.2)
 
-        # ② 暂停（锁存表 B）—— B.wr_ok - A.wr_ok == 暂停期间的 I2C 写笔数
+        # ② 暂停（锁存表 B）
+        # ⚠⚠ 判据已从"wr_ok 增量"改为**动作级计数**（2026-10-13）：
+        #   旧判据 `B.wr_ok − A.wr_ok` 的窗口**跨了播放期** —— 播放中"每秒回读体检"
+        #   补写的 REG32 会被误计成"暂停写了多笔"，实测间歇报 2/3/5/16 笔，
+        #   复跑全部证伪为**窗口伪影**（不是代码回归）。窗口无论如何收紧都根除不了。
+        #   ⇒ 现由 audio_out_pause() **自己**累加 g_ao_pause_calls / g_ao_pause_volwr，
+        #    与 I2C 流量、探针密度、窗口长度全都无关，是确定性判据。
         B = latch_snap(3, wait=1.8)
-        pause_writes = B["ESWROK"] - A["ESWROK"]
+        pause_calls  = B["PAUSECALL"] - A["PAUSECALL"]
+        pause_writes = B["PAUSEWR"]   - A["PAUSEWR"]
 
         # ③ 续播（锁存表 C）
         C = latch_snap(4, wait=2.6)
@@ -194,8 +202,8 @@ def main():
         print("  起播表A: state=%d rc=%d ao_rc=%d init_rc=%d playing=%d ready=%d ramp=%d wake=%d wr_ok=%d probe_retry=%d" %
               (A["WSTATE"], A["WRC"], A["AORC"], A["AOINITRC"], A["AOPLAY"], A["AOREADY"],
                A["AORAMP"], A["AOWAKE"], A["ESWROK"], A["ESPRETRY"]))
-        print("  暂停表B: state=%d wr_ok=%d  ⇒ 暂停期 I2C 写笔数=%d（旧实现 9；新实现应为 1）" %
-              (B["WSTATE"], B["ESWROK"], pause_writes))
+        print("  暂停表B: state=%d pause_calls=%d pause_wr=%d  ⇒ 暂停写 REG32 笔数=%d（旧实现 9；新实现应为 1）" %
+              (B["WSTATE"], pause_calls, pause_writes, pause_writes))
         print("  续播表C: state=%d rc=%d playing=%d ready=%d ramp=%d wake=%d skip=%d" %
               (C["WSTATE"], C["WRC"], C["AOPLAY"], C["AOREADY"], C["AORAMP"],
                C["AOWAKE"], C["AOSKIP"]))
@@ -216,9 +224,11 @@ def main():
             fails.append("[%d] P0 起播失败 WRC=%d AORC=%d AOINITRC=%d wr_ok=%d"
                          "（-22=audio_out_start 失败）"
                          % (cyc, A["WRC"], A["AORC"], A["AOINITRC"], A["ESWROK"]))
-        # ---- P1 暂停只发 1 笔 I2C 写 ----
+        # ---- P1 暂停只发 1 笔 I2C 写（★动作级判据，不受窗口影响）----
+        if pause_calls != 1:
+            fails.append("[%d] P1 暂停动作执行了 %d 次（应为 1）" % (cyc, pause_calls))
         if pause_writes != 1:
-            fails.append("[%d] P1 暂停发了 %d 笔 I2C 写（应为 1；>1 ⇒ 又走了 stop_dac 断电路径）"
+            fails.append("[%d] P1 暂停写了 %d 笔 REG32（应为 1 静音；>1 ⇒ 又走了 stop_dac 断电路径）"
                          % (cyc, pause_writes))
         # ---- P2 暂停后 codec 仍通电可达 ----
         if B["ESRBPWR"] == 0xFFFF:

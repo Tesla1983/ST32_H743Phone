@@ -137,6 +137,9 @@ static void wav_snap_latch(uint32_t phase)
     g_wav_snap[G_SNAP_DMARERR]  = g_ao_dma_err;
     g_wav_snap[G_SNAP_FRAMES]   = g_ao_frames;
     g_wav_snap[G_SNAP_ESPRETRY] = g_es_probe_retry;      /* probe 首试没探到、延时后探到 */
+    g_wav_snap[G_SNAP_PAUSECALL] = g_ao_pause_calls;     /* ★ 暂停动作次数（动作级判据）*/
+    g_wav_snap[G_SNAP_PAUSEWR]   = g_ao_pause_volwr;     /* ★ 暂停动作写 REG32 的笔数 */
+    g_wav_snap[G_SNAP_RESUMECALL]= g_ao_resume_calls;    /* ★ 起播/续播动作次数 */
     g_wav_snap[G_SNAP_MAGIC]    = G_WAV_SNAP_MAGIC;      /* 最后写魔数 ⇒ 主机凭它判"表是完整的" */
     g_wav_snap[G_SNAP_PHASE]    = phase;                 /* seqlock：清除"正在写"标记 */
 }

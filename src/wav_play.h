@@ -89,9 +89,8 @@ extern volatile uint32_t g_wav_test;     /* 诊断：写 1 起播 /YMGUI/MUSIC/T
  *   g_wav_snap[G_SNAP_MAGIC] 最后写 ⇒ 主机凭魔数判"这一拍的表是完整的"。
  * ⚠ 索引顺序即内存布局，**改动会同时废掉 tools/wav_pause_resume_check.py**。 */
 #define G_WAV_SNAP_MAGIC 0x5A4D4731u   /* 'ZMG1' */
-#define G_SNAP_MAGIC    39u   /* 魔数 G_WAV_SNAP_MAGIC（最后写）*/
-#define G_SNAP_ESPRETRY 40u   /* g_es_probe_retry  probe 首试没探到、延时后探到 */
-#define G_WAV_SNAP_N     41u  /* 表长（含 MAGIC）—— 主机按此字节数批量读 */
+#define G_SNAP_MAGIC    39u   /* 魔数 G_WAV_SNAP_MAGIC（**代码里最后写** ⇒ 主机凭它判表完整）*/
+#define G_WAV_SNAP_N     44u  /* 表长（含 MAGIC）—— 主机按此字节数批量读 */
 
 #define G_SNAP_PHASE     0u   /* 本次锁存对应的相位码（1/2/3/4）*/
 #define G_SNAP_LOOP      1u   /* 锁存瞬间的 g_loop_count（判"动作后又过了几拍"）*/
@@ -134,7 +133,11 @@ extern volatile uint32_t g_wav_test;     /* 诊断：写 1 起播 /YMGUI/MUSIC/T
 #define G_SNAP_FRAMES    38u  /* g_ao_frames（÷48828 ≈ 已出声秒数）*/
 #define G_SNAP_MAGIC    39u   /* 魔数 G_WAV_SNAP_MAGIC（最后写）*/
 #define G_SNAP_ESPRETRY 40u   /* g_es_probe_retry  probe 首试没探到、延时后探到 */
-#define G_WAV_SNAP_N     41u  /* 表长（含 MAGIC）—— 主机按此字节数批量读 */
+/* ★ 2026-10-13 追加（表尾，不动上游索引）：动作级计数，修 P1 的测量窗口伪影 */
+#define G_SNAP_PAUSECALL 41u  /* g_ao_pause_calls  暂停动作真正执行次数（单调）*/
+#define G_SNAP_PAUSEWR   42u  /* g_ao_pause_volwr  暂停动作里对 REG32 的写笔数（单调）*/
+#define G_SNAP_RESUMECALL 43u /* g_ao_resume_calls 起播/续播动作真正执行次数（单调）*/
+#define G_WAV_SNAP_N     44u  /* 表长（含 MAGIC）—— 主机按此字节数批量读 */
 
 extern volatile uint32_t g_wav_snap_req;         /* 写相位码触发锁存（板上用后清 0）*/
 extern volatile uint32_t g_wav_snap[G_WAV_SNAP_N];

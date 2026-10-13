@@ -44,6 +44,12 @@ volatile uint32_t g_es_readback = 0u;      /* 回读体检执行次数（含起�
 /* ★ 2026-10-13：UI 卡死修复新增的两个计数（见 g_es_ng_idr 下方的长说明）*/
 volatile uint32_t g_es_bus_clear = 0u;     /* I2C bus clear（9 时钟 + STOP）真正执行过的次数 */
 volatile uint32_t g_es_breaker_trip = 0u;  /* I2C 熔断触发次数（连续硬失败过多 ⇒ 快速失败）*/
+volatile uint32_t g_es_i2c_req = 0u;       /* 排障钩子：写 1 ⇒ 主循环按 g_es_i2c_hz 重定时 */
+volatile uint32_t g_es_i2c_timingr = 0u;   /* 最近一次生效的 I2C1 TIMINGR（重定时诊断）*/
+volatile uint32_t g_es_busclear_en = 1u;   /* ★排障开关：1=允许自动 bus clear（默认）；
+                                            * 0=禁用（只做 PE 复位）—— 用于验证"单次 IDR 采样
+                                            * 误判 SDA 被钳低 ⇒ 误触发 bus clear ⇒ 正反馈"
+                                            * 的假设。验证完保持 1。 */
 volatile uint32_t g_es_ng_idr  = 0xFFFFu;  /* 失败瞬间 PB6(SCL)/PB7(SDA) 的电平（GPIOB->IDR bit6/bit7）
                                             * 0x40/0x80 = 已释放（有上拉）；缺 0x80 ⇒ SDA 被从机压住 = 总线卡死*/
 
@@ -71,6 +77,11 @@ static uint8_t           s_codec_ready = 0u;
  * breaker_tick    ：熔断后 HAL_GetTick() 的冷却起点；冷却期内所有 I2C 立即快速失败。*/
 static uint32_t          s_es_consec_fail = 0u;
 static uint32_t          s_es_breaker_tick = 0u;
+
+/* ★ SCL 目标频率（Hz）。默认 100 kHz；SWD 写 `g_es_i2c_hz` 后调 es8311_i2c_retiming()
+ *   现场改 TIMINGR —— 用于验证"降频能否消除 ~30% 首试 NACK"的电气边际假设。
+ *   范围夹在 10~400 kHz（I2C 标准模式上限 400 kHz，下限防手滑写 0 除零）。 */
+volatile uint32_t g_es_i2c_hz = 100000u;
 
 /* ====================== I2C1 总线 ====================== */
 
@@ -160,9 +171,16 @@ uint32_t es8311_i2c_timing(uint32_t pclk)
     if (presc > 0u) presc -= 1u;
     if (presc > 15u) presc = 15u;
 
-    /* 100 kHz ⇒ 半周期合计 10 µs，折算成 tPRESC 个数：pclk/((presc+1)×1e5) */
-    tot = pclk / ((presc + 1u) * 100000u);
+    /* ⚠⚠ 目标 SCL 频率 = g_es_i2c_hz（默认 100 kHz，可 SWD 现场下调做电气余量实验）。
+     *   【为什么可调】2026-10-13 零探针窗口实测（零探针窗口实验：全程不碰探针、
+     *   播放中静置 20 s）：本模块 I2C **首试 NACK 率约 30%**，且成簇爆发（g_es_fail 一次
+     *   涨 2~5 笔）、ng_ring 全是 NACK、失败瞬间 g_es_ng_idr=0x40（SDA 被读成低）。
+     *   根因指向**电气边际**：模块的 SDA/SCL 上拉**只有 MCU 内部 ~40 kΩ**（板上无外部
+     *   上拉），配 100 kHz 时上升沿 (RC) 余量不足 ⇒ 采样点读到的电平还没升到位。
+     *   降 SCL 频率 = 给上升沿更多时间 ⇒ 直接验证该假设（纯软件、零硬件风险）。 */
+    tot = pclk / ((presc + 1u) * g_es_i2c_hz);
     if (tot < 8u) tot = 8u;
+    if (tot > 500u) tot = 500u;          /* SCLH/SCLL 各 8 bit，总周期数上限 ~510 */
     scll_t = (tot * 55u) / 100u;         /* 低 55% */
     if (scll_t < 4u) scll_t = 4u;
     sclh_t = tot - scll_t;
@@ -180,6 +198,29 @@ uint32_t es8311_i2c_timing(uint32_t pclk)
            ((sclh_t - 1u) << 8) | (scll_t - 1u);
 }
 
+/* ★ SWD 现场重定时：读 g_es_i2c_hz 重算 TIMINGR 并写进 I2C1（无需重新烧录即可扫多个频率）。
+ *   用法（主机）：probe-rs write ... g_es_i2c_hz <Hz>；再 write ... g_es_i2c_req 1；
+ *   固件在主循环里消费 g_es_i2c_req 后调用本函数。返回最终生效的 TIMINGR（诊断）。
+ *   ⚠ 只在 g_es_bus_rc==0（I2C1 已初始化）时有效；否则直接返回 0。
+ *   ⚠ HAL_I2C_Init 会重置外设；调用前后驱动的 retry/breaker 状态无需变动（时序无关）。*/
+uint32_t es8311_i2c_retiming(void)
+{
+    uint32_t hz = g_es_i2c_hz;
+
+    if (g_es_bus_rc != 0u)
+    {
+        return 0u;
+    }
+    if (hz < 10000u)  hz = 10000u;      /* 下限 10 kHz：防手滑写 0（除零）+ 防过慢 */
+    if (hz > 400000u) hz = 400000u;     /* 上限 400 kHz：I2C 标准模式极限 */
+    g_es_i2c_hz = hz;
+
+    s_hi2c.Init.Timing = es8311_i2c_timing(HAL_RCC_GetPCLK1Freq());
+    (void)HAL_I2C_Init(&s_hi2c);
+    g_es_i2c_timingr = s_hi2c.Init.Timing;
+    return s_hi2c.Init.Timing;
+}
+
 /* ====================== 寄存器读写 ====================== */
 
 /* 重试次数与间隔。
@@ -191,10 +232,21 @@ uint32_t es8311_i2c_timing(uint32_t pclk)
  *   ⇒ 19 × 250 ms ≈ 4.75 s。50 ms 这个值对 100 kHz 总线毫无意义
  *   （一字节事务本身只要 ~90 µs，就算从机全程拉伸时钟也就几百 µs），
  *   它只是把"对端不应答"拖成了 UI 级卡顿。改成 5 ms 后最坏 ~19×15 ms ≈ 285 ms。
- * ⚠ 重试次数 5 → 3：配合下面的"硬失败熔断"，连续失败会立刻快速失败，
- *   不必靠单笔多次重试去熬窗口（熬窗口由调用方下一拍再来承担，不阻塞 UI）。 */
+ * ⚠ 重试次数**保持 5**（补丁9 曾一度降到 3，2026-10-13 复测后改回）：
+ *   【为什么改回】零探针窗口实测（零探针窗口实验：reset→起播→完全不再碰
+ *   探针、静置 20 s）证明本模块 I2C 链路的**首试 NACK 率约 30%** —— 这是"内部上拉
+ *   (~40 kΩ) + 100 kHz"下该模块的固有电气边际，**不是**探针 halt 伪影（零窗口照样
+ *   30%），也**不是**补丁9 引入的。既然单笔首试就有 ~30% 会 NACK，那么"5 次重试仍
+ *   全灭"的概率 ≈ 0.28⁵ ≈ 0.17%，而"3 次重试仍全灭" ≈ 0.28³ ≈ 2.2% —— **放大约 13 倍**。
+ *   这正是 wav_pause_resume_check 的 P6（真丢写 g_es_fail==0）开始间歇 FAIL 的原因：
+ *   不是代码回归，是把容错余量削得太薄。
+ *   【为什么不会带回 UI 卡死】UI 卡死的真因是**单笔超时 50 ms**（×5 重试 = 250 ms/笔，
+ *   一次起播 19 笔 ≈ 4.75 s），与"重试几次"无关；超时已收敛到 5 ms（10 倍），最坏
+ *   19×5×5 ms ≈ 475 ms。且卡死态（SDA 被从机钳低）由 es8311_i2c_recover 在**首次**
+ *   失败时就读 IDR 检出、立刻 bus_clear 救回并 return，**根本走不满 5 次重试**。
+ *   ⇒ 重试数回到 5 只增加"对端偶发 NACK 时多试两次"的容错，不增加卡死态开销。 */
 #define ES8311_TIMEOUT_MS   5u
-#define ES8311_WR_TRIES     3u
+#define ES8311_WR_TRIES     5u
 #define ES8311_TRY_MS       2u
 #define ES8311_PROBE_TRIES  3u
 
@@ -376,16 +428,26 @@ static void es8311_bus_clear(void)
  *   ⚠ PE 必须**拉低至少 3 个 APB 时钟周期**才算有效复位（RM0433 I2C 章）。 */
 static void es8311_i2c_recover(HAL_StatusTypeDef st)
 {
-    uint32_t idr = GPIOB->IDR & (GPIO_PIN_6 | GPIO_PIN_7);
+    uint32_t idr;
 
     /* ★ 判据：SDA(PB7) 被压住 = 总线卡死 ⇒ 立刻 bus clear（与失败类型无关）。
      *   放在类型判断**之前**：实测卡死态下 HAL 报的正是 NACK(1)，
-     *   若照旧对 NACK 直接 return，就永远走不到恢复。 */
-    if ((idr & GPIO_PIN_7) == 0u)
+     *   若照旧对 NACK 直接 return，就永远走不到恢复。
+     * ⚠⚠ 但**必须先给总线一点时间把 SDA 抬起来**：HAL 失败(尤其 NACK 后的 STOP)
+     *   返回的**那一刻**，SDA 的上升沿（板上只有 MCU 内部 ~40 kΩ 弱上拉 × 总线电容，
+     *   RC 约数 µs）还没到位，此刻读 IDR 会读到 0 ⇒ **误判"总线卡死"** ⇒ 误触发
+     *   bus_clear（切 GPIO + 9 脉冲 + PE 复位，会打断正在进行的时序）⇒ 反而制造下一次
+     *   失败，形成"误判→bus clear→更多失败"的正反馈。2026-10-13 实测：10 万次读里
+     *   bus_clear 触发 187 次、失败率 ~30%、降频无改善 —— 正与该正反馈相符。
+     *   ⇒ 采样前先等几个 µs（并连读两次取"稳定态"）。 */
+    for (volatile uint32_t i = 0u; i < 2000u; ++i) { }   /* ≈ 20 µs @100 MHz：等 SDA 抬起 */
+    idr = GPIOB->IDR & (GPIO_PIN_6 | GPIO_PIN_7);
+    if ((g_es_busclear_en != 0u) && ((idr & GPIO_PIN_7) == 0u))
     {
         es8311_bus_clear();
         return;
     }
+    (void)idr;
 
     if (st == HAL_ERROR)
     {

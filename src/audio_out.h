@@ -140,6 +140,11 @@ extern volatile uint32_t g_ao_init_skips;/* 跳过完整 codec init 的次数（
 extern volatile uint32_t g_ao_wake_retry;/* "静音接通 DAC"整段因丢写而重试的次数 */
 extern volatile uint32_t g_ao_probe_n;   /* 排障钩子：写 N ⇒ 接下来 N 拍各读 3 个 codec 寄存器
                                           * （量稳态 I2C 失败率用，只读不改）*/
+/* ★ 2026-10-13 动作级计数（消除验收脚本 P1 的"窗口跨播放期"伪影）：
+ *   暂停/续播各自在**动作本身**累加，与 I2C 流量、探针密度、窗口长度无关。 */
+extern volatile uint32_t g_ao_pause_calls;  /* audio_out_pause() 真正执行次数 */
+extern volatile uint32_t g_ao_pause_volwr;  /* 暂停动作里对 REG32 的写笔数（应 = pause_calls）*/
+extern volatile uint32_t g_ao_resume_calls; /* 起播/续播动作真正执行次数 */
 /* ⚠ 2026-10-13 环形缓冲的一次语义修正（影响两条出音路径）：
  *   s_wr/s_rd 改为**单调计数器**（只在取索引时 & RING_MASK）。旧的
  *   `(s_wr - s_rd) & RING_MASK` 占用式在"环满"时读成 0（与"环空"同形），

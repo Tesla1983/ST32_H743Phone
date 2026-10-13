@@ -100,6 +100,15 @@ volatile uint32_t g_ao_init_skips = 0u;  /* 跳过了多少次完整 codec init�
 volatile uint32_t g_ao_wake_retry = 0u;  /* "静音接通 DAC"这一整段因有写丢失而重试的次数 */
 volatile uint32_t g_ao_probe_n   = 0u;   /* 排障钩子：写 N ⇒ 接下来 N 拍各做一次 codec 回读体检
                                           * （用于量"稳态下 I2C 失败率"，不依赖有没有在播放）*/
+/* ★ 2026-10-13：动作级计数器 —— 消除验收脚本 P1 的"测量窗口伪影"。
+ * 【为什么需要】wav_pause_resume_check 的 P1 用 `B.wr_ok − A.wr_ok` 反推"暂停写了几笔"，
+ *   而 A(起播)→B(暂停) 的窗口**跨了播放期**，播放中"每秒回读体检"补写的 REG32 会被
+ *   误计进去 ⇒ 间歇报"暂停发了 2/16 笔"（实测复跑全部证伪为伪影）。窗口无论如何收紧都
+ *   无法根除（播放期必须存在）。⇒ 改由**动作本身**计数：暂停/续播各自在同一处累加，
+ *   与 I2C 流量、探针密度、窗口长度都无关，是确定性判据。 */
+volatile uint32_t g_ao_pause_calls = 0u;   /* audio_out_pause() 被真正执行（非 early-return）的次数 */
+volatile uint32_t g_ao_pause_volwr = 0u;   /* 暂停动作里对 REG32 的写笔数（应恒 = g_ao_pause_calls）*/
+volatile uint32_t g_ao_resume_calls = 0u;  /* 续播（起播）动作被真正执行的次数 */
 
 /* 起播音量 ramp 的步数：8 步 × 主循环一拍（≈16 ms）≈ 130 ms 完成。
  * 步数太少压不住跳变、太多会让人听出"声音起得慢"，8 是折中。 */
@@ -722,6 +731,7 @@ int audio_out_start(void)
     {
         return 0;                       /* 已在播：幂等 */
     }
+    g_ao_resume_calls++;                /* ★ 动作级计数：本次起播/续播真的执行了 */
 
     /* 1) 控制通道：I2C1 + ES8311 */
     rc = es8311_bus_init();
@@ -913,11 +923,13 @@ void audio_out_pause(void)
     {
         return;
     }
+    g_ao_pause_calls++;                 /* ★ 动作级计数：本次暂停真的执行了 */
     tim6_stop();
     i2s_dma_stop();                     /* 没起 DMA 时内部直接返回 */
     i2s_stop();
     i2s_gpio_release();
     (void)es8311_dac_mute();            /* ★ 只静音，**不** es8311_stop_dac()（断电）*/
+    g_ao_pause_volwr++;                 /* ★ 本次暂停对 REG32 的写笔数（与上面一行 1:1）*/
     g_ao_playing = 0u;
     g_ao_codec   = 0u;
     s_wr = 0u;

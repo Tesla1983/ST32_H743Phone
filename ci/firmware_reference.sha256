@@ -1486,5 +1486,46 @@
 #      窗口内播放期"每秒回读体检"恰好补写一笔 REG32，非代码回归。）
 #   · tools/verify_board_image.py --sampled 8192 ⇒ 5 段全一致。
 # FLASH 1 664 052 B（79.35%），比补丁8 +784 B。
-4602cb3ec2a8b99714613cb5a4b8caebc3c143214c6cec45812a79a5b0ab76e8  ymgui-h743.bin
-1d22d2c58c08455d4d9271d08898d78a6d7c8ed2ed7d361088570153034c7d2c  ymgui-h743.elf
+# [补丁9初版基准，已被补丁9b取代] 4602cb3ec2a8b99714613cb5a4b8caebc3c143214c6cec45812a79a5b0ab76e8  ymgui-h743.bin
+# [补丁9初版基准，已被补丁9b取代] 1d22d2c58c08455d4d9271d08898d78a6d7c8ed2ed7d361088570153034c7d2c  ymgui-h743.elf
+
+# ===========================================================================
+# 【第三十版·补丁 9b（2026-10-13）】修补丁9遗留：I2C 误判 SDA 卡死 → 误触发 bus clear → 正反馈
+#
+# 【根因（比补丁9更深的第二层）】
+#   es8311_i2c_recover() 在 HAL 传输失败返回的**那一刻**立刻采样 GPIOB->IDR 判"SDA 是否被钳低"。
+#   但此刻 SDA 的上升沿（板上只有 MCU 内部 ~40 kΩ 弱上拉 × 总线电容，RC 约数 µs）**还没到位**，
+#   读到低电平 ⇒ 误判"总线卡死" ⇒ 误触发 bus_clear（切 GPIO + 9 脉冲 + PE 复位，打断正在进行的
+#   时序）⇒ 反而制造下一次失败。正反馈闭环 = "误判→bus clear→更多失败→更多误判"。
+#   板上实测（零探针窗口，全程不碰探针、播放中静置 20 s，排除 halt 伪影）：
+#     · 读失败率 ~29%，bus_clear 在 10 万次读里触发 187 次；
+#     · 失败全是 NACK（g_es_ng_tmo=0/busy=0），ng_ring 集中在 dac_readback 的读 REG12/REG0E；
+#     · **降 SCL 频率无改善**（100k→29.3% / 25k→27.9% / 10k→21.5%）⇒ 排除纯上升沿/频率问题，
+#       坐实"误判触发 bus clear"这条正反馈。
+#
+# 【修法】
+#   ① es8311_i2c_recover()：采样 IDR 前先等 ~20 µs（volatile 空循环）让 SDA 抬起，再判电平。
+#      实测读失败率 29% → **8.7%**。
+#   ② 加运行期开关 g_es_busclear_en（默认 1）。A/B 对照（同一次烧录切换）：
+#        =1（含稳定等待）读失败 8.7~9.2%；=0（禁用 bus clear）恶化到 60~100%（fail +13/+26）
+#      ⇒ 证明 bus clear 本身**必需**，问题只在"何时触发"。
+#   ③ I2C 写重试 3 → **5**（改回补丁7的值）：重试 3 次会把"全重试仍失败"概率放大约 13 倍
+#      ⇒ 音频偶发丢写（P6）。UI 卡死真因是单笔超时（已 50→5 ms），与重试数无关；且卡死态由
+#      bus_clear 在首次失败即救回并 return，**根本走不满重试**。
+#   ④ 新增 SCL 频率现场可调（g_es_i2c_hz + g_es_i2c_req + es8311_i2c_retiming），一次烧录扫多频。
+#   ⑤ 新增**动作级**计数 g_ao_pause_calls/g_ao_pause_volwr/g_ao_resume_calls + 锁存表追加 3 项
+#      （G_SNAP_PAUSECALL/PAUSEWR/RESUMECALL，表长 41→44）⇒ 修验收脚本 P1 的"窗口跨播放期"伪影，
+#      判据从 I2C 流量反推改为动作者自记，确定性。
+#
+# 【板上验收（2026-10-13，出货构建已烧录）】
+#   · tools/wav_pause_resume_check.py 4 ×3 连跑 ⇒ **12/12 全 PASS**；
+#     每轮 pause_calls=1 pause_wr=1（动作级，恒定），fail 增量恒 0，REG32 写=读=期望值。
+#     （修前：间歇 P1/P6 FAIL，pause 笔数报 2/3/5/16 —— 窗口伪影 + 真实丢写。）
+#   · tools/ui_freeze_repro.py 30 ⇒ **未复现卡死**（loop 持续增长，tick_ms=16 ms）。
+#   · 健康度：g_es_bus_clear=**9**（修前 189）、g_es_fail=**0**、g_es_breaker_trip=0、
+#     总线 IDR=0x7bc2（SCL/SDA 均释放）。
+#   · tools/verify_board_image.py build/ymgui-h743.bin --sampled 8192 ⇒ 5 段全一致。
+# FLASH 1 664 204 B（79.36%），比补丁9 +152 B。
+# ===========================================================================
+b280886d6494a41f1bc06677f67857a27e382d102521026e528211143cae8c0d  ymgui-h743.bin
+ddcd4d31efb5255c86c7a6d64ee2b3f04fe092119bf44d29dcc95f1da36b4869  ymgui-h743.elf

@@ -866,6 +866,16 @@ int main(void)
         }
         g_mark_poll = g_loop_count;
 
+        /* ★ I2C 现场重定时（排障钩子，SWD 写 g_es_i2c_req=1 触发一次）。
+         *   用途：一次烧录即可扫多个 SCL 频率，验证"降频能否消除 ~30% 首试 NACK"
+         *   的电气边际假设（见 src/es8311.c 的 es8311_i2c_timing）。
+         *   放在触摸之后、渲染之前：不与 UI 输入竞争总线。 */
+        if (g_es_i2c_req != 0u)
+        {
+            g_es_i2c_req = 0u;
+            (void)es8311_i2c_retiming();
+        }
+
         /* 恢复出厂设置（SWD 写 1 触发，跑完自动清 0）。
          * ⚠ 必须放在触摸之后、渲染之前：擦除 flash 要几百 ms，
          *   期间不重绘没关系，但要保证同一拍里不再往屏上推半帧内容。 */

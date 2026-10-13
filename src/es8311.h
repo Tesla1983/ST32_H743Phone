@@ -81,10 +81,19 @@ extern volatile uint32_t g_es_readback; /* 回读体检执行次数（起播后�
  * 板上实测根因：I2C 从机在事务被中途打断后把 SDA 钳低 ⇒ 总线卡死；旧代码对 NACK
  * 直接 return、从不做总线恢复，且单笔超时 50 ms × 5 重试 = 250 ms/笔，一次起播
  * ~19 笔 ⇒ 主循环单拍实测 3921 ms（= 用户看到的"UI 卡住无法滑动"）。
- * 修法：① bus clear（9 SCL 脉冲 + STOP，双线开漏、无对顶风险）；② 单笔超时 50→5 ms、
- * 重试 5→3；③ 连续硬失败熔断，冷却期内 I2C 立即快速失败，绝不长时间阻塞 UI。 */
+ * 修法：① bus clear（9 SCL 脉冲 + STOP，双线开漏、无对顶风险）；② 单笔超时 50→5 ms；
+ * ③ 连续硬失败熔断，冷却期内 I2C 立即快速失败，绝不长时间阻塞 UI。
+ * ⚠ 重试次数**保持 5**（一度降到 3，复测后改回）：零探针窗口实测本链路首试 NACK 约 30%
+ *   （模块仅靠 MCU 内部 ~40 kΩ 上拉跑 100 kHz 的电气边际），重试 3 次会把"全失败"概率
+ *   放大约 13 倍 ⇒ 音频偶发丢写。UI 卡死真因是单笔超时（已 50→5 ms），与重试数无关。 */
 extern volatile uint32_t g_es_bus_clear;   /* bus clear 真正执行过的次数（>0 = 发生过总线卡死）*/
 extern volatile uint32_t g_es_breaker_trip;/* I2C 熔断触发次数（连续硬失败过多 ⇒ 快速失败）*/
+/* ★ 2026-10-13：SCL 频率现场可调（验证"降频消除 ~30% 首试 NACK"的电气边际假设）
+ *   写 g_es_i2c_hz=<Hz>（10k~400k）→ 写 g_es_i2c_req=1 → 主循环调 es8311_i2c_retiming()。
+ *   一次烧录即可扫多个频率，无需反复 download（每次 ~200 s）。 */
+extern volatile uint32_t g_es_i2c_hz;      /* SCL 目标频率（默认 100000）*/
+extern volatile uint32_t g_es_i2c_req;     /* 写 1 ⇒ 主循环执行一次重定时 */
+extern volatile uint32_t g_es_i2c_timingr; /* 最近生效的 I2C1 TIMINGR（诊断）*/
 
 /**
  * @brief  初始化 I2C1（PB6/PB7，AF4，100 kHz）—— 只做总线，不碰 codec
@@ -98,6 +107,12 @@ int es8311_bus_init(void);
  * @return TIMINGR 寄存器值
  */
 uint32_t es8311_i2c_timing(uint32_t pclk);
+
+/**
+ * @brief  按当前 g_es_i2c_hz 重算 TIMINGR 并重初始化 I2C1（SWD 现场调频用，免重烧）
+ * @return 生效的 TIMINGR（0 = bus 未初始化，未动作）
+ */
+uint32_t es8311_i2c_retiming(void);
 
 /**
  * @brief  探测指定 7 位地址上是否有器件应答（20 ms 超时）
