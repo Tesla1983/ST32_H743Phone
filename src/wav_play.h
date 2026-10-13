@@ -36,16 +36,31 @@ void wav_play_stop(void);
 /** 主循环每拍调一次：驱动补数 + 播完自动收尾 */
 void wav_play_tick(void);
 
-/** 1 = 正在播（暂停还没做，暂等同于"在播"） */
+/** 1 = **正在出声**（暂停/停止都返回 0；判"有没有暂停会话"用 wav_play_paused）*/
 int  wav_play_busy(void);
+
+/**
+ * @brief  暂停：停出音，但**保留文件句柄与播放位置**（区别于 wav_play_stop）
+ * @return 0 = 成功；<0 = 没在出声，无物可暂停。
+ */
+int  wav_play_pause(void);
+
+/**
+ * @brief  续播：从暂停处（或暂停后 seek 到的新位置）继续
+ * @return 0 = 已续播；<0 = 当前不是暂停态 / 文件没开 / 音频起不来。
+ */
+int  wav_play_resume(void);
+
+/** 1 = 处于暂停态（文件仍打开、位置保留，可续播）*/
+int  wav_play_paused(void);
 
 uint32_t wav_play_elapsed_ms(void);
 uint32_t wav_play_total_ms(void);
 
 /**
  * @brief  跳播：把当前播放位置移到 ms 处（f_lseek + 同步 g_wav_pos）
- * @return 0 = 成功；<0 = 失败（没在播 / 头没解析 / lseek 失败）。
- *         ⚠ 只在文件已打开时有效；落点会按帧边界对齐，且不落在 data 末尾。
+ * @return 0 = 成功；<0 = 失败（文件没开 / 头没解析 / lseek 失败）。
+ *         ⚠ 文件已打开即可用（播放中、暂停中都能跳）；落点按帧边界对齐、不落在 data 末尾。
  */
 int      wav_play_seek_ms(uint32_t ms);
 
@@ -73,5 +88,8 @@ int         BoardMusic_LastRc(void);   /* 上一次动作的返回码（UI 直�
 uint32_t    BoardMusic_ElapsedMs(void);
 uint32_t    BoardMusic_TotalMs(void);
 int         BoardMusic_Seek(uint32_t ms);  /* 跳播到指定毫秒（拖动进度条用）*/
+int         BoardMusic_Pause(void);        /* 暂停（保留文件/位置，可续播）*/
+int         BoardMusic_Resume(void);       /* 从暂停处续播 */
+int         BoardMusic_Paused(void);       /* 1 = 有暂停会话待续播 */
 
 #endif /* WAV_PLAY_H */

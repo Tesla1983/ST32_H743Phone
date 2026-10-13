@@ -272,6 +272,43 @@ void wav_play_stop(void)
     g_wav_pos   = 0u;
 }
 
+/* 暂停：停出音，但**保留文件句柄与 g_wav_pos**（与 stop 的区别就在这儿）。
+ * 续播时 feeder 仍从当前文件位置接着读 ⇒ 位置不丢、可从暂停处继续。 */
+int wav_play_pause(void)
+{
+    if (g_wav_state != 1u)
+    {
+        return -1;                     /* 没在出声，没什么可暂停 */
+    }
+    audio_out_stop();                  /* 只停音频输出；s_f 保持打开，g_wav_pos 不动 */
+    g_wav_state = 2u;                  /* 2 = 暂停 */
+    return 0;
+}
+
+/* 续播：从暂停处（或暂停后拖动到的新位置）重新起播。
+ * audio_out_start 会重新铺环缓冲 —— 而 feeder 读的是 s_f 的当前偏移，正是我们要的位置。 */
+int wav_play_resume(void)
+{
+    if (g_wav_state != 2u || s_opened == 0u)
+    {
+        return -1;
+    }
+    audio_out_set_volume((uint8_t)g_audio_volume);
+    audio_out_set_feeder(feeder_cb);   /* 保险：确认喂的仍是本文件 */
+    if (audio_out_start() != 0)
+    {
+        g_wav_state = 2u;              /* 起不来就维持暂停态，别谎报在播 */
+        return -1;
+    }
+    g_wav_state = 1u;
+    return 0;
+}
+
+int wav_play_paused(void)
+{
+    return (g_wav_state == 2u) ? 1 : 0;
+}
+
 int wav_play_seek_ms(uint32_t ms)
 {
     uint32_t bps;
@@ -347,7 +384,7 @@ void wav_play_tick(void)
 
 int wav_play_busy(void)
 {
-    return (g_wav_state != 0u) ? 1 : 0;
+    return (g_wav_state == 1u) ? 1 : 0;   /* 仅"正在出声"算在播；暂停(2)/停止(0) = 0 */
 }
 
 uint32_t wav_play_elapsed_ms(void)
@@ -442,4 +479,19 @@ uint32_t BoardMusic_TotalMs(void)
 int BoardMusic_Seek(uint32_t ms)
 {
     return wav_play_seek_ms(ms);
+}
+
+int BoardMusic_Pause(void)
+{
+    return wav_play_pause();
+}
+
+int BoardMusic_Resume(void)
+{
+    return wav_play_resume();
+}
+
+int BoardMusic_Paused(void)
+{
+    return wav_play_paused();
 }

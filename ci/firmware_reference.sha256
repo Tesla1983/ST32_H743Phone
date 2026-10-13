@@ -1193,5 +1193,37 @@
 #   · 实拖待测：烧录后播放中拖动进度条应即时跳播、时间标签跟随、松手后从新位置继续。
 #   ⚠ 未做在板自动化：拖动是触摸交互，SWD 无法模拟滑块按下/拖动事件，最终靠人手目测。
 # FLASH 1 656 780 B（79.00%），比第三十版 +464 B。
-bd9d88b4d2c2d55e2fb149ab71c3deef4cf3357e20de73b1854c39bf13bd8666  ymgui-h743.bin
-e0b5cb9c170b3d062728d833ff972f19f96e960875301e070885bfebb451f464  ymgui-h743.elf
+# 旧哈希（第三十版·补丁1，已停用）：
+# bd9d88b4d2c2d55e2fb149ab71c3deef4cf3357e20de73b1854c39bf13bd8666  ymgui-h743.bin
+# e0b5cb9c170b3d062728d833ff972f19f96e960875301e070885bfebb451f464  ymgui-h743.elf
+
+# ============================================================================
+# 第三十版·补丁2（2026-10-13）· 音乐播放器「暂停→拖动→续播」
+# ============================================================================
+# 为什么变（按「更新时机」的 a：有意为之的功能改动；工具链 14.3.rel1 未变）：
+#   补丁1 只修了"播放中拖动跳播"；暂停态（未起播）拖动只改滑块视觉、起播仍从 0 重头。
+#   根因是旧版把"暂停"实现成 BoardMusic_Stop()（= 关文件 + g_wav_pos 归零），
+#   位置根本存不住。本次引入**真正的暂停/续播**：
+#     1. src/wav_play.c：
+#        · wav_play_pause()：只 audio_out_stop()（停出音），**保留文件句柄 s_f 与 g_wav_pos**，
+#          g_wav_state=2（暂停）。
+#        · wav_play_resume()：audio_out_set_feeder + audio_out_start() ——
+#          start 会重新铺环缓冲，而 feeder 读的是 s_f 的**当前偏移**，正是暂停/拖动后的位置。
+#        · wav_play_paused() 查暂停态；wav_play_busy() 语义收窄为「仅 g_wav_state==1（在出声）」，
+#          暂停/停止都返回 0（否则 UI 的"已暂停/在播"文案与自动收尾会误判）。
+#        新增 board 层 BoardMusic_Pause/Resume/Paused。
+#     2. apps/music.c：
+#        · on_music 三态：在播 → Pause；不在播但有暂停会话 → Resume；否则 → Play(从头)。
+#        · on_prev/on_next 换歌先 BoardMusic_Stop() 丢弃旧暂停会话（保证"暂停会话==当前 index"）。
+#        · on_seek 加守卫：无已加载曲目（既不在播也无暂停会话）不处理，避开 stop 后残留的旧 total。
+#        · AppState.time_text 24→32 B（消除新增的 -Wformat-truncation，保持零新增告警）。
+#   已知权衡：暂停/续播走 audio_out_stop→start（含 codec 重新初始化），可能有轻微 click；
+#     若听感明显，后续可改成"只停 TIM6 的软暂停"（更省事但需改 audio_out 内部）。
+# 验收（需在板目测，属触摸交互）：
+#   · 编译通过（16/16，FLASH 1 656 996 B / 79.01%，比补丁1 +216 B，零新增告警）；
+#   · 逻辑自检：暂停保留 s_f/g_wav_pos；resume 后 feeder 从当前偏移续读（代码静态可证）；
+#   · 实拖待测：播放→暂停→拖动到某处→播放，应从新位置续播而非从头。
+#   ⚠ 未做在板自动化：暂停/续播/拖动都是触摸交互，SWD 无法模拟，最终靠人手目测。
+# FLASH 1 656 996 B（79.01%），比补丁1 +216 B。
+71ba7a31fe6e342b27c1a7ed0fb2d30ed00eb079b6fdcf9459f2eefc73cb57c9  ymgui-h743.bin
+9b217aa0de0294413d9e7eeff36a458b5dbbf5e7e303b55b66d93338795cf3d9  ymgui-h743.elf

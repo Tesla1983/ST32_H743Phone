@@ -26,7 +26,7 @@ typedef struct
 	int   count;           /* 上次扫描到的条目数 */
 	char  title[40];
 	char  status[48];
-	char  time_text[24];
+	char  time_text[32];   /* "m:ss / m:ss"；32 够装（-Wformat-truncation 不再报）*/
 	uint32_t acc;          /* 进度刷新节流累加器（毫秒）*/
 } AppState;
 static AppState state;
@@ -162,8 +162,22 @@ static void on_music(GYOBJ btn)
 
 	if (state.music_playing)
 	{
-		BoardMusic_Stop();
+		/* 暂停：停出音但保留文件句柄与位置 ⇒ 之后可续播。
+		 * （旧版这里是 BoardMusic_Stop()，会关文件、位置归零 ⇒ 拖动后无法续播，正是本次要修的。）*/
+		(void)BoardMusic_Pause();
 		state.music_playing = 0;
+	}
+	else if (BoardMusic_Paused())
+	{
+		/* 续播：从暂停处 / 暂停后拖动到的位置继续。
+		 * ⚠ 前提"暂停会话 == 当前 index"：切歌时 on_prev/on_next 会 Stop 掉旧会话，故不变式成立。 */
+		if (BoardMusic_Resume() != 0)
+		{
+			snprintf(state.status, sizeof(state.status), "续播失败 rc=%d", BoardMusic_LastRc());
+			PhoneUI_text_set(state.music_status, state.status);
+			return;
+		}
+		state.music_playing = 1;
 	}
 	else
 	{
@@ -192,9 +206,11 @@ static void on_prev(GYOBJ btn)
 	if (state.count <= 0)
 		return;
 	state.index = (state.index - 1 + state.count) % state.count;
+	/* 换歌一律先停掉当前（无论是否在播）—— 否则旧的暂停会话会留到新曲目上，
+	 * 续播时对不上 index。在播则接着放新曲目，不在播则就此丢弃旧会话。 */
+	BoardMusic_Stop();
 	if (state.music_playing)
 	{
-		BoardMusic_Stop();
 		(void)BoardMusic_Play(state.index);
 	}
 	refresh_track();
@@ -206,9 +222,9 @@ static void on_next(GYOBJ btn)
 	if (state.count <= 0)
 		return;
 	state.index = (state.index + 1) % state.count;
+	BoardMusic_Stop();   /* 换歌先停当前，丢弃旧暂停会话（同 on_prev） */
 	if (state.music_playing)
 	{
-		BoardMusic_Stop();
 		(void)BoardMusic_Play(state.index);
 	}
 	refresh_track();
@@ -224,6 +240,12 @@ static void on_seek(GYOBJ sld, int32 v)
 	char   a[12], b[12];
 
 	(void)sld;
+	/* 没有已加载的曲目（既不在播、也没有暂停会话）时拖动无意义；
+	 * 顺带避开 stop 后残留的旧 total（wav_play_stop 不清 rate/total）。 */
+	if (!state.music_playing && !BoardMusic_Paused())
+	{
+		return;
+	}
 	if (total == 0u)
 	{
 		return;
