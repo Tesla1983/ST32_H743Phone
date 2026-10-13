@@ -123,10 +123,10 @@ def main():
     else:
         print("[PASS] D7 无 DMA 错误")
 
-    # 收尾：恢复默认（TIM6 路径）。demo 自己 3 s 播完会停，不需要额外触发。
+    # 收尾：恢复默认（自 2026-10-13 起默认就是走 DMA）。demo 自己 3 s 播完会停，不需要额外触发。
     time.sleep(0.2)
-    print("恢复 g_ao_use_dma=0（默认走 TIM6）")
-    bench.wr("g_ao_use_dma", [0])
+    print("恢复 g_ao_use_dma=1（当前默认就是走 DMA）")
+    bench.wr("g_ao_use_dma", [1])
 
     print("\n[PASS] I2S TX DMA 验收通过（听感由耳朵判定）" if ok
           else "\n[FAIL] I2S TX DMA 验收未通过（见上）")

@@ -120,10 +120,25 @@ int es8311_init(void);
 int es8311_config_i2s(void);
 
 /**
- * @brief  启动 DAC 通路（esp-adf es8311_start(ES_MODULE_DAC)），音量 0xBF≈75%
+ * @brief  启动 DAC 通路（esp-adf es8311_start(ES_MODULE_DAC)），音量取当前 UI 音量
  * @return 0=OK；<0=失败
  */
 int es8311_start_dac(void);
+
+/**
+ * @brief  启动 DAC 通路，但**音量写 0（静音）**
+ *
+ * 【为什么要这个版本：起播那一声"咔哒"】
+ *   DAC 通路上电是"从 power-down 醒来"的动作，输出会从直流 0 跳到工作点；若同一刻
+ *   就把 REG32 一步写到目标音量，跳变幅度 = 目标电平 ⇒ 必然是一声可闻的响。
+ *   正确做法（也是 esp-adf/各家 codec 驱动的通例）：**先在静音档把通路接通**，
+ *   等 I2S 时钟建立、数据流稳定之后，再把音量逐步 ramp 上去。
+ *   调用顺序：I2S 先跑起来（FIFO 有数据）→ es8311_dac_start_muted() →
+ *   分若干拍把 REG32 从 0 升到 es8311_volume_reg(g_audio_volume)。
+ *   （见 src/audio_out.c 的 s_dac_pending / s_vol_ramp_left。）
+ * @return 0=OK；<0=失败
+ */
+int es8311_dac_start_muted(void);
 
 /**
  * @brief  挂起/静音（esp-adf es8311_suspend）

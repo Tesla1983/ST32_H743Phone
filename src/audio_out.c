@@ -1,7 +1,13 @@
 /* ===========================================================================
  * 音频输出层实现 —— 设计说明见 audio_out.h
  *
- * 【出音用哪条路：TIM6 周期中断喂 FIFO（不是 DMA）】
+ * 【出音用哪条路：默认 I2S TX DMA（2026-10-13 起）；TIM6 滴灌为回退路径】
+ *   ★ 现状：出货构建默认走 **SPI2(I2S2) TX 的 DMA1_Stream4 + DMAMUX（请求 40）**，
+ *     8 KB 乒乓缓冲，CPU 只在半/全传中断里补数（约 95 次/秒，而不是 5 万次/秒）。
+ *     运行期开关 `g_ao_use_dma`（默认 1）；写 0 回退到下面的 TIM6 滴灌。
+ *   ★ 两条路径的**起播时序都已做"防咔哒"处理**（见下方「起播防咔哒时序」）。
+ *
+ * 【为什么当初先做的是 TIM6 路（历史，保留因为踩坑结论仍有价值）】
  *   第一版走的是 DMA1_Stream2 循环双缓冲，板上实测**送不出数据**：
  *     SPI_CR1=0x201（SPE+CSTART 都在）、I2SCFGR 分频正确、内核时钟 200 MHz 正常、
  *     DMA 的 CR/CIRC/MINC/PSIZE 都对，但 SR 恒为 0、NDTR 一秒只动几十项
@@ -52,7 +58,9 @@ volatile uint32_t g_ao_isr_dry  = 0;     /* ISR 进来却发现环形缓冲没�
  *   而 g_ao_rc 只在失败路径上写 ⇒ 靠它无法区分"卡在第几步"。 */
 volatile uint32_t g_ao_stage    = 0;
 
-/* ---- 2026-10-13：I2S TX 走 DMA 的实验开关与诊断（默认 0 = 走 TIM6 滴灌，零回归）----
+/* ---- 2026-10-13：I2S TX 走 DMA 的开关与诊断（**默认 1 = 走 DMA**）----
+ * 2026-10-13 用户复听确认 DMA 路径干净（无断音/咔哒）⇒ 默认已从 TIM6 切到 DMA。
+ * 写 0 可回退到 TIM6 滴灌（对照/排障用；两条路径的代码都保持可用）。
  * 第一版 DMA（DMA1_Stream2 循环双缓冲）当年结论是"SPI_SR 恒为 0、NDTR 不涨"。
  * 但那个结论有个**方法论隐患**：当时是主机侧 probe-rs 直接读外设寄存器 —— 而本工程
  * 自己的记录写着"probe-rs 读 0x4000_xxxx 不可信，只能读 RAM"。所以这次：
@@ -60,7 +68,7 @@ volatile uint32_t g_ao_stage    = 0;
  *   ② 显式补上最可能漏的一步 —— **SPI_CFG1.TXDMAEN**（H7 上不置这一位，SPI 根本
  *      不产生 TX DMA 请求，NDTR 自然一动不动；HAL 在 HAL_I2S_Transmit_DMA 里是
  *      单独 SET_BIT 的，见 stm32h7xx_hal_i2s.c:1467-1471）。 */
-volatile uint32_t g_ao_use_dma   = 0;    /* 1 = 起播走 I2S TX DMA；0 = TIM6 滴灌（默认）*/
+volatile uint32_t g_ao_use_dma   = 1;    /* 1 = 起播走 I2S TX DMA（默认）；0 = 回退 TIM6 滴灌 */
 volatile uint32_t g_ao_dma_rc    = 99;   /* DMA 起播返回码（0=OK）*/
 volatile uint32_t g_ao_dma_half  = 0;    /* 半传中断次数 */
 volatile uint32_t g_ao_dma_cplt  = 0;    /* 全传中断次数 */
@@ -70,6 +78,25 @@ volatile uint32_t g_ao_ring_drop = 0;    /* 环形缓冲满而被丢弃的半字
 volatile uint32_t g_ao_dma_gap_max = 0;  /* 相邻两次"半传输中断"之间的**最大间隔(µs)**：
                                           * 正常 ≈ 21 000 µs（1024 帧）；若明显更大 ⇒ DMA 流
                                           * 被总线/DMA 端口仲裁挡住过（2026-10-13 排障用）。*/
+
+/* ---- 起播"防咔哒"时序（2026-10-13；诊断量声明见 audio_out.h）----
+ * 【那一声"咔哒"从哪来】起播序列原来把 DAC 通路（es8311_start_dac）放在 I2S **之前**
+ *   调用，且 REG32 一步写到目标音量 ⇒ 两个跳变叠在一起：
+ *     ① DAC 从 power-down 醒来时，MCLK/BCLK 还没建立 ⇒ 时钟一到就产生一次直流跳变；
+ *     ② 音量从"静音"瞬间跳到目标值 ⇒ 幅度再跳一次。
+ * 【修法】把动作拆成三步、按物理顺序排：
+ *     1) 先起 I2S（时钟跑起来、FIFO 有数据）—— 起播函数只做这一步；
+ *     2) 下一拍 tick 再 `es8311_dac_start_muted()`：通路接通，音量仍是 0（静音）；
+ *     3) 随后 8 拍把 REG32 从 0 分步升到 UI 音量（≈ 8 × 16 ms ≈ 130 ms）。
+ *   ⚠ 为什么 DAC 唤醒要交给 tick 而不是在 audio_out_start() 里直接做：TIM6 路径
+ *     在 CSTART 之后 FIFO 还是空的，要等 tick 里起心跳、ISR 喂上第一口才有数据。
+ *     统一"起播第二拍再开 DAC"，两条路径（TIM6 / DMA）都不必各写一套。 */
+volatile uint32_t g_ao_dac_ready = 0u;   /* 1 = DAC 通路已唤醒（起播初期为 0）*/
+volatile uint32_t g_ao_dac_ramp  = 0u;   /* 音量 ramp 剩余步数（0 = 已到目标音量）*/
+
+/* 起播音量 ramp 的步数：8 步 × 主循环一拍（≈16 ms）≈ 130 ms 完成。
+ * 步数太少压不住跳变、太多会让人听出"声音起得慢"，8 是折中。 */
+#define AO_VOL_RAMP_STEPS 8u
 
 /* ---- 环形缓冲 → SRAM1 的 .bss_audio（MPU region0：非缓存）----
  * 8192 个半字 = 16 KB = 4096 帧 ≈ 84 ms 的音频；一次补半个环（2048 帧 ≈ 42 ms）。 */
@@ -91,6 +118,8 @@ static int16_t  AUDIO_BUF_ATTR s_tmp[RING_HALF_FRAMES * 2u];
 static volatile uint32_t s_wr;          /* 写计数（半字，单调），主循环推进 */
 static volatile uint32_t s_rd;          /* 读计数（半字，单调），ISR 推进 */
 static volatile uint8_t  s_tim_pending = 0u;   /* 起播延后到下一拍再起 TIM6（见下）*/
+static volatile uint8_t  s_dac_pending = 0u;   /* 起播后延到下一拍再唤醒 DAC（防咔哒，见上）*/
+static volatile uint8_t  s_vol_ramp_left = 0u; /* 音量 ramp 剩余步数（0 = 不动）*/
 
 static I2S_HandleTypeDef s_hi2s;        /* I2S2 = SPI2 的 I2S 模式 */
 static audio_out_feeder  s_feeder = NULL;
@@ -473,6 +502,19 @@ static int i2s_dma_start(void)
     HAL_NVIC_EnableIRQ(DMA1_Stream4_IRQn);
 
     __HAL_I2S_ENABLE(&s_hi2s);
+
+    /* ★ 第三个细节：**先让 DMA 把 TX FIFO 灌满，再置 CSTART**。
+     *   CSTART 之后 SCK 立刻开始跑；若那一刻 FIFO 还是空的，第一个时钟就取不到数据
+     *   ⇒ 置 UDR ⇒ 起播第一声"啪"。SPE 一置位 TXP 即为 1、DMA 请求随即产生，
+     *   灌满 16 深的 FIFO 只要几 µs。这里带计数上限，异常时不至于死等。 */
+    for (uint32_t t = 0u; t < 100000u; ++t)
+    {
+        if ((READ_BIT(SPI2->SR, SPI_SR_TXP) & SPI_SR_TXP) == 0UL)
+        {
+            break;                       /* TXP=0 ⇒ FIFO 已满 */
+        }
+    }
+
     SET_BIT(SPI2->CR1, SPI_CR1_CSTART);
 
     s_dma_ready = 1u;
@@ -692,7 +734,9 @@ int audio_out_start(void)
 
     rc  = es8311_init();
     rc |= es8311_config_i2s();
-    rc |= es8311_start_dac();           /* 内部会按当前 UI 音量写 REG32 */
+    /* ⚠⚠ 这里**不再**调 es8311_start_dac()：DAC 通路必须等 I2S 时钟与数据流就绪
+     *   之后再唤醒（否则就是那一声"咔哒"）。唤醒 + 音量 ramp 交给下一拍 tick
+     *   （s_dac_pending 分支）—— 见文件上方「起播防咔哒时序」的说明。 */
     if (rc != 0)
     {
         g_ao_rc = -3;
@@ -750,6 +794,13 @@ int audio_out_start(void)
     g_ao_rc      = 0;
     g_ao_stage   = 5u;
 
+    /* DAC 唤醒延到下一拍（此刻 I2S 刚起、FIFO 刚由 DMA 灌上，但 TIM6 路径还没喂过）。
+     * 清零"防咔哒"三个状态量，保证每次起播都从"未唤醒 + 音量 0"重新走一遍。 */
+    s_dac_pending   = 1u;
+    s_vol_ramp_left = 0u;
+    g_ao_dac_ready  = 0u;
+    g_ao_dac_ramp   = 0u;
+
     /* ⚠ 诊断量按"本次播放"清零：这些量在 ISR/主循环里只增不减，若不在这里清，
      *   多次播放会累加（上一次 3 s 的 146 k 帧会带进下一次），验收脚本算不出
      *   单次播放的精确量。仅 resetting 播放相关的计数，不动 g_ao_stage/g_ao_codec 等状态位。 */
@@ -785,6 +836,10 @@ void audio_out_stop(void)
     s_wr = 0u;
     s_rd = 0u;
     s_tim_pending = 0u;
+    s_dac_pending = 0u;                 /* 起播防咔哒状态一并归零 */
+    s_vol_ramp_left = 0u;
+    g_ao_dac_ready  = 0u;
+    g_ao_dac_ramp   = 0u;
 }
 
 int audio_out_playing(void)
@@ -824,6 +879,42 @@ void audio_out_tick(void)
     if ((READ_BIT(s_hi2s.Instance->SR, SPI_SR_TXP) & SPI_SR_TXP) != 0UL)
     {
         g_ao_txp_seen++;
+    }
+
+    /* ---- 起播防咔哒：第二拍才唤醒 DAC，随后把音量分步 ramp 上去 ----
+     * 判据"数据流稳了没有"分两条路：
+     *   DMA 路径：i2s_dma_start 已经把两个半缓冲都铺满 ⇒ 起播即就绪；
+     *   TIM6  路径：CSTART 时 FIFO 是空的，得等 ISR 喂过（g_ao_isr > 0）。
+     * ⚠ 必须在 I2S 真的在流的时候才唤醒 DAC —— 这就是"先时钟、后通路"的全部意义。 */
+    if (s_dac_pending != 0u)
+    {
+        int ready = (g_ao_use_dma != 0u) ? (s_dma_ready != 0u) : (g_ao_isr > 0u);
+
+        if (ready != 0)
+        {
+            s_dac_pending = 0u;
+            (void)es8311_dac_start_muted();     /* 通路接通、音量 0（静音起播）*/
+            s_vol_ramp_left = (uint8_t)AO_VOL_RAMP_STEPS;
+            g_ao_dac_ready  = 1u;
+            g_ao_stage      = 7u;
+        }
+    }
+
+    /* 音量 ramp：8 步从 0 升到 UI 音量（每拍一步 ≈ 16 ms）。
+     * 目标每步重读 g_audio_volume：ramp 途中用户拖了滑杆也能跟上，不把音量锁在旧值。 */
+    if (s_vol_ramp_left > 0u)
+    {
+        uint32_t step   = (uint32_t)(AO_VOL_RAMP_STEPS - s_vol_ramp_left) + 1u;
+        uint32_t target = g_audio_volume;
+
+        if (target > 100u)
+        {
+            target = 100u;
+        }
+        (void)es8311_set_volume_ui((s_vol_ramp_left == 1u) ? target
+                                                          : (target * step) / AO_VOL_RAMP_STEPS);
+        s_vol_ramp_left--;
+        g_ao_dac_ramp = s_vol_ramp_left;
     }
 
     dbg_snapshot();

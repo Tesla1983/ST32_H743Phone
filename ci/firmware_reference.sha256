@@ -1375,5 +1375,25 @@
 #   → VERY_HIGH。用于验证"UDR ≈ 1 次/s 的根因是 LCD band 的 MEM2MEM 抢占 DMA1 端口"。
 # 补丁5d 首版的教训（已回退并记录）：把 FTHLV 抬到 15 个数据时 DMA **完全不搬**。
 # FLASH 1 660 996 B（79.20%）。
-bf6e2da04dec8583f5ebefd28d518c81ff5d983b922562dc83e502ca44723ff0  ymgui-h743.bin
-5b3fd5255cb7a818434144c75cf7cd44ee03c754d1804bfaec0313eba3774810  ymgui-h743.elf
+# 上一版（补丁5d'：FTHLV 退回 8 + 优先级 VERY_HIGH，出音仍默认走 TIM6）：
+# bf6e2da04dec8583f5ebefd28d518c81ff5d983b922562dc83e502ca44723ff0  ymgui-h743.bin
+# 5b3fd5255cb7a818434144c75cf7cd44ee03c754d1804bfaec0313eba3774810  ymgui-h743.elf
+
+# ----------------------------------------------------------------------------
+# 第三十版·补丁6（2026-10-13）· 起播防咔哒 + 出音默认由 TIM6 切到 I2S TX DMA
+# ----------------------------------------------------------------------------
+# ① 「起播防咔哒」：原来 audio_out_start() 先 es8311_start_dac()（唤醒 DAC 通路）再起 I2S，
+#    且 REG32 音量一步写到位 ⇒ 起播一声"咔哒"（两个跳变叠加：DAC 在 MCLK/BCLK 未建立时
+#    上电 + 音量从静音瞬跳到目标）。改成三步、按物理顺序排：
+#      I2S 先跑 → **下一拍 tick** 才 es8311_dac_start_muted()（通路接通、REG32=0 静音）
+#      → 随后 8 拍把 REG32 ramp 到 UI 音量（AO_VOL_RAMP_STEPS=8，≈130 ms）。
+#    DMA 路径另外在 CR1.CSTART **之前**轮询 SR.TXP 等 DMA 灌满 FIFO（首时钟无数据会 UDR）。
+#    新增诊断 g_ao_dac_ready / g_ao_dac_ramp；g_ao_stage==7 = DAC 已唤醒。
+#    验收 = tools/audio_start_ramp_check.py（R1~R7；R7 用 g_es_wr_ok 增量证明 ramp
+#    真发了 8 次 I2C 写：无 ramp 参考 41 次、有 ramp 参考 49 次；实测 DMA 48 / TIM6 50）。
+# ② 出音路径默认由 TIM6 滴灌切换为 **I2S TX DMA**（g_ao_use_dma 默认 = 1）：用户人工复听
+#    确认 DMA 路径无断音/咔哒（补丁5d 把 udr 从 ≈1 次/s 降到 0 之后）。写 0 仍可回退 TIM6。
+#    验收脚本按当前开关自动选判据（audio_out_check 的 A2 已按 g_ao_use_dma 分流）。
+# FLASH 1 661 204 B（79.21%），比补丁5d' +208 B。
+0ac9f5cfb636458a7e860811df9bf63b041fad5f9104114dd19b8fc59b87b545  ymgui-h743.bin
+5aed3cbd139fad3470c3a0e112f3a3ac1562e6db07fd500037dde77afd656b56  ymgui-h743.elf

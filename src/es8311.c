@@ -289,7 +289,12 @@ int es8311_config_i2s(void)
     return rc;
 }
 
-int es8311_start_dac(void)
+/* DAC 通路寄存器序列（音量值参数化）—— es8311_start_dac() 与
+ * es8311_dac_start_muted() 共用**同一套顺序**，只有 REG32（DAC 音量）的取值不同。
+ * ⚠ 顺序照抄 esp-adf：先开 DAC 通路/电源，最后两级写 REG32。别为了"先静音"
+ *   把 REG32 挪到最前面 —— 通路上电期间的分频/OSR 还没配好，写入可能被后续
+ *   的 REG12 power-up 覆盖掉（同一段代码两条路都走，顺序只能有一份）。 */
+static int dac_path_regs(uint8_t vol_reg)
 {
     uint8_t v;
     int rc = 0;
@@ -306,9 +311,7 @@ int es8311_start_dac(void)
         rc |= es8311_write_reg(0x0A, v);
     }
 
-    /* 音量取**当前 UI 音量**（控制中心滑杆的值，出厂 70 ⇒ 0x85 ≈ -28 dB），
-     * 不再写死 0xBF：否则用户在抽屉里把音量拖小、下次起播又被拉回 0 dB。 */
-    rc |= es8311_write_reg(0x32, es8311_volume_reg(g_audio_volume));
+    rc |= es8311_write_reg(0x32, vol_reg);
     rc |= es8311_write_reg(0x17, 0xBF);   /* ADC 侧（本测试不用）*/
     rc |= es8311_write_reg(0x0E, 0x02);
     rc |= es8311_write_reg(0x12, 0x00);   /* SYSTEM_REG12：power up */
@@ -325,6 +328,22 @@ int es8311_start_dac(void)
 
     g_es_rc = rc;
     return rc;
+}
+
+int es8311_start_dac(void)
+{
+    /* 音量取**当前 UI 音量**（控制中心滑杆的值，出厂 70 ⇒ 0x85 ≈ -28 dB），
+     * 不再写死 0xBF：否则用户在抽屉里把音量拖小、下次起播又被拉回 0 dB。
+     * ⚠ 这是"一步到位"的起播（自检固件 audio_test 用它）——音量跳变会带一声轻响。
+     *   出货的音乐播放走 es8311_dac_start_muted() + 音量 ramp（见 audio_out.c）。 */
+    return dac_path_regs(es8311_volume_reg(g_audio_volume));
+}
+
+int es8311_dac_start_muted(void)
+{
+    /* REG32 写 0（-95.5 dB，等同静音）：把"DAC 从 power-down 醒来"这步跳变压到听不见，
+     * 通路接通后再由调用方把音量 ramp 到目标值（见 es8311.h 的说明）。 */
+    return dac_path_regs(0x00u);
 }
 
 int es8311_stop_dac(void)

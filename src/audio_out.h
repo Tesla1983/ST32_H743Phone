@@ -5,7 +5,8 @@
  *   src/audio_test.c 是"自检"：SWD 触发、跑完 fid 走人， pin 用完就还回去。
  *   音乐播放是"常态功能"：用户随时点开就要出声，且**必须在默认 CMake option 下编进来**
  *   （出货固件）。两者需求不同，所以拆：
- *     audio_out.c  = 出货常驻（I2C1 + ES8311 + I2S2 + TIM6 中断滴灌出音 + 音量）
+ *     audio_out.c  = 出货常驻（I2C1 + ES8311 + I2S2 出音 + 音量；出音默认走 I2S TX DMA，
+ *                   写 `g_ao_use_dma=0` 可回退到 TIM6 中断滴灌）
  *     wav_play.c   = 上层播放源（TF 卡 WAV → 喂给 audio_out）
  *
  * 【接线（方案 A，已出声，权威表见 docs/DEVELOPMENT_LOG.md 2026-10-12 节）】
@@ -17,9 +18,11 @@
  *    DMA1/2 也访问得到 D2 域 ⇒ 一致性由 MPU 保证，不必每笔 Clean/Invalidate。
  *   ⚠ SDMMC 的 IDMA 是例外（只认 AXI），但它不参与本模块（卡走 FatFs 轮询读）。
  *
- * 【出音的两条 H7 铁律（2026-10-12 实测，见 MEMORY.md）】
+ * 【出音的三条 H7 铁律（见 MEMORY.md）】
  *   ① 置 SPE 不会开始传输，**必须再置 CR1.CSTART**；
- *   ② 欠载 UDR=1 会把 TXP 压在 0 且引擎停吃 FIFO，**必须写 IFCR.UDRC** 才恢复。
+ *   ② 欠载 UDR=1 会把 TXP 压在 0 且引擎停吃 FIFO，**必须写 IFCR.UDRC** 才恢复；
+ *   ③ **起播防咔哒**：DAC 通路必须等 I2S 时钟与数据流就绪后再唤醒，且音量不能一步
+ *      到位 —— 详见 audio_out.c 的「起播防咔哒时序」（先跑 I2S → 静音接通路 → 8 拍 ramp）。
  * =========================================================================== */
 #ifndef AUDIO_OUT_H
 #define AUDIO_OUT_H
@@ -91,15 +94,16 @@ extern volatile uint32_t g_ao_txp_seen;  /* tick 里看到 TXP=1 的次数（时
 extern volatile uint32_t g_ao_stage;     /* 起播阶段进度（1..6，见 .c；不是错误码）*/
 extern volatile uint32_t g_ao_dbg[16];   /* 寄存器现场快照（索引表见 .c），probe 读不了外设 */
 
-/* ---- I2S TX DMA 实验开关与诊断（2026-10-13；默认全关 = 走 TIM6 滴灌，零回归）----
- * 置 g_ao_use_dma = 1 再起播，就会改走"SPI 自己发 DMA 请求、DMA 搬 TXDR"那条路。
+/* ---- I2S TX DMA 开关与诊断（2026-10-13；**默认 1 = 走 DMA**）----
+ * `g_ao_use_dma` 默认已置 1（用户复听确认 DMA 路径干净）；写 0 回退到 TIM6 滴灌。
+ * 置 1 后起播就走"SPI 自己发 DMA 请求、DMA 搬 TXDR"那条路。
  * 判据（tools/i2s_dma_check.py）：
  *   · g_ao_dma_rc == 0 且 g_ao_dma_half / g_ao_dma_cplt 在涨；
  *   · g_ao_frames 在涨（声音在流）而 g_ao_isr **不涨**（TIM6 已不参与）；
  *   · g_ao_dma_err == 0；
  *   · g_ao_dbg2[0] 的 bit15（SPI_CFG1.TXDMAEN）= 1，g_ao_dbg2[8] 低 7 位 = 40（SPI2_TX）；
  *   · g_ao_dbg2[5]（DMA_SxNDTR）应在 0..4096 间**变化**（DMA 真在搬）。 */
-extern volatile uint32_t g_ao_use_dma;   /* 1 = 起播走 I2S TX DMA；0 = TIM6 滴灌（默认）*/
+extern volatile uint32_t g_ao_use_dma;   /* 1 = 走 I2S TX DMA（默认）；0 = 回退 TIM6 滴灌 */
 extern volatile uint32_t g_ao_dma_rc;    /* DMA 起播返回码：0=OK 1=HAL_DMA_Init 失败 2=Start_IT 失败 */
 extern volatile uint32_t g_ao_dma_half;  /* 半传中断次数 */
 extern volatile uint32_t g_ao_dma_cplt;  /* 全传中断次数 */
@@ -109,6 +113,14 @@ extern volatile uint32_t g_ao_ring_drop; /* 环形缓冲满被丢弃的半字数
 extern volatile uint32_t g_ao_dma_gap_max;/* 相邻两次 DMA 半传输中断的**最大间隔(µs)**：
                                            * 正常 ≈ 21 000（1024 帧）；明显更大 ⇒ DMA 补数
                                            * 被 DMA 端口仲裁/总线挡住过（咔哒根因线索）。*/
+
+/* ---- 起播"防咔哒"时序（2026-10-13）----
+ * 起播那一声响来自"DAC 通路在 I2S 时钟还没建立时就上电，且音量一步到位"。
+ * 现在改成三步：I2S 先跑 → 静音接通 DAC → 音量分步 ramp。诊断量：
+ *   g_ao_dac_ready  0 = 还没唤醒 DAC（起播初期）/ 1 = 已唤醒
+ *   g_ao_dac_ramp   音量 ramp 剩余步数（0 = 已到 UI 音量；ramp 期间 8→1）*/
+extern volatile uint32_t g_ao_dac_ready;
+extern volatile uint32_t g_ao_dac_ramp;
 
 /* ⚠ 2026-10-13 环形缓冲的一次语义修正（影响两条出音路径）：
  *   s_wr/s_rd 改为**单调计数器**（只在取索引时 & RING_MASK）。旧的

@@ -1,18 +1,21 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""常驻音频输出链路（codec + I2S2 + TIM6 中断滴灌）板上验收（2026-10-12 / 2026-10-13 修订）
+"""常驻音频输出链路（codec + I2S2 + 出音引擎）板上验收（2026-10-12 / 2026-10-13 修订）
 
 与 tools/audio_check.py 的区别：**那条验的是自检路径**（轮询写 FIFO，只在
 YMGUI_AUDIO_TEST=ON 时编进来）；**这条验的是出货路径**——音乐 app 与控制中心
-音量真正会走的那条：ES8311 寄存器 → I2S2 → TIM6 周期中断滴灌 FIFO。
+音量真正会走的那条：ES8311 寄存器 → I2S2 → 出音引擎。
+⚠ 出音引擎自 2026-10-13 起**默认是 I2S TX DMA**（`g_ao_use_dma=1`）；写 0 回退 TIM6 滴灌。
+  本脚本按当前开关自动选 A2 判据，两条路都能验。
 
 声源用**内置正弦**（g_ao_demo），故意不碰 TF 卡，这样：
     demo 响、播 WAV 不响  ⇒ 播放器/文件的问题；
-    demo 也不响           ⇒ 音频硬件/接线/TIM6 滴灌的问题。
+    demo 也不响           ⇒ 音频硬件/接线/出音引擎的问题。
 
 判据（全是确定整数）：
   A1  codec 起得来：g_ao_rc == 0 且 g_ao_codec == 1
-  A2  TIM6 心跳在转：g_ao_isr / g_ao_push 都在涨
+  A2  出音引擎在转：DMA 路径 ⇒ g_ao_push 在涨且 g_ao_isr 保持 0（TIM6 不参与）；
+      TIM6 路径 ⇒ g_ao_isr / g_ao_push 都在涨
   A3  播了 3 秒的量：g_ao_frames ≈ 48 828 × 3 = 146 484（±10%）
   A4  没有持续欠载：g_ao_udr 与 g_ao_underrun 都远小于总帧数
   A5  播完自动收尾：g_ao_playing 回到 0
@@ -88,7 +91,10 @@ def _run():
         print("[FAIL] 内核没在跑 —— probe-rs download 之后必须 reset。")
         return 1
 
-    print("起播：写 g_ao_demo = 1（3 秒 977 Hz，走常驻 TIM6 滴灌通路）")
+    use_dma = bench.rd("g_ao_use_dma", 1)[0]
+    print("出音路径：%s（g_ao_use_dma=%d）"
+          % ("I2S TX DMA（默认）" if use_dma else "TIM6 中断滴灌（回退）", use_dma))
+    print("起播：写 g_ao_demo = 1（3 秒 977 Hz）")
     b0, attempt = trigger_and_catch()
     if b0 is None:
         print("[FAIL] 三次都没赶上播放窗口（playing 始终为 0）—— 起播可能失败。")
@@ -110,13 +116,25 @@ def _run():
         print("[FAIL] A1b 起播后 g_ao_playing 不是 1：%d" % b0["playing"])
         ok = False
 
-    # 再等一会儿（仍在 3 s 窗口内），取第二拍看心跳有没有继续转
+    # 再等一会儿（仍在 3 s 窗口内），取第二拍看发声引擎有没有继续转
     time.sleep(1.2)
     b1 = rd_block()
-    print("  TIM6 心跳：isr %d→%d   push(半字) %d→%d   frames %d→%d"
-          % (b0["isr"], b1["isr"], b0["push"], b1["push"],
-             b0["frames"], b1["frames"]))
-    if b1["isr"] <= b0["isr"] or b1["push"] <= b0["push"]:
+    if use_dma:
+        print("  DMA 引擎：push(半字) %d→%d   frames %d→%d   TIM6 isr %d→%d（应保持 0）"
+              % (b0["push"], b1["push"], b0["frames"], b1["frames"],
+                 b0["isr"], b1["isr"]))
+        if b1["push"] <= b0["push"]:
+            print("[FAIL] A2 DMA 供数没在涨（push %d→%d）—— TXDMAEN/FTHLV/DMAMUX"
+                  " 请求号（应 40）/NVIC 向量任一处没配好" % (b0["push"], b1["push"]))
+            ok = False
+        elif b1["isr"] != b0["isr"]:
+            print("[FAIL] A2 DMA 路径下 TIM6 竟在中断（isr %d→%d）—— 路径选择不对"
+                  % (b0["isr"], b1["isr"]))
+            ok = False
+        else:
+            print("[PASS] A2 DMA 引擎在供数（push +%d 半字，TIM6 未参与、isr 恒 0）"
+                  % (b1["push"] - b0["push"]))
+    elif b1["isr"] <= b0["isr"] or b1["push"] <= b0["push"]:
         print("[FAIL] A2 TIM6 中断/滴灌没在涨（isr %d→%d, push %d→%d）—— "
               "心跳没转起来，或中断没接上（检查 startup 向量表）"
               % (b0["isr"], b1["isr"], b0["push"], b1["push"]))
@@ -160,7 +178,7 @@ def _run():
         print("[FAIL] A5 播完没收尾：g_ao_playing=%d" % b2["playing"])
         ok = False
     else:
-        print("[PASS] A5 播完自动停（g_ao_playing=0，TIM6 与 codec 都已挂起）")
+        print("[PASS] A5 播完自动停（g_ao_playing=0，出音引擎与 codec 都已挂起）")
 
     print("\n[PASS] 常驻出声链路验收通过（听不听得见由耳朵判定，这里只验数据通路）"
           if ok else "\n[FAIL] 常驻出声链路验收未通过")

@@ -4,7 +4,8 @@
 
 与 audio_out_check.py 的区别：那条验的是**内置正弦**（不碰卡）；这条验的是
 **真·音乐 app 路径** —— FatFs 打开 /YMGUI/MUSIC/TOKYOHOT.WAV、解析 WAV 头、
-feeder 从 TF 卡读数据、喂进同一个 audio_out 引擎（codec + I2S2 + TIM6 滴灌）。
+feeder 从 TF 卡读数据、喂进同一个 audio_out 引擎（codec + I2S2 + 出音引擎；
+默认 I2S TX DMA，写 g_ao_use_dma=0 可回退 TIM6 滴灌）。
 
 判据：
   B1  文件能打开 + 头能解析 + 起播成功：g_wav_rc == 0
