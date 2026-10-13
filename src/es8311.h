@@ -77,6 +77,14 @@ extern volatile uint32_t g_es_fail;    /* 重试 3 次仍失败 的次数（应�
 extern volatile uint32_t g_es_fix_wr;  /* 回读校验发现不对、补写 的次数 */
 extern volatile uint32_t g_es_recover_pe;/* 因 BUSY/TIMEOUT 做 I2C 软复位(PE 0→1)的次数 */
 extern volatile uint32_t g_es_readback; /* 回读体检执行次数（起播后那次 + 播放中每秒那次）*/
+/* ---- 2026-10-13：UI 卡死修复新增（快速点播放/暂停后主循环被 I2C 拖死）----
+ * 板上实测根因：I2C 从机在事务被中途打断后把 SDA 钳低 ⇒ 总线卡死；旧代码对 NACK
+ * 直接 return、从不做总线恢复，且单笔超时 50 ms × 5 重试 = 250 ms/笔，一次起播
+ * ~19 笔 ⇒ 主循环单拍实测 3921 ms（= 用户看到的"UI 卡住无法滑动"）。
+ * 修法：① bus clear（9 SCL 脉冲 + STOP，双线开漏、无对顶风险）；② 单笔超时 50→5 ms、
+ * 重试 5→3；③ 连续硬失败熔断，冷却期内 I2C 立即快速失败，绝不长时间阻塞 UI。 */
+extern volatile uint32_t g_es_bus_clear;   /* bus clear 真正执行过的次数（>0 = 发生过总线卡死）*/
+extern volatile uint32_t g_es_breaker_trip;/* I2C 熔断触发次数（连续硬失败过多 ⇒ 快速失败）*/
 
 /**
  * @brief  初始化 I2C1（PB6/PB7，AF4，100 kHz）—— 只做总线，不碰 codec

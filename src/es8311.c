@@ -41,13 +41,16 @@ volatile uint32_t g_es_fail    = 0u;       /* 重试 3 次仍失败的次数（>
 volatile uint32_t g_es_fix_wr  = 0u;       /* "回读发现不对 → 补写"的次数 */
 volatile uint32_t g_es_recover_pe = 0u;    /* 因 BUSY/TIMEOUT 而做 I2C 软件复位(PE 0→1)的次数 */
 volatile uint32_t g_es_readback = 0u;      /* 回读体检执行次数（含起播后那次与每秒那次）*/
+/* ★ 2026-10-13：UI 卡死修复新增的两个计数（见 g_es_ng_idr 下方的长说明）*/
+volatile uint32_t g_es_bus_clear = 0u;     /* I2C bus clear（9 时钟 + STOP）真正执行过的次数 */
+volatile uint32_t g_es_breaker_trip = 0u;  /* I2C 熔断触发次数（连续硬失败过多 ⇒ 快速失败）*/
 volatile uint32_t g_es_ng_idr  = 0xFFFFu;  /* 失败瞬间 PB6(SCL)/PB7(SDA) 的电平（GPIOB->IDR bit6/bit7）
                                             * 0x40/0x80 = 已释放（有上拉）；缺 0x80 ⇒ SDA 被从机压住 = 总线卡死*/
 
 /* 写失败后的 I2C 现场复位（只动 I2C1 自己的寄存器 + HAL 句柄，不碰任何 GPIO 电气；
  * 定义放在 s_hi2c 声明之后，见下面 es8311_write_reg 之前）。 */
 
-static I2C_HandleTypeDef s_hi2c;
+static I2C_HandleTypeDef s_hi2c;                          /* I2C1 句柄（bus_clear 里会复位其 State）*/
 static uint8_t           s_addr7 = ES8311_I2C_ADDR_CE0;   /* 当前选定的 7 位地址 */
 
 /* UI 音量的真正来源在 main.c（g_audio_volume）—— 本模块不认识 app_config，
@@ -63,7 +66,16 @@ extern volatile uint32_t g_audio_volume;
  *   ⇒ 没初始化就干脆不动总线（返回 -1，调用方忽略返回值）。 */
 static uint8_t           s_codec_ready = 0u;
 
+/* ---- I2C 硬失败熔断状态（2026-10-13 UI 卡死修复）----
+ * consecutive_fail：连续"全重试仍失败"的笔数；达 ES8311_BREAKER_N 即触发熔断。
+ * breaker_tick    ：熔断后 HAL_GetTick() 的冷却起点；冷却期内所有 I2C 立即快速失败。*/
+static uint32_t          s_es_consec_fail = 0u;
+static uint32_t          s_es_breaker_tick = 0u;
+
 /* ====================== I2C1 总线 ====================== */
+
+/* 前置声明：bus_init 末尾的总线自检会用到（定义在各辅助函数集中处，见下方）。 */
+static void es8311_bus_clear(void);
 
 int es8311_bus_init(void)
 {
@@ -101,6 +113,19 @@ int es8311_bus_init(void)
      * 不显式调 HAL_I2CEx_Config*Filter：那两个函数在 hal_i2c_ex.c 里，
      * 为它多编一个文件不值得，默认值正好是想要的。 */
     g_es_bus_rc = 0;
+
+    /* ★★ 开机总线自检 + 清理（2026-10-13 UI 卡死修复）★★
+     * 【为什么开机就要做】I2C 总线卡死（从机把 SDA 钳低）是**从机侧**的状态，
+     *   **不会随 MCU 复位而消失** —— 板载/外接 codec 的 5 V 常亮，它的 I2C
+     *   状态机停在"正拉着 SDA"就一直拉着。所以"复位板子重来"并不必然回到干净态：
+     *   实测就出现过复位后 bus 仍为 0x40（SDA 被钳住），于是固件一开机就每笔 I2C
+     *   都耗满超时 ⇒ 起播/续播全废。
+     *   ⇒ 上电配置完 I2C 后立刻看一次电平：SDA 被钳住就先 bus clear 再放行。
+     *   ⚠ 放在 g_es_bus_rc=0 之后：bus_clear 的前置检查依赖它。 */
+    if ((GPIOB->IDR & GPIO_PIN_7) == 0u)
+    {
+        es8311_bus_clear();          /* SDA 被从机压住 ⇒ 9 时钟 + STOP 把它走完 */
+    }
     return 0;
 }
 
@@ -157,11 +182,35 @@ uint32_t es8311_i2c_timing(uint32_t pclk)
 
 /* ====================== 寄存器读写 ====================== */
 
-/* 重试次数与间隔：实测 NACK 是"芯片有几十毫秒不响应"这种窗口 ⇒ 间隔取 2 ms
- * （比 1 ms 明显更容易熬过窗口）。全失败才算真丢写 / 真探不到。 */
-#define ES8311_WR_TRIES     5u
+/* 重试次数与间隔。
+ * ⚠⚠ 2026-10-13 关键修正：单笔超时从 **50 ms 降到 5 ms**。
+ *   【UI 卡死的直接原因】板上实测（无读取窗口测速，排除 probe halt 伪影）：
+ *   "快速点播放/暂停"后主循环单拍耗时 **g_tick_ms = 3921 ms**，主循环速率从
+ *   77 拍/秒掉到 0~16 拍/秒 ⇒ 用户看到的"整个 UI 卡住无法滑动"。
+ *   算式完全吻合：一次起播约 19 笔 I2C，每笔 5 次重试 × 50 ms = 250 ms
+ *   ⇒ 19 × 250 ms ≈ 4.75 s。50 ms 这个值对 100 kHz 总线毫无意义
+ *   （一字节事务本身只要 ~90 µs，就算从机全程拉伸时钟也就几百 µs），
+ *   它只是把"对端不应答"拖成了 UI 级卡顿。改成 5 ms 后最坏 ~19×15 ms ≈ 285 ms。
+ * ⚠ 重试次数 5 → 3：配合下面的"硬失败熔断"，连续失败会立刻快速失败，
+ *   不必靠单笔多次重试去熬窗口（熬窗口由调用方下一拍再来承担，不阻塞 UI）。 */
+#define ES8311_TIMEOUT_MS   5u
+#define ES8311_WR_TRIES     3u
 #define ES8311_TRY_MS       2u
 #define ES8311_PROBE_TRIES  3u
+
+/* 硬失败熔断：连续 N 次"全重试仍失败"即判定总线不可用 ⇒ 后续调用**立即返回失败**
+ * （不做任何 HAL 超时等待、不重试），冷却 ES8311_BREAKER_MS 后再放行一次探测式尝试。
+ * 【为什么必须有】实测总线进入"SDA 被从机钳低"的卡死态后，**每一笔**都会耗满
+ *   "超时 × 重试"；而 app 的进度刷新、每秒回读体检、确认期都会不停发 I2C ⇒
+ *   卡死态被无限延长。熔断把"卡死期间的 I2C 开销"从秒级压到 ~0。 */
+#define ES8311_BREAKER_N    6u
+#define ES8311_BREAKER_MS   250u
+
+/* ---- 前置声明：probe 在这些实现之前就用到它们（bus clear / 熔断 / 计数）----
+ * 定义在文件下方（bus clear 需要 GPIO + I2C 寄存器，集中放在一起更清楚）。 */
+static void es8311_i2c_recover(HAL_StatusTypeDef st);
+static uint32_t es8311_retry_budget(void);
+static void es8311_i2c_note(int failed);
 
 int es8311_probe(uint8_t addr7)
 {
@@ -181,7 +230,20 @@ int es8311_probe(uint8_t addr7)
  *     所以这里的外层"延时后重试"才是真正起作用的那个。 */
 int es8311_probe_to(uint8_t addr7, uint32_t timeout_ms)
 {
-    for (uint32_t att = 0u; att < ES8311_PROBE_TRIES; ++att)
+    uint32_t tries;
+    /* ⚠ 超时上限收敛到 ES8311_TIMEOUT_MS：调用方（出货路径）传的是 20 ms，
+     *   那对"从机不应答"是纯粹浪费（探测本身 ~90 µs 级别），且会累积成 UI 卡顿。 */
+    if (timeout_ms > ES8311_TIMEOUT_MS)
+    {
+        timeout_ms = ES8311_TIMEOUT_MS;
+    }
+    tries = es8311_retry_budget();
+    if (tries > ES8311_PROBE_TRIES)
+    {
+        tries = ES8311_PROBE_TRIES;
+    }
+
+    for (uint32_t att = 0u; att < tries; ++att)
     {
         if (HAL_I2C_IsDeviceReady(&s_hi2c, (uint16_t)(addr7 << 1), 3u, timeout_ms) == HAL_OK)
         {
@@ -189,10 +251,14 @@ int es8311_probe_to(uint8_t addr7, uint32_t timeout_ms)
             {
                 g_es_probe_retry++;      /* 首试没探到、延时后探到了（诊断量）*/
             }
+            es8311_i2c_note(0);
             return 0;
         }
+        /* 探测失败同样要看总线电平：SDA 被钳住就做 bus clear（否则后面全卡）。 */
+        es8311_i2c_recover(HAL_ERROR);
         HAL_Delay(ES8311_TRY_MS);
     }
+    es8311_i2c_note(1);
     return -1;
 }
 
@@ -201,21 +267,129 @@ void es8311_set_addr(uint8_t addr7)
     s_addr7 = addr7;
 }
 
+/* ★★ I2C 总线恢复：9 个 SCL 脉冲 + STOP（bus clear）— 2026-10-13 UI 卡死根因之一 ★★
+ *
+ * 【症状与根因】板上实测（i2c_timeline.py，全程只读 IDR 不改电气）：
+ *   快速点播放/暂停后总线电平**恒定 0x40** —— SCL(PB6)=1 已释放、SDA(PB7)=0
+ *   **被从机永久钳低**；此后每一笔 I2C 都在 "超时 × 重试" 里耗满时间
+ *   （实测累计 g_es_fail=900、主循环单拍 3921 ms）⇒ UI 卡死无法滑动。
+ *
+ * 【为什么 SDA 会被钳住】I2C 从机在"读到地址后、按约定该释放 SDA"的时刻被中途打断
+ *   （本工程的高频启停：I2S 时钟开关、codec 电源态切换、以及 probe-rs halt 冻结 CPU
+ *   时外设仍在跑），就会停在"正拉着 SDA"的中间态。从机不会自己退出 ⇒ 主机必须按
+ *   I2C 规范用 9 个 SCL 脉冲把它"走完"剩余位、再补一个 STOP 复位总线状态机。
+ *
+ * 【本函数为什么以前不存在、现在必须有】旧的 es8311_i2c_recover() 只处理
+ *   HAL_BUSY/TIMEOUT（复位 I2C1 外设寄存器），对 NACK 直接 `return`；而**单片机侧
+ *   复位自己的 I2C 外设根本无法让从机松开 SDA** —— 外设复位了，线还是被钳着。
+ *   实测证据：g_es_recover_pe=0（从未做过任何恢复）+ bus 恒定 0x40（永久卡死）。
+ *   ⇒ 唯一的出路是**软件 bit-bang 时钟脉冲**（把 PB6/PB7 临时切成 GPIO 推挽/开漏，
+ *   这是 I2C 总线恢复的标准做法，不是"强灌电流"）。
+ *
+ * ⚠⚠ 电气安全（严守用户第 0 条禁令）：
+ *   · 两个脚**都配成开漏输出（GPIO_MODE_OUTPUT_OD）**，绝不使用推挽。
+ *     开漏下主机只能在"释放(写1)"与"拉低(写0)"之间切换，**与从机不可能对顶**
+ *     （任何一方拉低都是合法的 I2C 线"或"语义）—— 这是刻意选的保守值：
+ *     即使从机正在拉伸 SCL 或钳住 SDA，也不存在对顶电流路径。
+ *   · 全程**不主动拉低 SDA**（SDA 始终写 1 = 只释放），只由主机提供 SCL 脉冲。
+ *   · 脉冲期间每个电平都读回 IDR 确认，最多 9 个脉冲（I2C 一帧最多 8 数据位 + 1 ACK）。
+ *   · 恢复完把 PB6/PB7 **还原成 AF4 开漏**（I2C1 原配置），不留副作用。
+ *   · 电流量级：开漏 + 内部上拉 ~40 kΩ ⇒ 单脚最大 VDD/40k ≈ 82 µA，可忽略。 */
+static void es8311_bus_clear(void)
+{
+    GPIO_InitTypeDef g;
+
+    /* ⚠ 前置条件：GPIOB 与 I2C1 的时钟必须已使能（由 es8311_bus_init 打开）。
+     *   若总线还没初始化就走到这里，碰 I2C1 寄存器会 BusFault ⇒ 直接返回。 */
+    if (g_es_bus_rc != 0u)
+    {
+        return;
+    }
+
+    /* --- 1) SCL/SDA 都切成**开漏**输出 + 上拉；两脚均写 1（释放）。
+     *        开漏 = 物理上不可能与从机对顶（见上方电气安全说明）。 --- */
+    g.Pin       = GPIO_PIN_6 | GPIO_PIN_7;
+    g.Mode      = GPIO_MODE_OUTPUT_OD;
+    g.Pull      = GPIO_PULLUP;
+    g.Speed     = GPIO_SPEED_FREQ_LOW;          /* 慢速：总线恢复不需要快边沿 */
+    g.Alternate = 0;
+    HAL_GPIO_Init(GPIOB, &g);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6 | GPIO_PIN_7, GPIO_PIN_SET);   /* 两线释放（高）*/
+
+    /* --- 2) 起始条件：SCL 高时把 SDA 拉低（START）。开漏下"同向拉低"无对顶电流。 --- */
+    for (volatile uint32_t i = 0u; i < 200u; ++i) { }
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);   /* SDA 低（START）*/
+    for (volatile uint32_t i = 0u; i < 200u; ++i) { }
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);     /* SDA 释放，交还给从机 */
+
+    /* --- 3) 9 个 SCL 脉冲：每个脉冲后检查 SDA 是否已释放（从机吐完最后一位） --- */
+    for (uint32_t clk = 0u; clk < 9u; ++clk)
+    {
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);   /* SCL 低 */
+        for (volatile uint32_t i = 0u; i < 200u; ++i) { }
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);     /* SCL 高空闲（释放）*/
+        for (volatile uint32_t i = 0u; i < 200u; ++i) { }
+
+        if ((GPIOB->IDR & GPIO_PIN_7) != 0u)     /* SDA 已被释放（读到高）⇒ 从机走完了 */
+        {
+            break;
+        }
+    }
+
+    /* --- 4) STOP 条件：SCL 高时让 SDA 由低→高（释放）—— 复位所有从机的总线状态机 --- */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
+    for (volatile uint32_t i = 0u; i < 200u; ++i) { }
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);         /* SDA 释放 ⇒ STOP */
+    for (volatile uint32_t i = 0u; i < 200u; ++i) { }
+
+    /* --- 5) 还原 PB6/PB7 为 AF4 开漏（I2C1 原配置），并把 I2C 外设/handle 归位 --- */
+    g.Pin       = GPIO_PIN_6 | GPIO_PIN_7;
+    g.Mode      = GPIO_MODE_AF_OD;
+    g.Pull      = GPIO_PULLUP;
+    g.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+    g.Alternate = GPIO_AF4_I2C1;
+    HAL_GPIO_Init(GPIOB, &g);
+
+    /* I2C 外设软件复位（PE 0→1，≥3 个 APB 周期），清掉可能残留的 BUSY/状态机 */
+    CLEAR_BIT(I2C1->CR1, I2C_CR1_PE);
+    (void)I2C1->CR1;
+    for (volatile uint32_t i = 0u; i < 32u; ++i) { }
+    SET_BIT(I2C1->CR1, I2C_CR1_PE);
+    s_hi2c.State     = HAL_I2C_STATE_READY;
+    s_hi2c.ErrorCode = HAL_I2C_ERROR_NONE;
+    s_hi2c.Lock      = HAL_UNLOCKED;
+    g_es_recover_pe++;
+
+    /* --- 6) 复位熔断：总线刚清理过，给一次"干净"的机会 --- */
+    s_es_consec_fail  = 0u;
+    s_es_breaker_tick = 0u;
+    g_es_bus_clear++;
+}
+
 /* 写/读失败后的 I2C 现场处置。**按失败类型分开处理**（2026-10-13 板上实测的分类）：
- *   · HAL_ERROR(NACK)：从机不应答地址 —— 板上实测**总线电平是正常释放的**
- *     （g_es_ng_idr = 0xC0，SCL/SDA 都被上拉拉高），说明不是"总线卡死"，而是
- *     **芯片在那一小段时间里不响应 I2C**（正在处理软复位/电源态切换）。这种失败
- *     **不能靠复位外设解决**，只能"等一等再重试" ⇒ 这里只延时，不动外设。
- *   · HAL_BUSY / HAL_TIMEOUT：外设状态机或总线时序出了问题（HAL 句柄可能停在
- *     BUSY_xx，HAL_I2C_Master_Transmit 开头就判 State==READY）⇒ 才做 I2C 软件复位
- *     （PE 0→1，只动 I2C1 自己的寄存器，不碰 GPIO 电气）+ 句柄状态归位。
- *   ⚠ PE 必须**拉低至少 3 个 APB 时钟周期**才算有效复位（RM0433 I2C 章），
- *     所以中间读回一次 CR1 再空转几拍，别写成"两条指令连着写"。 */
+ *   · HAL_ERROR(NACK)：从机不应答地址。**但必须先看总线电平**：
+ *       - IDR 的 SDA 仍为高（0xC0/0x80）：总线正常，只是芯片那一小段时间不响应
+ *         （软复位/电源态切换窗口）⇒ 只延时，不动外设。
+ *       - IDR 的 SDA 被钳低（0x40）：**总线已卡死** ⇒ 必须做 bus clear，
+ *         否则后面每一笔都要耗满"超时 × 重试"（实测正是 UI 卡死的直接原因）。
+ *   · HAL_BUSY / HAL_TIMEOUT：外设状态机/时序问题 ⇒ 复位 I2C 外设（PE 0→1）+ 句柄归位。
+ *   ⚠ PE 必须**拉低至少 3 个 APB 时钟周期**才算有效复位（RM0433 I2C 章）。 */
 static void es8311_i2c_recover(HAL_StatusTypeDef st)
 {
+    uint32_t idr = GPIOB->IDR & (GPIO_PIN_6 | GPIO_PIN_7);
+
+    /* ★ 判据：SDA(PB7) 被压住 = 总线卡死 ⇒ 立刻 bus clear（与失败类型无关）。
+     *   放在类型判断**之前**：实测卡死态下 HAL 报的正是 NACK(1)，
+     *   若照旧对 NACK 直接 return，就永远走不到恢复。 */
+    if ((idr & GPIO_PIN_7) == 0u)
+    {
+        es8311_bus_clear();
+        return;
+    }
+
     if (st == HAL_ERROR)
     {
-        return;                       /* NACK：从机不应答，等调用方的延时即可 */
+        return;                       /* NACK 且总线电平正常：等调用方的延时即可 */
     }
     CLEAR_BIT(I2C1->CR1, I2C_CR1_PE);
     (void)I2C1->CR1;                  /* 读回：保证写已到达外设 */
@@ -225,6 +399,45 @@ static void es8311_i2c_recover(HAL_StatusTypeDef st)
     s_hi2c.ErrorCode = HAL_I2C_ERROR_NONE;
     s_hi2c.Lock      = HAL_UNLOCKED;
     g_es_recover_pe++;
+}
+
+/* 熔断查询：返回**本次调用允许的最大重试次数**（实现"半开"语义，避免误伤正常播放）。
+ *   0 = 正常：用 ES8311_WR_TRIES 次重试（能熬过芯片电源态窗口）。
+ *   1 = 熔断冷却中：**只允许 1 次快速尝试**（单笔 5 ms），不做重试风暴。
+ *      为什么不是"直接返回失败"：冷却期内直接把起播判失败，会把"慢但能用"
+ *      变成"点了播放没反应"——那是更差的回归。给一次便宜的机会，
+ *      真恢复了立刻转正常；仍失败则继续冷却，代价仅 5 ms。 */
+static uint32_t es8311_retry_budget(void)
+{
+    if (s_es_consec_fail < ES8311_BREAKER_N)
+    {
+        return ES8311_WR_TRIES;
+    }
+    if ((HAL_GetTick() - s_es_breaker_tick) >= ES8311_BREAKER_MS)
+    {
+        /* 冷却结束：放行一次完整重试（半开试探） */
+        s_es_consec_fail = ES8311_BREAKER_N - 1u;
+        return ES8311_WR_TRIES;
+    }
+    return 1u;                        /* 冷却中：仅一次快速尝试 */
+}
+
+/* 记一次"整笔失败"（所有重试都失败）或一次成功 —— 维护连续失败计数与熔断触发。*/
+static void es8311_i2c_note(int failed)
+{
+    if (failed)
+    {
+        s_es_consec_fail++;
+        if (s_es_consec_fail == ES8311_BREAKER_N)
+        {
+            s_es_breaker_tick = HAL_GetTick();
+            g_es_breaker_trip++;
+        }
+    }
+    else
+    {
+        s_es_consec_fail = 0u;
+    }
 }
 
 /* 重试次数与间隔定义已上移到 es8311_probe_to 之前（probe/write/read 共用）。 */
@@ -237,14 +450,19 @@ int es8311_write_reg(uint8_t reg, uint8_t val)
     buf[0] = reg;
     buf[1] = val;
 
-    /* 最多写 ES8311_WR_TRIES 次：失败后按类型处置再重试（理由见上）。
+    /* ★ 熔断（半开）：冷却期只允许 1 次快速尝试，绝不拖成 UI 卡顿。
+     *   理由见 es8311_retry_budget：直接失败会把"慢但能用"退化成"点了没反应"。 */
+    uint32_t tries = es8311_retry_budget();
+
+    /* 最多写 tries 次：失败后按类型处置再重试（理由见上）。
      * ⚠ 只在**第一次**失败时记账（否则重试会把失败现场冲掉，复盘时就看不到真因）。
      * ⚠ 失败**必须重试**：调用方（dac_path_regs / 音量 ramp）的历史写法是忽略返回值的，
      *   一旦这几个字节丢了，DAC 通路/音量就会"只写了一半"—— 表现正是用户报的
      *   "没声音"和"音量大小混乱"。 */
-    for (uint32_t att = 0u; att < ES8311_WR_TRIES; ++att)
+    for (uint32_t att = 0u; att < tries; ++att)
     {
-        st = HAL_I2C_Master_Transmit(&s_hi2c, (uint16_t)(s_addr7 << 1), buf, 2u, 50u);
+        st = HAL_I2C_Master_Transmit(&s_hi2c, (uint16_t)(s_addr7 << 1), buf, 2u,
+                                     ES8311_TIMEOUT_MS);
         if (st == HAL_OK)
         {
             if (att != 0u)
@@ -257,6 +475,7 @@ int es8311_write_reg(uint8_t reg, uint8_t val)
                 g_es_reg32_n++;
             }
             g_es_wr_ok++;
+            es8311_i2c_note(0);
             return 0;
         }
 
@@ -281,6 +500,7 @@ int es8311_write_reg(uint8_t reg, uint8_t val)
     }
 
     g_es_fail++;
+    es8311_i2c_note(1);
     return -1;
 }
 
@@ -288,19 +508,25 @@ int es8311_read_reg(uint8_t reg, uint8_t *val)
 {
     HAL_StatusTypeDef st = HAL_ERROR;
 
+    /* ★ 熔断（半开）：冷却期只允许 1 次快速尝试（理由见 es8311_retry_budget）。 */
+    uint32_t tries = es8311_retry_budget();
+
     /* 与写同样要重试：读失败会让调用方**跳过**后续写（config_i2s 就是
      * `if (read == 0) write(...)`），结果是数据格式没配却"看起来成功"——又是
      * 一类只有耳朵能发现的静默故障。 */
-    for (uint32_t att = 0u; att < ES8311_WR_TRIES; ++att)
+    for (uint32_t att = 0u; att < tries; ++att)
     {
-        st = HAL_I2C_Master_Transmit(&s_hi2c, (uint16_t)(s_addr7 << 1), &reg, 1u, 50u);
+        st = HAL_I2C_Master_Transmit(&s_hi2c, (uint16_t)(s_addr7 << 1), &reg, 1u,
+                                     ES8311_TIMEOUT_MS);
         if (st == HAL_OK)
         {
-            st = HAL_I2C_Master_Receive(&s_hi2c, (uint16_t)(s_addr7 << 1), val, 1u, 50u);
+            st = HAL_I2C_Master_Receive(&s_hi2c, (uint16_t)(s_addr7 << 1), val, 1u,
+                                        ES8311_TIMEOUT_MS);
         }
         if (st == HAL_OK)
         {
             g_es_rd_ok++;
+            es8311_i2c_note(0);
             return 0;
         }
         if (att == 0u)
@@ -316,6 +542,7 @@ int es8311_read_reg(uint8_t reg, uint8_t *val)
         es8311_i2c_recover(st);
         HAL_Delay(ES8311_TRY_MS);
     }
+    es8311_i2c_note(1);
     return -1;
 }
 
