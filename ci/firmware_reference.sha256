@@ -1252,6 +1252,30 @@
 # 验收：
 #   · 编译通过（16/16，FLASH 1 657 284 B / 79.03%，比补丁2 +288 B，零新增告警）；
 #   · 在板目测：起播/切歌/暂停后桌面卡片标题随之变；停止后回落占位。
-# FLASH 1 657 284 B（79.03%），比补丁2 +288 B。
-434b3d63ff0f063c8db6cddff0716af6bd7cfea79cdefd1f4e4f3632607dd547  ymgui-h743.bin
-b88c9feebf3c5b7de15b5439b0dc70a7040d7aab31d9fdb95c0fca6ba18e592c  ymgui-h743.elf
+# 旧哈希（第三十版·补丁3，已停用）：
+# 434b3d63ff0f063c8db6cddff0716af6bd7cfea79cdefd1f4e4f3632607dd547  ymgui-h743.bin
+# b88c9feebf3c5b7de15b5439b0dc70a7040d7aab31d9fdb95c0fca6ba18e592c  ymgui-h743.elf
+
+# ============================================================================
+# 第三十版·补丁4（2026-10-13）· 触摸 INT(PB13)→EXTI 门控：空闲不再读 I2C
+# ============================================================================
+# 为什么变（按「更新时机」的 a：有意为之的优化改动；工具链 14.3.rel1 未变）：
+#   位拍 I2C 一次 GSTID 读约 210 µs（ct_iic_delay 每步 2 µs × ~105 步）。原实现每拍
+#   都进 gt9xxx_scan()，靠驱动内部"每 10 次才读 1 次"的粗节流兜着 —— 代价是触摸
+#   起始最多要等 9 帧（~130 ms）才被探到（明显按压延迟）。本次改为 INT 边沿门控：
+#     1. src/startup_gcc.s：为 EXTI15_10(IRQ40) 开向量槽（原来落在 `.rept 49` 的
+#        Default_Handler 死循环块里）——.rept 49 拆成 40 + 1(EXTI) + 8；加弱别名兜底。
+#     2. src/touch_port.c：新增 touch_int_exti_init()（PB13 双边沿 EXTI + NVIC 优先级 6）、
+#        强定义 EXTI15_10_IRQHandler 与 HAL_GPIO_EXTI_Callback（ISR 里**只自增计数器**，
+#        绝不碰 I2C）；touch_port_poll() 加门控：中断计数变了 / 正在按住 / 空闲心跳
+#        到期 三者之一才真读 I2C（判据不依赖 INT 极性 ⇒ 电平保持型也正确）。
+#        新增诊断量 g_tp_int_count / g_tp_scan_count / g_tp_poll_skip / g_tp_poll_period。
+#     3. third_party/BSP/TOUCH/gt9xxx.c：删除驱动内部"每 10 次读 1 次"的节流（节流上移），
+#        否则会把上层"INT 说有数据、立即扫"的请求吞掉。
+#   ⚠ 若 EXTI 没动静（INT 没接），退化 = 心跳每 10 帧读 1 次，与旧版同量级 ⇒ 不劣化。
+# 验收：
+#   · 二进制级：.isr_vector 偏移 0x0E0(IRQ40) = 0x0800104d = EXTI15_10_IRQHandler+thumb。
+#   · 工具：tools/touch_int_check.py（T2 空闲门控 + T3 真人碰屏验证 EXTI 触发）。
+# FLASH 1 657 468 B（79.03%），比补丁3 +184 B。
+5dc03688c6705acaa4656952c2c59a0249b92e9ad38f35eff9af9e241b907b61  ymgui-h743.bin
+24b93f9bf7739fff6ad86b8f5fd23a0ba16a8883653361ee485a01a162030f54  ymgui-h743.elf

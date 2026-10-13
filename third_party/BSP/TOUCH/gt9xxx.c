@@ -183,12 +183,12 @@ uint8_t gt9xxx_scan(uint8_t mode)
     uint8_t res = 0;
     uint16_t temp;
     uint16_t tempsta;
-    static uint8_t t = 0;                           /* 控制查询间隔,从而降低CPU占用率 */
-    t++;
 
-    if ((t % 10) == 0 || t < 10)                    /* 空闲时,每进入10次CTP_Scan函数才检测1次,从而节省CPU使用率 */
-    {
-        gt9xxx_rd_reg(GT9XXX_GSTID_REG, &mode, 1);  /* 读取触摸点的状态 */
+    /* ★移植改动（2026-10-13）★ 删除原版"每 10 次调用才读 1 次"的内部节流 —— 节流改由
+     * 上层 src/touch_port.c 统一负责（INT=PB13 的 EXTI 边沿 + 空闲心跳）。这里若再节流，
+     * 会把上层"INT 说有数据、立即扫"的请求吞掉，故本函数每次调用都真读 I2C。
+     * （以下一段的缩进保留原样，只是解开了外层 if 包裹。） */
+    gt9xxx_rd_reg(GT9XXX_GSTID_REG, &mode, 1);  /* 读取触摸点的状态 */
 
         if ((mode & 0X80) && ((mode & 0XF) <= g_gt_tnum))
         {
@@ -249,7 +249,6 @@ uint8_t gt9xxx_scan(uint8_t mode)
                 {
                     tp_dev.x[0] = tp_dev.x[1];
                     tp_dev.y[0] = tp_dev.y[1];
-                    t = 0;                  /* 触发一次,则会最少连续监测10次,从而提高命中率 */
                 }
                 else                        /* 非法数据,则忽略此次数据(还原原来的) */
                 {
@@ -259,12 +258,7 @@ uint8_t gt9xxx_scan(uint8_t mode)
                     tp_dev.sta = tempsta;   /* 恢复tp_dev.sta */
                 }
             }
-            else 
-            {
-                t = 0;                      /* 触发一次,则会最少连续监测10次,从而提高命中率 */
-            }
         }
-    }
 
     if ((mode & 0X8F) == 0X80)              /* 无触摸点按下 */
     {
@@ -279,8 +273,6 @@ uint8_t gt9xxx_scan(uint8_t mode)
             tp_dev.sta &= 0XE000;           /* 清除点有效标记 */
         }
     }
-
-    if (t > 240)t = 10;                     /* 重新从10开始计数 */
 
     return res;
 }

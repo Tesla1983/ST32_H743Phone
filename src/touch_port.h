@@ -27,6 +27,14 @@ extern volatile uint32_t g_inject_ok;    /* YMGUI_Inject_Pointer() 成功返回�
                                           * ★这是"注入链路不再卡死"的直接证据★：
                                           * 故障时它不再增长（且 g_fault.magic 会置起）。 */
 
+/* ---- INT(PB13)→EXTI 门控的诊断量（2026-10-13）----
+ * 判据：手指碰屏时 g_tp_int_count 增长（= INT 线确实在动、EXTI 向量与 NVIC 都通），
+ *       空闲时 g_tp_poll_skip 快速增长而 g_tp_scan_count 近乎不涨（= 门控在省 I2C）。 */
+extern volatile uint32_t g_tp_int_count;   /* EXTI 边沿中断累计次数 */
+extern volatile uint32_t g_tp_scan_count;  /* 实际进 I2C 扫描的拍数 */
+extern volatile uint32_t g_tp_poll_skip;   /* 因门控跳过 I2C 的拍数 */
+extern volatile uint32_t g_tp_poll_period; /* 空闲心跳周期（帧），默认 10，可运行期调大 */
+
 /* ---- 合成触摸自测（无需真的碰屏，用 SWD 触发端到端验证）----
  * 验证整条链路：注入 → 命中测试 → 事件派发 → 控件响应 → 标脏重绘。
  *   g_synth_test = 1  单击 (g_synth_x, g_synth_y)，两拍完成

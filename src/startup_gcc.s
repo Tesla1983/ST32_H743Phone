@@ -55,8 +55,14 @@ __Vectors:
      * 2026-10-13（第五次）为 TIM6_DAC 开槽：音频出声用 TIM6 周期中断在 ISR 里滴灌 I2S TX FIFO
      *   （主循环一帧 ~16ms 远慢于 FIFO 82µs 预算，必须靠高频中断）。TIM6_DAC_IRQn = 54。
      *   若落 Default_Handler 会死循环冻结内核。强定义在 src/audio_out.c，弱别名兜底。
-     * 拆成 49 + 1 + 2 + 1 + 1 + 1 + 16 + 1 + 49 + 1 + 28 = 150，顺序不能错：位置由 CMSIS 的 IRQn 决定。 */
-    .rept  49                           /* IRQ0..IRQ48 */
+     * 2026-10-13（第六次）为 EXTI15_10 开槽：触摸 INT=PB13 走 EXTI 边沿中断做"有触摸才读 I2C"
+     *   的门控（见 src/touch_port.c）。EXTI15_10_IRQn = 40。强定义在 src/touch_port.c，弱别名兜底。
+     * 拆成 40 + 1 + 8 + 1 + 2 + 1 + 1 + 1 + 16 + 1 + 49 + 1 + 28 = 150，顺序不能错：位置由 CMSIS 的 IRQn 决定。 */
+    .rept  40                           /* IRQ0..IRQ39 */
+    .word  Default_Handler
+    .endr
+    .word  EXTI15_10_IRQHandler         /* IRQ40 = EXTI15_10（触摸 INT=PB13，强定义在 src/touch_port.c） */
+    .rept  8                            /* IRQ41..IRQ48 */
     .word  Default_Handler
     .endr
     .word  SDMMC1_IRQHandler            /* IRQ49 = SDMMC1（见 sd_card.c） */
@@ -156,3 +162,8 @@ Default_Handler:
  * 这里给弱别名兜底 —— 万一 audio_out.c 没编进来，也不会链接失败，只会落回死循环。 */
 .weak TIM6_DAC_IRQHandler
 .thumb_set TIM6_DAC_IRQHandler, Default_Handler
+
+/* EXTI15_10（IRQ40）：触摸 INT=PB13 的边沿中断，强定义在 src/touch_port.c。
+ * 弱别名兜底 —— 万一 touch_port.c 没编进来，也不会链接失败，只会落回死循环。 */
+.weak EXTI15_10_IRQHandler
+.thumb_set EXTI15_10_IRQHandler, Default_Handler

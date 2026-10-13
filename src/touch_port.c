@@ -39,6 +39,35 @@ volatile uint32_t g_poll_stage = 0;
  * 根因修好后恢复为 1（见文件末尾的注释）。 */
 volatile uint32_t g_tp_inject_enable = 1;
 
+/* ===========================================================================
+ * 2026-10-13：触摸 INT(PB13) → EXTI 边沿中断，做"有触摸才读 I2C"的门控
+ *
+ * 背景：位拍 I2C 一次 GSTID 读约 210 µs（ct_iic_delay 每步 2 µs × ~105 步）。
+ * 原实现每拍都进 gt9xxx_scan()，靠驱动内部"每 10 次才读 1 次"的粗节流兜着 ——
+ * 代价是**触摸起始最多要等 9 帧（~130 ms）才被探到**（明显的按压延迟）。
+ *
+ * 现在：GT9xxx 一有触摸报告就拉 INT(PB13)，EXTI15_10 双边沿中断只做一件事 ——
+ * 给 g_tp_int_count 自增（见 HAL_GPIO_EXTI_Callback）。touch_port_poll() 用
+ * "中断计数变了 / 正在按住 / 空闲心跳到期"三者之一作为"本拍需读 I2C"的判据：
+ *   · 有触摸 → 中断一到，下一拍立刻读（延迟从 ~130 ms 降到 ≤1 帧）；
+ *   · 空闲   → 完全不碰 I2C（心跳周期 g_tp_poll_period 帧才读 1 次兜底）。
+ * 判据里**故意不依赖 INT 的极性/电平模式**（双边沿 + 按住期间逐帧强制扫描），
+ * 所以即便模块 INT 是"低电平保持"而非脉冲，行为也正确。
+ *
+ * ⚠ 若 EXTI 完全没动静（INT 线没接 / 模块不驱动），退化行为 = 心跳周期帧读 1 次，
+ *   与旧版"每 10 帧读 1 次"同量级 ⇒ 最坏情况不劣于改动前（见 g_tp_poll_period）。
+ * =========================================================================== */
+
+/* SWD 诊断量 */
+volatile uint32_t g_tp_int_count   = 0;  /* EXTI(PB13) 边沿中断累计次数（触碰屏时应增长）*/
+volatile uint32_t g_tp_scan_count  = 0;  /* 实际进 I2C 扫描的拍数 */
+volatile uint32_t g_tp_poll_skip   = 0;  /* 因门控跳过 I2C 的拍数（空闲时快速增长）*/
+volatile uint32_t g_tp_poll_period = 10; /* 空闲心跳周期（帧）。10 = 与旧节流同量级；EXTI 验证可靠后可调大 */
+
+static uint32_t s_tp_int_seen = 0;       /* 上次 poll 见到的中断计数 */
+static uint8_t  s_tp_active   = 0;       /* 1 = 上一拍判为"按住中"（逐帧强制扫描：拖动平滑/抬起可测）*/
+static uint32_t s_tp_idle_cnt = 0;       /* 空闲心跳计数 */
+
 /* 合成触摸自测（SWD 写 g_synth_test 触发，不依赖真实手指）：
  *   = 1  单击 (g_synth_x, g_synth_y)          —— 两拍：按下 → 抬起
  *   = 2  从右向左滑（桌面翻到下一页）          —— 按下 → 8 拍移动 → 抬起
@@ -60,6 +89,25 @@ static int32_t  s_synth_cur_y = 0;
 
 static uint8_t s_pid[4];
 
+/* ---- 触摸 INT(PB13) → EXTI15_10 边沿中断 ----
+ * HAL_GPIO_Init 内部会开 SYSCFG 时钟并写 EXTICR（见 stm32h7xx_hal_gpio.c:247），
+ * 所以这里只要给 GPIOB 时钟即可。双边沿：不假设模块 INT 的极性/触发模式。 */
+static void touch_int_exti_init(void)
+{
+    GPIO_InitTypeDef gi;
+
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    gi.Pin   = GT9XXX_INT_GPIO_PIN;             /* PB13 */
+    gi.Mode  = GPIO_MODE_IT_RISING_FALLING;     /* 双边沿 */
+    gi.Pull  = GPIO_PULLUP;                     /* 悬空输入易误触发；上拉在开漏/推挽下都安全 */
+    gi.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GT9XXX_INT_GPIO_PORT, &gi);
+
+    HAL_NVIC_SetPriority(EXTI15_10_IRQn, 6u, 0u);  /* 比音频 TIM6(5)/SD(5) 低一档：ISR 只自增 */
+    HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+}
+
 int touch_port_init(void)
 {
     g_tp_rc = gt9xxx_init();
@@ -73,7 +121,27 @@ int touch_port_init(void)
     gt9xxx_rd_reg(GT9XXX_PID_REG, s_pid, 4);
     g_tp_pid = ((uint32_t)s_pid[0] << 24) | ((uint32_t)s_pid[1] << 16) |
                ((uint32_t)s_pid[2] << 8)  |  (uint32_t)s_pid[3];
+
+    /* I2C 通了才开 INT 门控：失败路径下 poll 会因 g_tp_rc != 0 直接返回，
+     * 那时开 EXTI 没意义（只会白发中断）。 */
+    touch_int_exti_init();
     return 0;
+}
+
+/* EXTI15_10（IRQ40）：强定义（弱别名在 src/startup_gcc.s 兜底）。 */
+void EXTI15_10_IRQHandler(void)
+{
+    HAL_GPIO_EXTI_IRQHandler(GT9XXX_INT_GPIO_PIN);
+}
+
+/* HAL 的 EXTI 分发回调（覆写 __weak 版本）。ISR 里**只自增**，绝不碰 I2C ——
+ * 位拍 I2C 一次要 ~210 µs，放 ISR 会严重拖长中断、干扰音频滴灌与渲染。 */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == GT9XXX_INT_GPIO_PIN)
+    {
+        g_tp_int_count++;
+    }
 }
 
 void touch_port_poll(void)
@@ -153,6 +221,39 @@ void touch_port_poll(void)
 
     g_poll_stage = 2;
 
+    /* ---- INT 门控：空闲时不碰 I2C（省下每帧 ~210 µs 的位拍事务）----
+     * 三个判据满足任一即"本拍要真读 I2C"：
+     *   ① 中断计数变了（GT9xxx 说有新报告，紧接着就来）；
+     *   ② 上一拍判为按住中（逐帧采样：拖动要平滑，抬起要能及时测到）；
+     *   ③ 空闲心跳到期（纯兜底：即便 EXTI 没动静，延迟也不劣于旧版）。 */
+    {
+        uint8_t need = 0;
+
+        if (g_tp_int_count != s_tp_int_seen)
+        {
+            s_tp_int_seen = g_tp_int_count;   /* 用"计数变化"而非"标志位"，避免与 ISR 抢标志 */
+            need = 1;
+        }
+        else if (s_tp_active)
+        {
+            need = 1;
+        }
+        else if (++s_tp_idle_cnt >= g_tp_poll_period)
+        {
+            s_tp_idle_cnt = 0;
+            need = 1;
+        }
+
+        if (need == 0)
+        {
+            g_tp_poll_skip++;
+            g_poll_stage = 4;
+            return;                            /* 空闲：跳过 I2C（上一拍已发过抬起）*/
+        }
+    }
+
+    g_tp_scan_count++;
+
     /* gt9xxx_scan(0) = 返回**屏幕坐标**（1 则返回物理坐标）；
      * 返回非 0 表示本次扫描有有效触点，坐标在 tp_dev.x[0] / tp_dev.y[0]。 */
     if (gt9xxx_scan(0) != 0)
@@ -166,6 +267,8 @@ void touch_port_poll(void)
             g_tp_points++;
             g_tp_last_x = x;
             g_tp_last_y = y;
+            s_tp_active   = 1;                 /* 进入按住：下一拍逐帧强制扫描 */
+            s_tp_idle_cnt = 0;
             YMGUI_Inject_Pointer((GYcoord)x, (GYcoord)y, 1);   /* 按下 */
             g_inject_ok++;
             g_poll_stage = 4;
@@ -174,6 +277,7 @@ void touch_port_poll(void)
     }
 
     g_poll_stage = 3;
+    s_tp_active = 0;                           /* 本拍无有效触点 */
 
     if (g_tp_inject_enable == 0)
     {
