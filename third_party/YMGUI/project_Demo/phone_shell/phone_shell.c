@@ -104,6 +104,7 @@ static GYcoord drag_origin_y;
 static GYpx* snapshots[APP_COUNT];
 static GYpx *test_frame, *test_reference;
 static void (*display_flush)(struct GYdisp*, const GYrect*, const GYpx*);
+static void home_music_title_sync(void);   /* 桌面音乐卡片标题：实时跟随当前曲目 */
 
 /* 关机面板可见性诊断量（2026-10-04，供 tools/ribbon_check.py 读）。
  * ⚠ 为什么不用 scene 判"面板有没有打开"：scene 枚举里 4 是 SHUTDOWN
@@ -947,6 +948,11 @@ static void advance(uint32 elapsed)
 	if (elapsed > 100)
 		elapsed = 100;
 	PhoneApps_Tick(elapsed);
+	/* 桌面音乐卡片标题实时跟随当前曲目。
+	 * 起播/暂停/停止由 PhoneHost_MusicChanged 即时更新；切歌等"播放状态没变、
+	 * 但曲目变了"的情形靠这条周期同步兜底（if_changed 幂等，内容不变不置脏）。 */
+	if (scene == HOME)
+		home_music_title_sync();
 	if (scene == BOOT)
 	{
 		phase_elapsed += (int)elapsed;
@@ -2140,12 +2146,28 @@ void PhoneHost_Capture(GYpx* pixels)
 	YMGUI_Refresh(ctx);
 	capture_target = NULL;
 }
+/* 桌面音乐卡片标题：实时显示"当前正在播放的文件标题"。
+ * 有曲目（在播/暂停）→ 文件名；无 → 回落默认占位文案。
+ * ⚠ 用 PhoneUI_text_if_changed（按 label 当前内容比较）——周期调用也只在真变化时置脏。 */
+static void home_music_title_sync(void)
+{
+	char name[48];
+
+	if (home_music_title == NULL)
+		return;
+	if (BoardMusic_CurrentName(name, (int)sizeof(name)) != 0 || name[0] == 0)
+		PhoneUI_text_if_changed(home_music_title, T("晚间海浪"));
+	else
+		PhoneUI_text_if_changed(home_music_title, name);
+}
+
 void PhoneHost_MusicChanged(int playing)
 {
 	if (mini_music_button)
 		PhoneUI_button_icon(mini_music_button, playing ? ICON_PAUSE : ICON_PLAY);
 	if (home_music_status)
 		PhoneUI_text_set(home_music_status, playing ? T("Yaomi 音乐 / 播放中") : T("Yaomi 音乐 / 已暂停"));
+	home_music_title_sync();
 }
 
 /* ===========================================================================
@@ -2180,7 +2202,10 @@ void PhoneHost_RefreshLanguage(void)
 	if (home_date != NULL)         { PhoneUI_text_set(home_date, net_date()); }
 	if (home_widget_title != NULL) { PhoneUI_text_set(home_widget_title, T("给生活留一点空白")); }
 	if (home_count != NULL)        { PhoneUI_text_set(home_count, net_weather()); }
-	if (home_music_title != NULL)  { PhoneUI_text_set(home_music_title, T("晚间海浪")); }
+	/* 桌面音乐卡片标题：曲目名是实时数据（当前正在播放的文件），
+	 * 别像其他固定文案那样写死占位 —— 否则切语言会把真值覆盖掉
+	 * （与上面日期/天气同一个坑）。 */
+	home_music_title_sync();
 	if (home_music_status != NULL) { PhoneUI_text_set(home_music_status, T("Yaomi 音乐 / 已暂停")); }
 
 	/* 最近任务页 */

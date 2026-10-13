@@ -64,6 +64,12 @@ uint32_t wav_play_total_ms(void);
  */
 int      wav_play_seek_ms(uint32_t ms);
 
+/**
+ * @brief  当前（在播/暂停）曲目的显示名（路径末段，含扩展名）
+ * @return 0 = 有当前曲目；<0 = 没有（停止/从未起播），此时 out 置空串。
+ */
+int      wav_play_current_name(char *out, int n);
+
 /* ---- SWD 可读诊断量 ---- */
 extern volatile int32_t  g_wav_rc;       /* 0=OK；<0 = 失败（取值表见 wav_play_start 注释）*/
 extern volatile uint32_t g_wav_state;    /* 0 停 / 1 播 */
@@ -91,5 +97,6 @@ int         BoardMusic_Seek(uint32_t ms);  /* 跳播到指定毫秒（拖动进�
 int         BoardMusic_Pause(void);        /* 暂停（保留文件/位置，可续播）*/
 int         BoardMusic_Resume(void);       /* 从暂停处续播 */
 int         BoardMusic_Paused(void);       /* 1 = 有暂停会话待续播 */
+int         BoardMusic_CurrentName(char *out, int n); /* 当前在播/暂停曲目名（停止返回 <0）*/
 
 #endif /* WAV_PLAY_H */

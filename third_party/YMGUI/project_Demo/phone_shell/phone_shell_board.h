@@ -200,6 +200,7 @@ int         BoardMusic_Seek(uint32_t ms);           /* 跳播到指定毫秒（�
 int         BoardMusic_Pause(void);                 /* 暂停：停出音但保留文件句柄与位置（可续播）*/
 int         BoardMusic_Resume(void);                /* 从暂停处（或暂停后 seek 到的新位置）续播 */
 int         BoardMusic_Paused(void);                /* 1 = 有暂停会话（可续播），0 = 无 */
+int         BoardMusic_CurrentName(char* out, int n);/* 当前在播/暂停曲目名（停止返回 <0，out=""）*/
 
 /* ---- 输入法自测（SWD 触发，无需碰屏）----
  * 板上没有物理键盘也没有 stdio，"看着屏幕上有没有候选"不算可靠判据。

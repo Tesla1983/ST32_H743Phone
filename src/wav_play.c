@@ -32,6 +32,25 @@ static void path_copy(char *dst, int n, const char *src)
     dst[i] = 0;
 }
 
+/* 取路径最后一段（文件名）——桌面卡片的"正在播放"标题用。 */
+static const char *path_basename(const char *p)
+{
+    const char *b = p;
+
+    if (p == NULL)
+    {
+        return "";
+    }
+    for (; *p != 0; ++p)
+    {
+        if (*p == '/')
+        {
+            b = p + 1;
+        }
+    }
+    return b;
+}
+
 /* ---- 诊断量 ---- */
 volatile int32_t  g_wav_rc       = 99;   /* 0=OK；<0 = 打开/播放失败（见 wav_play.h 的取值表）*/
 volatile uint32_t g_wav_state    = 0;    /* 0 停 / 1 播 / 2 暂停 */
@@ -49,6 +68,7 @@ volatile uint32_t g_wav_test = 0;
 
 static FIL  s_f;
 static char s_path[IMG_PATH_MAX];
+static char s_cur_name[48];   /* 当前曲目显示名（路径末段）——桌面卡片"正在播放"标题用 */
 static uint8_t s_opened;
 static uint32_t s_data_off;   /* data chunk 在文件里的起始偏移（seek 用，0 = 还没解析头）*/
 
@@ -256,6 +276,8 @@ int wav_play_start(const char *path)
 
     g_wav_state = 1u;
     g_wav_rc    = 0;
+    /* 记当前曲目名（路径末段），供桌面卡片实时显示"正在播放"标题。 */
+    path_copy(s_cur_name, (int)sizeof(s_cur_name), path_basename(path));
     return 0;
 }
 
@@ -270,6 +292,7 @@ void wav_play_stop(void)
     }
     g_wav_state = 0u;
     g_wav_pos   = 0u;
+    s_cur_name[0] = 0;            /* 停止后没有"当前曲目" ⇒ 桌面卡片回落到占位文案 */
 }
 
 /* 暂停：停出音，但**保留文件句柄与 g_wav_pos**（与 stop 的区别就在这儿）。
@@ -494,4 +517,26 @@ int BoardMusic_Resume(void)
 int BoardMusic_Paused(void)
 {
     return wav_play_paused();
+}
+
+/* 当前（在播/暂停）曲目的显示名 —— 桌面卡片"正在播放"标题用。
+ * 停止（state==0）后没有当前曲目 ⇒ 返回 <0 且 out 置空串。 */
+int wav_play_current_name(char *out, int n)
+{
+    if (out == NULL || n <= 0)
+    {
+        return -1;
+    }
+    if (g_wav_state == 0u || s_cur_name[0] == 0)
+    {
+        out[0] = 0;
+        return -1;
+    }
+    path_copy(out, n, s_cur_name);
+    return 0;
+}
+
+int BoardMusic_CurrentName(char *out, int n)
+{
+    return wav_play_current_name(out, n);
 }

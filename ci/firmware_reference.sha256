@@ -1225,5 +1225,33 @@
 #   · 实拖待测：播放→暂停→拖动到某处→播放，应从新位置续播而非从头。
 #   ⚠ 未做在板自动化：暂停/续播/拖动都是触摸交互，SWD 无法模拟，最终靠人手目测。
 # FLASH 1 656 996 B（79.01%），比补丁1 +216 B。
-71ba7a31fe6e342b27c1a7ed0fb2d30ed00eb079b6fdcf9459f2eefc73cb57c9  ymgui-h743.bin
-9b217aa0de0294413d9e7eeff36a458b5dbbf5e7e303b55b66d93338795cf3d9  ymgui-h743.elf
+# 旧哈希（第三十版·补丁2，已停用）：
+# 71ba7a31fe6e342b27c1a7ed0fb2d30ed00eb079b6fdcf9459f2eefc73cb57c9  ymgui-h743.bin
+# 9b217aa0de0294413d9e7eeff36a458b5dbbf5e7e303b55b66d93338795cf3d9  ymgui-h743.elf
+
+# ============================================================================
+# 第三十版·补丁3（2026-10-13）· 桌面音乐卡片标题实时显示「当前播放的文件名」
+# ============================================================================
+# 为什么变（按「更新时机」的 a：有意为之的功能改动；工具链 14.3.rel1 未变）：
+#   桌面 dock 的音乐卡片标题原为写死的假文案 T("晚间海浪")。本次改成**实时显示
+#   "当前正在播放的文件标题"**：
+#     1. src/wav_play.c：新增 static s_cur_name[48] —— 在 wav_play_start 成功后记
+#        路径末段（path_basename）；wav_play_stop 清空（停止后没有"当前曲目"）。
+#        新增 wav_play_current_name() 与 board 层 BoardMusic_CurrentName(out,n)：
+#        在播(g_wav_state==1)/暂停(==2) 返回曲目名，停止返回 <0 且 out=""。
+#        （pause 保留 s_cur_name ⇒ 暂停态卡片仍显示曲目名，符合"当前曲目"语义。）
+#     2. phone_shell.c：
+#        · 新增 home_music_title_sync()：有曲目→曲目名，无→回落占位 T("晚间海浪")；
+#          一律用 PhoneUI_text_if_changed（按 label 当前内容 strcmp，幂等、不变不置脏）。
+#        · PhoneHost_MusicChanged() 里调用（起播/暂停/停止即时更新）。
+#        · advance() 在 scene==HOME 时每拍调用（兜底「切歌」等"播放状态没变、曲目变了"）。
+#        · PhoneHost_RefreshLanguage() 里原本把该标题写死成 T("晚间海浪")——
+#          改为调 home_music_title_sync()，否则切语言会把正在播放的真曲名覆盖掉
+#          （与日期/天气同一个坑，见该函数内注释）。
+#   ⚠ 数据来源与音乐 app 内一致（img_scan_name 的同名文件名，含扩展名），两页显示统一。
+# 验收：
+#   · 编译通过（16/16，FLASH 1 657 284 B / 79.03%，比补丁2 +288 B，零新增告警）；
+#   · 在板目测：起播/切歌/暂停后桌面卡片标题随之变；停止后回落占位。
+# FLASH 1 657 284 B（79.03%），比补丁2 +288 B。
+434b3d63ff0f063c8db6cddff0716af6bd7cfea79cdefd1f4e4f3632607dd547  ymgui-h743.bin
+b88c9feebf3c5b7de15b5439b0dc70a7040d7aab31d9fdb95c0fca6ba18e592c  ymgui-h743.elf
