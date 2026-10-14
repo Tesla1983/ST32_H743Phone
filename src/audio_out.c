@@ -168,6 +168,7 @@ volatile uint32_t g_ao_resume_calls = 0u;  /* 续播（起播）动作被真正�
 #define RING_HALFWORDS   8192u
 #define RING_MASK        (RING_HALFWORDS - 1u)
 #define RING_HALF_FRAMES (RING_HALFWORDS / 4u)      /* 2048 帧 = 4096 半字 */
+#define RING_QUARTER_FRAMES (RING_HALF_FRAMES / 2u) /* 1024 帧 = 2048 半字（补丁14）*/
 static uint16_t AUDIO_BUF_ATTR s_ring[RING_HALFWORDS];
 /* feeder 的落脚点（连续缓冲，补完再拷进 ring）—— 2048 帧 × 4 B = 8 KB */
 static int16_t  AUDIO_BUF_ATTR s_tmp[RING_HALF_FRAMES * 2u];
@@ -712,36 +713,42 @@ static void ring_put(const int16_t *src, uint32_t halfwords)
     }
 }
 
-/* 补半个环（2048 帧 = 4096 半字）。feeder 给不满就补静音，绝不留下上一首的残影。 */
-static void pump_half(void)
+/* 补 N 帧（N ≤ RING_HALF_FRAMES）。feeder 给不满就补静音，绝不留下上一首的残影。
+ * ★ 2026-10-14（补丁14）：由 pump_half() 拆出可变量版本 —— 理由见下方补数判据的注释。 */
+static void pump_frames(uint32_t frames)
 {
     uint32_t got = 0;
     int      n   = -1;
 
     if (s_feeder != NULL)
     {
-        n = s_feeder(s_tmp, RING_HALF_FRAMES);
+        n = s_feeder(s_tmp, frames);
     }
     if (n > 0)
     {
         got = (uint32_t)n;
     }
-    if (got > RING_HALF_FRAMES)
+    if (got > frames)
     {
-        got = RING_HALF_FRAMES;
+        got = frames;
     }
-    if (got < RING_HALF_FRAMES)
+    if (got < frames)
     {
-        memset(&s_tmp[got * 2u], 0, (RING_HALF_FRAMES - got) * 4u);
+        memset(&s_tmp[got * 2u], 0, (frames - got) * 4u);
         if ((s_feeder != NULL) && (s_demo_left == 0u))
         {
             g_ao_underrun++;             /* 数据供不上（卡慢/播到最后一段）*/
             g_ao_under_feed++;           /* ⚠ 与 ① 分开计：多数只是短读/尾巴，听不出来 */
         }
     }
-    ring_put(s_tmp, RING_HALF_FRAMES * 2u);
+    ring_put(s_tmp, frames * 2u);
     g_ao_pump++;
 }
+
+/* 补半个环（2048 帧 = 4096 半字）/ 补 1/4 个环（1024 帧 = 2048 半字）。 */
+static void pump_half(void)    { pump_frames(RING_HALF_FRAMES); }
+static void pump_quarter(void) { pump_frames(RING_QUARTER_FRAMES); }
+
 
 /* ====================== 内置正弦自检（不碰 TF 卡）=======================
  * 【为什么需要它】"codec + I2S + 心跳" 能不能响，与"卡上有没有 WAV、WAV 解析对不对"
@@ -1322,20 +1329,40 @@ void audio_out_tick(void)
         return;
     }
 
-    /* 补数：环形缓冲里剩的不超过半个环就补半个环（≈42 ms 的量，主循环一拍 16 ms 足够）。 */
+    /* 补数：**只要环里还有空间就补**，把环尽可能维持在"接近满"。
+     *
+     * 【2026-10-14 补丁14：为什么把判据从"占用 ≤ 半环"改成"剩余空间 ≥ 1/4 环"】
+     *   旧判据 `used <= 半环 ⇒ 补半环` 让环占用长期停在 **0~4096 半字（0~42 ms）**，而 DMA 的
+     *   消耗是**成批**的（每次半传/全传中断一次性取走 2048 半字）：实测（tools/tim6_vs_dma_check.py，
+     *   同一段音乐、同一次干扰）环占用在 0 与 4096 之间摆动、**最低到 0** ⇒ 主循环只要耽误一拍，
+     *   下一次 dma_fill_half 就找不到 2048 半字，只能把尾部**填硬 0**（一次 2048 半字 = 21 ms
+     *   电平跳变块 = 一声"咔"）。
+     *   对照：TIM6 路径的消耗是**逐个半字**的（ISR 每次只写 1 个），同样干扰下环最低水位实测
+     *   2304 半字、缺口 0 —— 这就是"同样一次供数失误，两条路径代价差 2048 倍"的由来。
+     *   新判据下环稳定在 6144~8192 半字（63~84 ms），扛得住约 3 次连续的半缓冲补数，
+     *   即主循环被堵 ~63 ms 也不破音（旧设计余量 = 0）。 */
     {
-        uint32_t used = s_wr - s_rd;
+        uint32_t used  = s_wr - s_rd;
+        uint32_t space = RING_HALFWORDS - used;
 
-        /* 补丁12：记录播放期环占用的**最小值** —— 它就是"抗主循环卡顿的垫子"。
-         * 起播铺满整环 + DMA 拿 4096 后，这里应当稳定 ≥ 4096（42 ms）；
-         * 若掉到接近 0，说明某一拍被堵得太久，下一次半传中断就会填静音。 */
+        /* 补丁12：记录播放期环占用的**最小值** —— 它就是"抗主循环卡顿的垫子"。 */
         if (used < g_ao_ring_used_min)
         {
             g_ao_ring_used_min = used;
         }
-        if (used <= (RING_HALFWORDS / 2u))
+        /* 空间够补半环就补半环；只剩 1/4 环的空间就补 1/4 —— 绝不因"没地方放"而放弃补数
+         * （放弃补数 = 环就地见底 = 下一拍就可能填硬 0）。 */
+        if (space >= (RING_HALF_FRAMES * 2u))
         {
             pump_half();
+            if (g_ao_t_pump1_ms == 0u)
+            {
+                g_ao_t_pump1_ms = HAL_GetTick() - g_ao_t_cstart_ms;
+            }
+        }
+        else if (space >= (RING_QUARTER_FRAMES * 2u))
+        {
+            pump_quarter();
             if (g_ao_t_pump1_ms == 0u)
             {
                 g_ao_t_pump1_ms = HAL_GetTick() - g_ao_t_cstart_ms;
