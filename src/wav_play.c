@@ -67,6 +67,21 @@ volatile uint32_t g_wav_read_ms  = 0;    /* 最近一次半缓冲补数的耗时
  * 与 audio_out.c 的 g_ao_demo 同构，供 tools/wav_play_check.py 用 SWD 触发验收。 */
 volatile uint32_t g_wav_test = 0;
 
+/* ★ 补丁15d：板上执行的「暂停 → N ms → 续播」突发，专门用来测**快速连点**那条幂等分支。
+ *
+ * 【为什么必须放板上】`probe-rs write` 每次都要 spawn 一个进程，实测单次 ≈ 400 ms；
+ *   而暂停淡出只有 AO_PAUSE_FADE_TICKS(12) 拍 × 主循环 16.98 ms ≈ **204 ms**
+ *   ⇒ 主机两次写之间的真实间隔**必然**大于淡出窗口 ⇒ 永远落不进 `audio_out_start()`
+ *   的幂等分支（`tools/rapid_stop_start_check.py` 实测 5/5 轮"空测"就是这个原因，
+ *   不是固件缺陷）。把整段交给板子做，间隔才真的可控。
+ * 用法：写 `g_wav_test = 5`；板子下一拍 `wav_play_pause()`，`g_wav_burst_ms` 毫秒后
+ *   `wav_play_resume()`，成功则 `g_wav_burst_done++`。判据看 `g_ao_idem_cancel` 增量。 */
+volatile uint32_t g_wav_burst_ms   = 30u;   /* ★ 补丁15d：暂停→续播的间隔（毫秒）*/
+volatile uint32_t g_wav_burst_done = 0u;    /* ★ 补丁15d：板上突发成功完成的次数 */
+static uint8_t    s_burst_stage    = 0u;
+static uint32_t   s_burst_deadline = 0u;
+
+
 /* ====================== 验收用「相位锁存」（2026-10-13）======================
  * 【为什么要有它】版本迭代到补丁 8 后，验收脚本要在"暂停 → 续播"之后的稳态读
  *   十几个诊断量。每个量一次 `probe-rs read` = **一次内核 halt**；而 I2C 是阻塞式
@@ -475,6 +490,26 @@ void wav_play_tick(void)
     {
         g_wav_test = 0u;
         (void)wav_play_resume();
+    }
+    /* ★ 补丁15d：板上「暂停 → g_wav_burst_ms → 续播」突发（测快速连点的幂等分支）。
+     * 分两拍做：本拍发起暂停并记截止时刻，之后每拍检查 → 到点续播。
+     * 中间那段**主循环照常跑** ⇒ 淡出 tick 正常推进，与真人连点的时序一致。 */
+    else if (g_wav_test == 5u)
+    {
+        g_wav_test = 0u;
+        if (wav_play_pause() == 0)
+        {
+            s_burst_stage    = 1u;
+            s_burst_deadline = HAL_GetTick() + g_wav_burst_ms;
+        }
+    }
+    if ((s_burst_stage == 1u) && ((int32_t)(HAL_GetTick() - s_burst_deadline) >= 0))
+    {
+        s_burst_stage = 0u;
+        if (wav_play_resume() == 0)
+        {
+            g_wav_burst_done++;
+        }
     }
 
     /* 验收"相位锁存"（见文件头说明）：主机写 g_wav_snap_req=<相位码>，这里在**下一拍**

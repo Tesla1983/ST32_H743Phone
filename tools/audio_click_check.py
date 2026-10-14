@@ -24,7 +24,10 @@
 ------------------------------------------
   C1 起播 + 稳态：g_ao_under_dma == 0        —— 没有"会听到的"静音填充
      （起播窗口本身就含一次探针写 + 若干读 ⇒ 旧固件在这里稳定 +6，新固件 0；见上文）
-  C2 垫子：g_ao_ring_used_min >= 4096        —— 起播铺满整环后，抗卡顿余量始终 ≥42 ms
+  C2 每个半缓冲都基本补满：窗口内 Δframes/Δ(半传+全传) >= 900（真值 1024）
+     ⚠ 分子分母必须**同一窗口的增量**（旧写法用会话累计值，两者分开读 ⇒ 802~964 乱漂，
+       见下方 ② 段的注释）。它才是"环有没有饿到 DMA"的判据；ring_used_min 瞬时到 0
+       是正常的（半传刚取走最后一块）。
   C3 起播补数及时：0 < g_ao_t_pump1_ms <= 60 —— 起播后第一拍就补上，不是几十毫秒后
   C4 DMA 无异常停顿：g_ao_dma_gap_max <= 43000（HT→HT 正常就是 ≈42 000，见 audio_out.h）
   C5 UDR 自恢复未发生：g_ao_udr == 0
@@ -82,25 +85,42 @@ def main():
           % (d[T_PUMP1], d[T_DACWAKE], bench.rd("g_ao_t_ramp_ms", 1)[0]))
     print("  垫子下限 g_ao_ring_used_min=%d 半字（=%.0f ms）" % (d[RING_MIN], d[RING_MIN] / 48.828))
     print("  g_ao_frames=%d（≈%.2f s 音频）" % (frames, frames / 48828.0))
+    # ★ 补丁15：把"数据出口"的量度也打出来（seam = 跨半缓冲接缝的样本跳变，
+    #   是"咔"最直接的量度；feed_sh = feeder 单次短读缺口帧数）
+    e3 = bench.rd("g_ao_dbg3", 16)
+    print("  ★出口：seam_max=%d seam_n=%d feed_short_max=%d tz_run_max=%d  停:发起=%d 收尾=%d"
+          % (e3[0], e3[1], e3[3], e3[2], e3[7], e3[8]))
     start = dict(dma=d[UNDER_DMA], feed=d[UNDER_FEED], short=d[UNDER_SHORT],
-                 ring_min=d[RING_MIN], pump1=d[T_PUMP1], gap=d[0], frames=frames)
+                 ring_min=d[RING_MIN], pump1=d[T_PUMP1], gap=d[0], frames=frames,
+                 first_ms=d[UNDER_FIRST], seam_max=e3[0], seam_n=e3[1],
+                 feed_sh=e3[3], stop_calls=e3[7], stop_done=e3[8])
 
     print("\n=== ② 稳态 20 s（真实播放，无起播扰动）===")
+    # ★ 判据口径修正（补丁15c）：C2 的**分子与分母必须在同一时刻取**。
+    #   旧写法是 "会话累计 frames ÷ 会话累计 (half+cplt)"，而这两组量在脚本里是**分开读**的
+    #   （probe-rs 每次读写都会停机内核，而 DMA 是独立总线主设备、停机期间照跑）
+    #   ⇒ 分母被多计了"两次读之间跑掉的中断"。板上实测该比值在 802~964 之间漂
+    #   （真值恒为 1024：每个半传正好搬 2048 半字 = 1024 帧，两端增量测算为 1024.0）
+    #   ⇒ 会随读数快慢假报 FAIL。改成**窗口两端各取一次增量**，比值才是固件行为。
+    f0 = bench.rd("g_ao_frames", 1)[0]
+    h0 = bench.rd("g_ao_dma_half", 1)[0]
+    c0 = bench.rd("g_ao_dma_cplt", 1)[0]
     time.sleep(20.0)
     d2 = dbg()
     f2 = bench.rd("g_ao_frames", 1)[0]
+    half = bench.rd("g_ao_dma_half", 1)[0]
+    cplt = bench.rd("g_ao_dma_cplt", 1)[0]
     wu = bench.rd("g_wav_underrun", 1)[0]
     rd_ = bench.rd("g_ao_ring_drop", 1)[0]
     udr = bench.rd("g_ao_udr", 1)[0]
     gap = bench.rd("g_ao_dma_gap_max", 1)[0]
     print("  20 s 增量：under_dma=+%d  under_feed=+%d  under_short=%d"
           % (d2[UNDER_DMA] - start["dma"], d2[UNDER_FEED] - start["feed"], d2[UNDER_SHORT]))
-    half = bench.rd("g_ao_dma_half", 1)[0]
-    cplt = bench.rd("g_ao_dma_cplt", 1)[0]
-    ratio = f2 / max(1, half + cplt)
+    ratio = (f2 - f0) / max(1, (half - h0) + (cplt - c0))
     print("  ring_used_min=%d 半字（瞬时；到 0 正常）  frames=%d（Δ=%d）"
           % (d2[RING_MIN], f2, f2 - start["frames"]))
-    print("  半传+全传中断=%d+%d ⇒ 平均每个半缓冲补 %d 帧（满值 1024）" % (half, cplt, ratio))
+    print("  窗口内 半传+全传中断=%d+%d ⇒ 平均每个半缓冲补 %d 帧（满值 1024）"
+          % (half - h0, cplt - c0, ratio))
     print("  g_wav_underrun=%d  g_ao_ring_drop=%d  g_ao_udr=%d  gap_max=%d µs" % (wu, rd_, udr, gap))
 
     print("\n=== ③ 停止 → 再播：REG31 解静音闭环 ===")
@@ -141,11 +161,20 @@ def main():
         ("C7 读卡不断供（g_wav_underrun == 0）", wu == 0),
         ("C8 停止后再播已解静音（REG31 bit6/5 == 0）", (mute & 0x60) == 0),
         # ★ 补丁13 新增两条：直指用户报的"爆音"
-        #   C9：切时钟之前"静音"必须是**被确认**的，而不是"写了就算"。I2C 写会失败
-        #       （实测首试 NACK 5%~30%，失败环里 0x31 静音/0x32 音量命中最多），
-        #       "写了就算"= 有相当概率在满音量下切时钟 ⇒ 直流阶跃 ⇒ 那声爆音。
-        ("C9 静音已确认（REG32 回读==0 且 REG31 bit6/5==1，且无未确认记录）",
-         (sil_vol == 0) and ((sil_mute & 0x60) == 0x60) and (sil_ng == 0) and (sil_fail == 0)),
+        #   C9：切时钟之前"淡出"必须是**被确认**的，而不是"写了就算"。I2C 写会失败
+        #       （实测首试 NACK 5%~30%），"写了就算"= 有相当概率在满音量下切时钟
+        #       ⇒ 直流阶跃 ⇒ 那声爆音。
+        # ★★ 补丁15 判据修正（有据，不是放宽）★★
+        #   补丁13 起 C9 还要求「REG31 bit6/5==1（数字静音已置位）」。补丁15 已**证伪**
+        #   那个前提：REG31 的 DSMMUTE/DEMMUTE 是"把 ΣΔ 调制器输入即时钳 0"，
+        #   对模拟输出来说**本身就是一次阶跃 = 那声咔**。所以它不再被当作"消爆音手段"，
+        #   `es8311_dac_become_silent()` 从此**只写 REG32**（靠硬件软 ramp 平滑渐弱）。
+        #   ⇒ C9 现在的正确口径是：**REG32 确实归零（渐弱会走完）且没有任何未确认记录**；
+        #     而"调制器没有被硬切"这一条独立成 C11。
+        ("C9 淡出已确认（REG32 回读==0，且无未确认记录）",
+         (sil_vol == 0) and (sil_ng == 0) and (sil_fail == 0)),
+        ("C11 切钟前未对调制器做数字硬切（REG31 bit6/5 == 0；补丁15 消咔不变量）",
+         (sil_mute & 0x60) == 0),
         #   C10：正常播放/停止**不再给 codec 断电**。es8311_stop_dac() 的掉电尾会把
         #        内部参考 VREF(REG0D bit2) 与 VMIDSEL 一起断掉，"基准塌掉 → 重建"会在
         #        输出耦合电容上产生一次低频台阶（几十毫秒的"咚/噗"）—— 那是模拟域的台阶，

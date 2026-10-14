@@ -144,6 +144,39 @@ volatile uint32_t g_ao_csusp_ms_max = 0u;  /* ★ 补丁13：i2s_stop() 里"等�
 volatile uint32_t g_ao_csusp_tmo = 0u;     /* ★ 补丁13：上面那段等满 100 ms 兜底才 break 的次数 */
 volatile uint32_t g_ao_resume_calls = 0u;  /* 续播（起播）动作被真正执行的次数 */
 
+/* ================= 2026-10-14（补丁15）：把"咔"变成可读数字 =================
+ * 【为什么要新加一组量】前面几轮修"咔"用的都是**间接代理量**：
+ *   `g_ao_under_short`（有没有填硬零）、`g_ao_silent_*`（静音确认成没成）、
+ *   `g_ao_dma_gap_max`（DMA 停顿多长）。这些量都只能覆盖**某一类**成因。
+ *   而"咔"的物理定义只有一条：**送进 DAC 的样本流里出现了不该有的阶跃**。
+ *   ⇒ 这一轮直接量它：
+ *     `g_ao_seam_max`  DMA 路径：本次半缓冲的**首样本**与上一半缓冲**末样本**之差
+ *                      （正常音乐是连续流，这块接缝应当 ≈ 相邻样本差，不会突跳）；
+ *     `g_ao_tz_run_max` TIM6 路径：送进 TXDR 的**最长连续零**（半字）——
+ *                      TIM6 是逐字流，没有"接缝"，但它若吃到一整块零，一样是阶跃；
+ *     `g_ao_feed_short_max` feeder 单次短读的**最大缺口（帧）**——
+ *                      旧代码在 got<frames 时会把剩下的**整块 memset 成 0** 再放进环，
+ *                      一次就是 1024~2048 帧（21~42 ms）的**人为硬零块**，而这条路径
+ *                      **既不计缺口也不报错**（只 +1 次 g_ao_under_feed）⇒ 是"看不见的坏状态"。
+ * 【判读口径】
+ *   · `g_ao_seam_max` 大（>30000）且 `g_ao_seam_n` 涨 ⇒ 半缓冲接缝处有**人工断口**；
+ *   · `g_ao_tz_run_max >= 512`（≈5 ms）⇒ TIM6 吃到成块零；
+ *   · `g_ao_feed_short_max == 1024/2048` ⇒ 读卡短读到了"整块"级别，旧代码会合成零块。*/
+#define AO_SEAM_BIG 30000   /* 跨半缓冲接缝"人工断口"判据（16 位满幅 32767 的 92%）*/
+volatile uint32_t g_ao_stop_calls  = 0u;   /* ★ 补丁15：audio_out_stop() 真正发起淡出的次数 */
+volatile uint32_t g_ao_stop_done   = 0u;   /* ★ 补丁15：淡出走完、真正停掉传输的次数 */
+/* ★ 补丁15d：「起播落进"取消淡出"幂等分支」的**直接**计数（单调只增）。
+ * 为什么需要它：真实用户路径是**快速连点 暂停→播放**（走 wav_play_pause/resume），
+ * 而 pause 路径**不** ++g_ao_stop_calls、其淡出收尾也**不** ++g_ao_stop_done
+ * ⇒ 用 `stop_calls − stop_done` 反推幂等分支对这条路径**恒为 0**（不是漏测就是误判）。
+ * 直接在分支里 ++ 才是无歧义、无竞态的证据。 */
+volatile uint32_t g_ao_idem_cancel = 0u;
+volatile uint32_t g_ao_seam_max      = 0u;   /* DMA：跨半缓冲接缝的最大样本跳变（0~65535）*/
+volatile uint32_t g_ao_seam_n        = 0u;   /* DMA：上面这个跳变 > AO_SEAM_BIG 的次数 */
+volatile uint32_t g_ao_tz_run_max    = 0u;   /* TIM6：送进 TXDR 的最长连续零（半字）*/
+volatile uint32_t g_ao_feed_short_max = 0u;  /* feeder 单次短读最大缺口（帧；0 = 从未短读）*/
+volatile uint32_t g_ao_dbg3[16];             /* 上面几个量的"同一时刻"批读窗口 */
+
 /* 起播音量 ramp 的步数：8 步 × 主循环一拍（≈16 ms）≈ 130 ms 完成。
  * 步数太少压不住跳变、太多会让人听出"声音起得慢"，8 是折中。 */
 #define AO_VOL_RAMP_STEPS 8u
@@ -162,13 +195,34 @@ volatile uint32_t g_ao_resume_calls = 0u;  /* 续播（起播）动作被真正�
  *   es8311_dac_mute()，时钟断的瞬间 DAC 还满音量 ⇒ 输出电平瞬跳 ⇒ 那声"咔嗒"。 */
 #define AO_PAUSE_FADE_TICKS 12u
 
+/* ★ 补丁15c：**首次起播**时把"DAC 通路唤醒"推迟这么多毫秒（相对 CSTART）。
+ * 理由（板上实测，见 audio_out_start 里 s_wake_settle_ms 的注释）：首次起播刚做过
+ * REG00 软复位，唤醒那 20 笔 I2C 要重试 22 次、触发 29 次 bus clear、3 次熔断、
+ * 单笔最长 31.4 ms ⇒ 整段 110~129 ms，而 DMA 余量只有 ~37.5 ms ⇒ 一整个半缓冲被合成。
+ * 这 120 ms 里 I2S 在 REG32=0 下静音送数（听不见），主循环把环补满。
+ * ⚠ 只对"跑完整 init 的那一次"生效；续播/二次起播仍走"下一拍就唤醒"（实测 20~60 ms）。 */
+#define AO_WAKE_SETTLE_FIRST_MS 120u
+
 /* ---- 环形缓冲 → SRAM1 的 .bss_audio（MPU region0：非缓存）----
- * 8192 个半字 = 16 KB = 4096 帧 ≈ 84 ms 的音频；一次补半个环（2048 帧 ≈ 42 ms）。 */
+ * ★★ 补丁15c：8192 → **16384** 个半字（+16 KB）。 ★★
+ * 【为什么必须加深：旧注释里的 ms 数是错的】旧注释写"8192 半字 ≈ 84 ms"是按
+ *   "48828 Hz 立体声（97656 半字/s）"算的。板上实测（tools/bench.rd 两端读 + 真实
+ *   时间分母）：DMA 实际吃 **327 664 半字/s**（每半传 2048 半字用 **12.47 ms**，
+ *   `g_ao_dma_half` 在 6.00 s 里涨 481 次）⇒ 8192 半字只够 **25 ms**，
+ *   加上 DMA 乒乓缓冲的 4096 半字（12.5 ms）总共才 **37.5 ms** 余量。
+ *   而"起播第一拍唤醒 DAC"那段 codec 通路 I2C 在**首次起播**时实测要
+ *   **110~129 ms**（见下）⇒ 环必然被抽干 ⇒ 一整个半缓冲（2048 半字）被合成
+ *   （板上实测 ring_min=0、under_short=2048、首个欠载 @105 ms）。
+ * ⇒ 加深到 16384（50 ms）+ 起播**铺满整环**：起播余量 50+12.5 = 62.5 ms，
+ *   稳态垫子 25→50 ms。⚠ SRAM1 占用 68 KB → 84 KB（128 KB 的 66%）。
+ * ⚠ 为什么 RING_HALF_FRAMES/RING_QUARTER_FRAMES **不再**由 RING_HALFWORDS 推导：
+ *   它们是"**补数块**大小"（受 s_tmp 尺寸约束），与"环有多深"是两件事。
+ *   若继续按 /4 推导，环一加深 s_tmp 就跟着翻倍（+8 KB）——没必要。 */
 #define AUDIO_BUF_ATTR   __attribute__((section(".bss_audio"), aligned(32)))
-#define RING_HALFWORDS   8192u
+#define RING_HALFWORDS   16384u
 #define RING_MASK        (RING_HALFWORDS - 1u)
-#define RING_HALF_FRAMES (RING_HALFWORDS / 4u)      /* 2048 帧 = 4096 半字 */
-#define RING_QUARTER_FRAMES (RING_HALF_FRAMES / 2u) /* 1024 帧 = 2048 半字（补丁14）*/
+#define RING_HALF_FRAMES 2048u                      /* 补数块：2048 帧 = 4096 半字 */
+#define RING_QUARTER_FRAMES 1024u                   /* 补 1/4 块：1024 帧 = 2048 半字（补丁14）*/
 static uint16_t AUDIO_BUF_ATTR s_ring[RING_HALFWORDS];
 /* feeder 的落脚点（连续缓冲，补完再拷进 ring）—— 2048 帧 × 4 B = 8 KB */
 static int16_t  AUDIO_BUF_ATTR s_tmp[RING_HALF_FRAMES * 2u];
@@ -188,6 +242,22 @@ static volatile uint8_t  s_vol_ramp_left = 0u; /* 音量 ramp 剩余步数（0 =
 static volatile uint8_t  s_dac_rb_pending = 0u;/* "确认期"剩余尝试次数（见 tick；0 = 不在确认期）*/
 static volatile uint32_t s_rb_tick = 0u;       /* 播放中定期回读体检的节流计数（~1 s 一次）*/
 static volatile uint8_t  s_pause_fade_ticks = 0u;  /* 暂停淡出：写完 REG32=0 后，延几拍等 HW 软 ramp 落静音再停传输（0 = 不在淡出）*/
+static int32_t           s_dma_last = 0;      /* 补丁15：上一个半缓冲的末样本（接缝检测的前驱）*/
+static uint32_t          s_dma_wr_seq = 0u;   /* 补丁15：已写过的半缓冲个数（第 1 个没有前驱，不计接缝）*/
+static uint32_t          s_tz_run = 0u;       /* 补丁15：TIM6 当前连续零的个数（半字）*/
+/* ★ 补丁15：淡出走完后是"停"(1) 还是"暂停"(0)。
+ * audio_out_stop/pause 共用同一套"发起淡出 → 12 拍 → 停传输"的延时收尾（理由见
+ * audio_out_stop 顶部），两者的唯一区别就是这个标志：
+ *   暂停 = 保留 feeder 与 codec 通路（续播接着放）；
+ *   停止 = 淡出走完后断开 feeder。 */
+static volatile uint8_t  s_stop_after_fade = 0u;
+static int32_t           s_dma_hold = 0;      /* 补丁15：最后一次真正送出去的样本（缺口"冻结"的取值来源）*/
+/* ★ 补丁15c：上一块半缓冲是"合成（冻结）"出来的 ⇒ 本块开头要做 ramp-in 接回真实数据。 */
+static volatile uint8_t  s_gap_tail = 0u;
+/* ★ 补丁15c：起播后"允许唤醒 DAC"的最早时刻（相对 CSTART 的 ms）。
+ *   首次起播（要跑完整 init，内含 REG00 软复位）时非 0 —— 理由见 audio_out_start。
+ *   0 = 下一拍就唤醒（续播/二次起播，实测唤醒只要 20~60 ms）。 */
+static uint32_t          s_wake_settle_ms = 0u;
 
 static I2S_HandleTypeDef s_hi2s;        /* I2S2 = SPI2 的 I2S 模式 */
 static audio_out_feeder  s_feeder = NULL;
@@ -198,6 +268,9 @@ static audio_out_feeder  s_feeder = NULL;
 #define DMA_HALF_FRAMES   1024u
 #define DMA_HALF_HALFWORDS (DMA_HALF_FRAMES * 2u)         /* 2048 */
 #define DMA_TOTAL_HALFWORDS (DMA_HALF_HALFWORDS * 2u)     /* 4096 */
+/* ★ 补丁15c：缺口之后的第一块开头做 ramp-in 的样本数（半字）。
+ *   256 半字 ≈ 3 ms @ 实测吞吐 ⇒ 足够抹掉阶跃，又短到听不出来。 */
+#define DMA_RAMPIN        256u
 static uint16_t AUDIO_BUF_ATTR s_dma_buf[DMA_TOTAL_HALFWORDS];
 static DMA_HandleTypeDef s_hdma_tx;
 static uint8_t  s_dma_ready = 0u;
@@ -260,6 +333,18 @@ static void dbg_snapshot(void)
     g_ao_dbg[21] = g_ao_t_pump1_ms;
     g_ao_dbg[22] = g_ao_t_dacwake_ms;
     g_ao_dbg[23] = g_ao_ring_used_min;
+
+    /* 补丁15：把"咔"的直接量度放进第二个批读窗口（一次 read 走 g_ao_dbg3[16]）。 */
+    g_ao_dbg3[0] = g_ao_seam_max;
+    g_ao_dbg3[1] = g_ao_seam_n;
+    g_ao_dbg3[2] = g_ao_tz_run_max;
+    g_ao_dbg3[3] = g_ao_feed_short_max;
+    g_ao_dbg3[4] = s_dma_wr_seq;
+    g_ao_dbg3[5] = g_ao_under_short;
+    g_ao_dbg3[6] = (uint32_t)s_dma_last;
+    g_ao_dbg3[7] = g_ao_stop_calls;     /* 补丁15：发起了几次"停"（淡出）*/
+    g_ao_dbg3[8] = g_ao_stop_done;      /* 补丁15：淡出走完、真正停掉几次 */
+    g_ao_dbg3[9] = (uint32_t)s_dma_hold;/* 补丁15：缺口衰减的起点 */
 }
 
 /* ---- DMA 现场快照（2026-10-13）----
@@ -474,17 +559,33 @@ static void dma_fill_half(uint32_t half)
         dst[i] = s_ring[s_rd & RING_MASK];
         s_rd++;
     }
-    for (uint32_t i = avail; i < DMA_HALF_HALFWORDS; ++i)
-    {
-        dst[i] = 0u;
-    }
+    /* ★★ 补丁15c：缺口改成"**冻结**最后一个有效样本"（不再衰减到 0），缺口之后的
+     * 第一块开头再做一段 **ramp-in** 接回真实数据。 ★★
+     * 【为什么"衰减到 0"仍然不够（补丁15 首版的做法）】衰减在缺口**内部**是平滑的
+     *   （一阶差 ≤16 LSB ≈ -66 dB），但缺口的**结束处**是"0 → 音乐值"的跳跃：
+     *   |0 − next| 可以是满幅 ⇒ 那一声"咔"只是被推到了缺口尾部，并没有消失。
+     * 【为什么"冻结 + ramp-in"是干净的】
+     *   · 冻结：缺口首样本 == 缺口前的最后样本 ⇒ 起点**零阶跃**（C0 连续）；
+     *   · ramp-in：缺口后头 DMA_RAMPIN 个样本从冻结值线性过渡到真实数据 ⇒ 终点也零阶跃。
+     *   整段的听感是"短促的一顿"（这一块 ≈21 ms），而不是"咔"。这正是 TIM6 路径
+     *   **天然**的行为（TIM6 缺数据时 ISR 不写 ⇒ H7 的 I2S 重复上一采样 = 冻结），
+     *   也正是用户实测"走 TIM6 没有爆音"的物理原因 —— 本轮把 DMA 路径的行为对齐过去。
+     *   ⚠ 若这一块一颗数据都没有（avail==0）且此前从未出过声（s_dma_hold==0），
+     *     冻结值就是 0 ⇒ 与原来的填零完全等价（不会更差）。 */
     if (avail < DMA_HALF_HALFWORDS)
     {
-        /* ⚠ 这是**真会被听到**的一类欠载：尾部这些半字是硬 0，紧跟着前面真实音乐进 DAC
-         *   ⇒ 电平从任意值瞬跳到 0（再跳回来）⇒ 一声"咔"。缺口越大越明显。 */
+        uint16_t hold = (uint16_t)(int16_t)s_dma_hold;
+
+        for (uint32_t i = avail; i < DMA_HALF_HALFWORDS; ++i)
+        {
+            dst[i] = hold;
+        }
+        s_gap_tail = 1u;                /* 本块是合成的 ⇒ 下一块开头补 ramp-in */
+
+        /* ⚠ 这是**真会被听到**的一类欠载，仍然记账（判据口径不变，便于与历史对照）。 */
         uint32_t short_by = DMA_HALF_HALFWORDS - avail;
 
-        g_ao_underrun++;                /* 供不上：这一半尾部填静音 */
+        g_ao_underrun++;                /* 供不上：这一半尾部只能冻结补 */
         g_ao_under_dma++;
         if (short_by > g_ao_under_short)
         {
@@ -495,8 +596,50 @@ static void dma_fill_half(uint32_t half)
             g_ao_under_first_ms = HAL_GetTick() - g_ao_t_cstart_ms;
         }
     }
+    else if (s_gap_tail != 0u)
+    {
+        /* 上一块是"冻结"出来的 ⇒ 本块开头 DMA_RAMPIN 个样本从冻结值线性过渡到真实数据，
+         * 抹掉缺口结束处的阶跃。
+         * ⚠ 改的是**本块**（DMA 此刻正在读另一块），本块要等下一次半传才会被读到 ⇒ 安全。 */
+        uint32_t n = DMA_RAMPIN;
+
+        if (n > DMA_HALF_HALFWORDS) { n = DMA_HALF_HALFWORDS; }
+        if (n >= 2u)
+        {
+            int32_t h0 = s_dma_hold;
+
+            for (uint32_t i = 0u; i < n; ++i)
+            {
+                int32_t real = (int32_t)(int16_t)dst[i];
+                /* i=0 ⇒ 完全取 h0；i=n-1 ⇒ 完全取真实数据 ⇒ 两端都无阶跃 */
+                dst[i] = (uint16_t)(int16_t)((h0 * (int32_t)(n - 1u - i) + real * (int32_t)i)
+                                             / (int32_t)(n - 1u));
+            }
+        }
+        s_gap_tail = 0u;
+    }
+    if (avail > 0u)
+    {
+        s_dma_hold = (int32_t)(int16_t)dst[DMA_HALF_HALFWORDS - 1u];  /* 供下一块缺口做起点 */
+    }
     g_ao_push   += avail;
     g_ao_frames += (avail / 2u);        /* 2 个半字 = 1 帧 */
+
+    /* ★ 补丁15：跨半缓冲接缝检测（数据出口处的"咔"直接量度）。
+     * 为什么只测"本次首样本 − 上次末样本"：半缓冲**内部**的大跳变通常是音乐本身
+     * （鼓点/瞬态），无法与"故障"区分；而**这一处接缝**在正常播放中一定是连续的
+     * 音乐流 —— 出现大跳变只可能来自"人工断口"（块被填零 / 数据被跳过 / 环形缓冲被覆盖）。
+     * ⚠ 第 1 个半缓冲没有前驱（s_dma_wr_seq==0），不计。 */
+    if (s_dma_wr_seq != 0u)
+    {
+        int32_t dd = (int32_t)(int16_t)dst[0] - s_dma_last;
+
+        if (dd < 0) { dd = -dd; }
+        if ((uint32_t)dd > g_ao_seam_max) { g_ao_seam_max = (uint32_t)dd; }
+        if ((uint32_t)dd > (uint32_t)AO_SEAM_BIG) { g_ao_seam_n++; }
+    }
+    s_dma_wr_seq++;
+    s_dma_last = (int32_t)(int16_t)dst[DMA_HALF_HALFWORDS - 1u];
 }
 
 static void dma_half_cb(DMA_HandleTypeDef *h)
@@ -669,6 +812,14 @@ void TIM6_DAC_IRQHandler(void)
 
     if (s_wr == s_rd)
     {
+        /* ⚠ 这里**什么都不写**是正确的、也是 TIM6 相对 DMA 的结构性优势：
+         *   写/读指针相等 ⇒ 不往 TXDR 写 ⇒ H7 的 I2S 在 TXF 空时会**重复上一个采样**
+         *   ⇒ 输出电平**保持不变**，没有任何阶跃 ⇒ 一声"咔"都产生不了。
+         *   （DMA 路径做不到这一点：它一次搬 2048 个半字，缺数只能整块补，所以补什么
+         *     就等于输出什么 —— 补硬 0 就是 21 ms 的满幅阶跃。补丁15 已把那里改成
+         *     "线性衰减"，见 dma_fill_half。）
+         * ⚠ 因此 tz_run_max 量到的大段连续零**通常是曲目本身的开头静音**，不是故障：
+         *   判据请看 g_ao_feed_short_max / g_ao_under_short（那是"人为合成"的证据）。 */
         g_ao_isr_dry++;                 /* 缓冲空了：这次什么都不做（保持上一次的值/静音）*/
         return;
     }
@@ -687,7 +838,23 @@ void TIM6_DAC_IRQHandler(void)
         {
             break;
         }
-        *((volatile uint16_t *)&SPI2->TXDR) = s_ring[s_rd & RING_MASK];
+        {
+            uint16_t v = s_ring[s_rd & RING_MASK];
+
+            /* ★ 补丁15：TIM6 路径的"成块零"检测。
+             *   TIM6 是**逐半字**流，所以没有 DMA 那种"半缓冲接缝"；但它若吃到一整块零
+             *   （feeder 在 pump 里合成的零块 / 环里被灌了零），在 DAC 侧同样是电平阶跃
+             *   ⇒ 同样是一声"咔"。有这个量才能判断"换了 TIM6 之后还剩不剩咔"。 */
+            if (v == 0u)
+            {
+                if (++s_tz_run > g_ao_tz_run_max) { g_ao_tz_run_max = s_tz_run; }
+            }
+            else
+            {
+                s_tz_run = 0u;
+            }
+            *((volatile uint16_t *)&SPI2->TXDR) = v;
+        }
         s_rd++;
         g_ao_push++;
         if ((g_ao_push & 1u) == 0u)      /* 2 个半字 = 1 帧 */
@@ -734,14 +901,38 @@ static void pump_frames(uint32_t frames)
     }
     if (got < frames)
     {
-        memset(&s_tmp[got * 2u], 0, (frames - got) * 4u);
+        uint32_t miss = frames - got;
+
+        /* ★ 补丁15：把"短读了多少"量化下来。
+         * ⚠⚠ 旧代码在这里 `memset` 填零 —— 也就是说：**只要 feeder 少给一个帧，剩下的
+         *   全部被合成成 0 再放进环**。feeder 读到文件尾（`feeder_cb` 里 avail==0 直接
+         *   `return 0`）或 f_read 失败（`return -1`）时 got 就是 0 ⇒ 一次合成
+         *   **整个 frames（1024 或 2048 帧 = 21~42 ms）的硬零块**，直接播出去 = 一声"咔"。
+         *   而这条路径**既不计缺口也不报错**（只让 g_ao_under_feed +1，看不出大小）
+         *   ⇒ 属于本项目最忌的"看不见的坏状态"。先把它量出来。 */
+        if (miss > g_ao_feed_short_max) { g_ao_feed_short_max = miss; }
         if ((s_feeder != NULL) && (s_demo_left == 0u))
         {
             g_ao_underrun++;             /* 数据供不上（卡慢/播到最后一段）*/
             g_ao_under_feed++;           /* ⚠ 与 ① 分开计：多数只是短读/尾巴，听不出来 */
         }
     }
-    ring_put(s_tmp, frames * 2u);
+    /* ★★ 补丁15：**只把 feeder 真正给出来的数据放进环，绝不合成零块**。 ★★
+     * 【旧行为为什么是错的】旧代码在 got<frames 时 `memset` 把剩下的填 0，再
+     *   `ring_put(..., frames*2)` 整块推进环 —— 也就是**人为制造一段硬静音**：
+     *     · feeder 读到文件尾（feeder_cb 里 avail==0 直接 return 0）⇒ got=0
+     *       ⇒ 一次就是 **1024~2048 帧 = 21~42 ms 的硬零块**；
+     *     · f_read 短读 / 失败（return -1）⇒ 同理。
+     *   这段零块进环后会被 DMA/TIM6 **原样送进 DAC** ⇒ 电平阶跃 ⇒ 一声"咔"。
+     *   而且它**既不计缺口也不报错**（只让 g_ao_under_feed +1，看不出大小）—— 属于
+     *   本项目最忌的"看不见的坏状态"。
+     * 【新行为】给多少放多少；got==0 时什么都不放。环里**永远不会出现人为零块**。
+     *   真的"没数据了"由下游以**平滑衰减**兜底（见 dma_fill_half 与 TIM6 的 dry 分支），
+     *   而且"播完"有专门的收尾（wav_play_tick → audio_out_stop → 淡出停钟）。 */
+    if (got != 0u)
+    {
+        ring_put(s_tmp, got * 2u);
+    }
     g_ao_pump++;
 }
 
@@ -816,9 +1007,55 @@ void audio_out_set_volume(uint8_t vol0_100)
     (void)es8311_set_volume_ui((uint32_t)vol0_100);
 }
 
+/* ★ 2026-10-14（补丁15b）：把"本次播放"的计数器清零抽成一个函数。
+ * 【为什么必须抽出来】补丁15 把 audio_out_stop() 改成了**异步淡出**：函数返回时
+ *   `g_ao_playing` 仍为 1，192 ms 后才由 audio_out_tick() 收尾归零。
+ *   ⇒ "停止后立刻起播"这一次调用会落进 audio_out_start() 开头的**幂等分支**
+ *     （`if (g_ao_playing != 0u)`），而该分支原先**一个诊断量都不重置**：
+ *       · `g_ao_frames` 继续在上一次播放的量上累加 ⇒ 探针算出的"平均帧/中断"
+ *         从满值 1024 掉到 169.8（分子把上一段全带进来了）；
+ *       · `g_ao_t_*` 继续用上一次播放的 `g_ao_t_cstart_ms` 算**绝对**时间 ⇒
+ *         板上实测读出 `g_ao_t_ramp_ms = 87783`（87.8 s，约等于开机时长）这种荒诞值，
+ *         直接让"起播防咔哒时序表"这条判据失效。
+ * 【语义上也应当重置】"暂停/停止被重新起播取消"= 上一段播放到此结束、这里开新的一段。
+ * ⚠ 本函数**只清计数器**，不碰"连续样本流"的上下文（s_dma_last / s_dma_wr_seq /
+ *   s_tz_run / s_dma_hold）—— 那些是流的一部分，在流中间清零会凭空造出一个阶跃，
+ *   正好是本轮（补丁15）要消灭的东西。流状态只在**全新起播**时由调用方重置。 */
+static void ao_reset_play_counters(void)
+{
+    g_ao_frames   = 0u;
+    g_ao_push     = 0u;
+    g_ao_isr      = 0u;
+    g_ao_isr_dry  = 0u;
+    g_ao_udr      = 0u;
+    g_ao_underrun = 0u;
+    g_ao_pump     = 0u;
+    g_ao_dma_half = 0u;
+    g_ao_dma_cplt = 0u;
+    g_ao_dma_err  = 0u;
+    g_ao_ring_drop = 0u;
+    g_ao_dma_gap_max = 0u;
+    s_last_half_cyc  = 0u;
+    /* 补丁12：欠载分类 + 起播时序表（每次播放重新计时）*/
+    g_ao_under_dma       = 0u;
+    g_ao_under_feed      = 0u;
+    g_ao_under_short     = 0u;
+    g_ao_under_first_ms  = 0u;
+    g_ao_t_pump1_ms      = 0u;
+    g_ao_t_dacwake_ms    = 0u;
+    g_ao_t_ramp_ms       = 0u;
+    g_ao_ring_used_min   = 0xFFFFFFFFu;
+    /* 补丁15：数据出口"咔"量度（按本次播放清零）*/
+    g_ao_seam_max        = 0u;
+    g_ao_seam_n          = 0u;
+    g_ao_tz_run_max      = 0u;
+    g_ao_feed_short_max  = 0u;
+}
+
 int audio_out_start(void)
 {
-    int rc;
+    int      rc;
+    uint32_t ran_full_init = 0u;   /* ★ 补丁15c：本次起播是否跑了完整 init（含软复位）*/
 
     if (g_ao_playing != 0u)
     {
@@ -827,12 +1064,22 @@ int audio_out_start(void)
          * 典型场景：快速连点 暂停→播放，暂停的淡出还没走完就点了播放。 */
         if (s_pause_fade_ticks != 0u)
         {
-            s_pause_fade_ticks = 0u;
+            s_pause_fade_ticks  = 0u;
+            s_stop_after_fade   = 0u;   /* ★ 补丁15：刚发起的"停"被这次起播取消了 */
             s_dac_rb_pending   = (uint8_t)AO_RB_CONFIRM_TRIES;
             s_vol_ramp_left    = (uint8_t)AO_VOL_RAMP_STEPS;  /* 从当前低音量重新 ramp 上去 */
             g_ao_dac_ramp      = s_vol_ramp_left;
             g_ao_wake_cnt++;
             g_ao_resume_calls++;
+            g_ao_idem_cancel++;         /* ★ 补丁15d：这条幂等分支被走到的直接证据 */
+            /* ★ 补丁15b：这次"续播"同时也是一段**新播放**的开始 ⇒ 诊断量必须重新标定。
+             *   理由见 ao_reset_play_counters() 的函数头（异步停止 ⇒ 停→立刻起播走幂等分支
+             *   ⇒ 旧代码里 g_ao_t_* / g_ao_frames 会沿用上一段的口径，板上实测
+             *   g_ao_t_ramp_ms=87783、平均帧/中断=169.8）。
+             *   ⚠ 流状态（s_dma_last / s_dma_wr_seq / s_tz_run / s_dma_hold）**保持不变**：
+             *     这是同一路样本流的延续，清零会造阶跃。 */
+            g_ao_t_cstart_ms   = HAL_GetTick();   /* 时间原点重新标定到这次续播 */
+            ao_reset_play_counters();
         }
         return 0;                       /* 已在播：幂等 */
     }
@@ -872,6 +1119,7 @@ int audio_out_start(void)
      *   ⚠ 首次 init 失败（写丢了）时重试整段一次；仍失败才判起播失败。 */
     if (es8311_is_inited() == 0)
     {
+        ran_full_init = 1u;             /* ★ 补丁15c：本次起播跑了完整 init（含软复位）*/
         rc  = es8311_init();
         rc |= es8311_config_i2s();
         if (rc != 0)
@@ -911,9 +1159,22 @@ int audio_out_start(void)
     }
     g_ao_stage = 2u;
 
+    /* ★★ 补丁15c：首次起播把"允许唤醒 DAC"的时刻推后 AO_WAKE_SETTLE_FIRST_MS。 ★★
+     * 【为什么】首次起播刚做过 REG00 软复位，芯片在自己的复位窗口里对 I2C 地址回 NACK，
+     *   而唤醒 DAC 那 20 笔只能**同步**跑在主循环里。板上实测（复位后第一次起播，
+     *   tools/bench.rd 读 g_es_* 差值）：写 NACK 22 笔、读 NACK 17 笔、重试后成功 13 笔、
+     *   重试 3 次仍丢 9 笔、**bus clear 29 次、熔断 3 次、单笔事务最长 31.4 ms**
+     *   ⇒ 整段唤醒 110~129 ms（后续起播只要 20~60 ms）。
+     *   而 DMA 的余量只有"环 25 ms + 乒乓缓冲 12.5 ms = 37.5 ms"（按实测吞吐折算）
+     *   ⇒ 环被抽干，一整个半缓冲被合成（实测 ring_min=0、under_short=2048 @105 ms）。
+     * 【修法】这几十毫秒里 I2S 照常送数但 REG32=0（**听不见**），主循环每 5 ms 补一次数、
+     *   把环补满；等复位窗口过去再唤醒 ⇒ 唤醒那一段变快，且开跑时手里是满环。
+     *   ⚠ "先时钟、后通路"的不变量反而更稳（唤醒时时钟已经跑了 120 ms）。 */
+    s_wake_settle_ms = (ran_full_init != 0u) ? AO_WAKE_SETTLE_FIRST_MS : 0u;
+
     s_wr = 0u;
     s_rd = 0u;
-    /* ★ 2026-10-14（补丁12）：起播把环形缓冲**铺满**（两次 pump = 8192 半字 = 84 ms）。
+    /* ★ 2026-10-14（补丁12/15c）：起播把环形缓冲**铺满**（整环 16384 半字）。
      *
      * 【为什么原来只铺半环是个坑】DMA 路径起播时，i2s_dma_start() 紧接着会调两次
      *   dma_fill_half() 把**两个半缓冲都取走**（4096 半字）——若此前只铺了半环（4096），
@@ -923,14 +1184,16 @@ int audio_out_start(void)
      *   板上实测（tools/audio_buf_probe.py，2026-10-14）：从按下播放起算
      *   `g_ao_underrun` 一次就是 +6 ⇒ 起播窗口确实在成片填静音。
      *
-     * 【修法】永远铺满整环：DMA 取走 4096 后环里仍剩 4096（= 21 ms 垫子），
-     *   加上 DMA 缓冲本身的 42 ms，CSTART 瞬间手里共 63 ms 余量 —— 主循环哪怕被堵
-     *   ~60 ms 也不会破音。
+     * 【修法】永远铺满整环：DMA 取走 4096 后环里仍剩 RING_HALFWORDS−4096 个半字。
+     *   补丁15c 起环深翻倍（8192→16384）⇒ 剩 12288 半字 ≈ 37.5 ms 的垫子（按实测
+     *   327 664 半字/s 折算），加上 DMA 乒乓缓冲自身 4096 半字（12.5 ms）≈ 50 ms。
      *   ⚠ 安全性：写/读指针是**单调 32 位计数器**（只在取下标时 & RING_MASK），
      *     "满"表现为差值 == RING_HALFWORDS（不是 0）⇒ 不存在"满空同形"，铺满不会误判。
      *     旧注释担心的 `(wr-rd)&MASK == 0` 早已不适用于当前实现（见 ring_put 的守卫）。 */
-    pump_half();
-    pump_half();
+    for (uint32_t i = 0u; i < (RING_HALFWORDS / (RING_HALF_FRAMES * 2u)); ++i)
+    {
+        pump_half();
+    }
     g_ao_stage = 3u;
 
     if (g_ao_use_dma != 0u)
@@ -971,29 +1234,21 @@ int audio_out_start(void)
 
     /* ⚠ 诊断量按"本次播放"清零：这些量在 ISR/主循环里只增不减，若不在这里清，
      *   多次播放会累加（上一次 3 s 的 146 k 帧会带进下一次），验收脚本算不出
-     *   单次播放的精确量。仅 resetting 播放相关的计数，不动 g_ao_stage/g_ao_codec 等状态位。 */
-    g_ao_frames   = 0u;
-    g_ao_push     = 0u;
-    g_ao_isr      = 0u;
-    g_ao_isr_dry  = 0u;
-    g_ao_udr      = 0u;
-    g_ao_underrun = 0u;
-    g_ao_pump     = 0u;
-    g_ao_dma_half = 0u;
-    g_ao_dma_cplt = 0u;
-    g_ao_dma_err  = 0u;
-    g_ao_ring_drop = 0u;
-    g_ao_dma_gap_max = 0u;
-    s_last_half_cyc  = 0u;
-    /* 补丁12：欠载分类 + 起播时序表（每次播放重新计时）*/
-    g_ao_under_dma       = 0u;
-    g_ao_under_feed      = 0u;
-    g_ao_under_short     = 0u;
-    g_ao_under_first_ms  = 0u;
-    g_ao_t_pump1_ms      = 0u;
-    g_ao_t_dacwake_ms    = 0u;
-    g_ao_t_ramp_ms       = 0u;
-    g_ao_ring_used_min   = 0xFFFFFFFFu;
+     *   单次播放的精确量。仅 resetting 播放相关的计数，不动 g_ao_stage/g_ao_codec 等状态位。
+     * ★ 补丁15b：清零体已抽成 ao_reset_play_counters()，供本路径与"停→立刻起播"的
+     *   幂等分支共用（两处口径必须完全一致，否则又是"换个入口就读出荒诞值"的老坑）。 */
+    ao_reset_play_counters();
+    /* 下面这几个是**流状态**（不属于计数器），只在全新起播时重置：
+     *   s_dma_last/s_dma_wr_seq = 接缝检测的前驱与计数（新流从第 1 个半缓冲重新数）；
+     *   s_tz_run                = TIM6 连续零的当前游程；
+     *   s_dma_hold              = 缺口线性衰减的起点（新流从静音起）；
+     *   s_stop_after_fade       = 全新起播，没有待收尾的"停"。 */
+    s_dma_last           = 0;
+    s_dma_wr_seq         = 0u;
+    s_tz_run             = 0u;
+    s_dma_hold           = 0;           /* 补丁15：缺口"冻结"的取值来源（新一次播放从 0 起）*/
+    s_gap_tail           = 0u;          /* 补丁15c：新流没有待 ramp-in 的缺口 */
+    s_stop_after_fade    = 0u;          /* 补丁15：全新起播，没有待收尾的"停" */
     return 0;
 }
 
@@ -1003,67 +1258,60 @@ void audio_out_stop(void)
     {
         return;
     }
-    /* ★ 2026-10-14（补丁12）：**先数字静音、再停时钟**。
-     * 【那一声"咔"从哪来】原来这里第一刀就是 tim6_stop/i2s_dma_stop/i2s_stop ——
-     *   I2S 的 MCLK/BCLK/LRCK 在 DAC **还挂在当前音量**（REG32 没归零）时被掐断。
-     *   ES8311 的 ΣΔ 调制器一没时钟就不再翻转，模拟输出立刻保住/跳到一个直流电平
-     *   ⇒ 相对"上一刻的波形值"就是一次阶跃 ⇒ 可闻的"咔/啪"。
-     *   暂停路径（补丁10）早就改成"先静音、后停钟"，但**停止/切歌/退出 app** 这条路
-     *   一直漏着 —— 而它比暂停更常见（点停止、切下一首、退出音乐 app）。
-     * 【修法】照官方 esp_codec_dev 的上下电次序：`es8311_enable(false)` =
-     *   set_mute(true) → 关 pa → suspend()。即**先把 DAC 数字静音**（REG31 专用静音位，
-     *   官方防爆音机制），让调制器在**时钟仍在跑**的时候把输入钳到 0、经重建滤波平滑
-     *   落向中位；给约 4 ms 落定，再停时钟。
-     *   ⚠ 为什么不复用暂停那套"REG32=0 + 硬件软 ramp + 等 12 拍"：停止是要求**立刻断**
-     *     的动作（切歌/退出），等 190 ms 会让人以为卡了。数字静音是即时的，
-     *     只多花一个 4 ms 落定时间（人耳完全感知不到）。
-     *   ⚠ 静音后**必须**在下次起播解静音 —— 由 dac_path_regs() 负责，
-     *     否则"停过一次之后再也出不了声"。 */
-    /* ★★ 2026-10-14（补丁13）：两处收口 —— 「静音要确认」+「不再给 codec 断电」。 ★★
+
+    /* ★★ 2026-10-14（补丁15）：停止改成「发起淡出 → 由 tick 在 12 拍后收尾」。 ★★
      *
-     * 【收口一：静音必须"确认"，不能"写了就算"】
-     *   板上实测（tools/ui_freeze_repro.py 40 轮真实点击，补丁12 固件）：I2C 首试 NACK
-     *   约 5%~30%，快速启停若干轮后 `g_es_fail` 涨到 49（49 个寄存器 5 次重试全灭），
-     *   而失败环里出现频率最高的两个寄存器正是 **0x31（静音）与 0x32（音量）**。
-     *   也就是说：「切时钟前的静音那一笔」恰恰是整条链路里**最容易丢的一笔** ——
-     *   它一丢，切时钟的瞬间 DAC 还挂在有效音量上，就是用户听到的那声爆音。
-     *   ⇒ 改用 es8311_dac_become_silent()：REG32 半步降 → 归零 → REG31 静音 →
-     *     **回读确认**，不对就补写再验（最多 2 轮）。未确认时 g_es_silent_ng 会 +1，
-     *     把"这一刻有爆音风险"变成可见的计数，而不是静默发生。
+     * 【为什么必须异步（这才是"停止/切歌/播完"那声咔的真正修法）】
+     *   消咔的唯一手段是三步：**REG32 归零（硬件软 ramp 平滑渐弱）→ 等软 ramp 走完 →
+     *   再掐 I2S 时钟**。软 ramp 实测约需 160 ms（REG37=0x48 ⇒ 0.25 dB/0.667 ms，
+     *   0 dB → 听感静音）。而旧版这里是同步的：`become_silent()` 之后只 `HAL_Delay(4)`
+     *   就 `i2s_stop()` —— **4 ms 只够降到 -1.5 dB**，等于在还能听见的音量上掐钟
+     *   ⇒ ΣΔ 调制器停摆、输出保住一个直流电平 ⇒ 相对上一刻的波形就是一次阶跃 ⇒ **"咔"**。
+     *   （补丁12/13 以为 `REG31` 数字静音那一笔能兜住，但那笔本身就是"把输入钳 0"
+     *     的即时硬切 —— 见 es8311_dac_become_silent() 的函数头。）
+     *   ⇒ 若在这里同步 `HAL_Delay(160)`：UI 会冻住 160 ms（用户直接摸到"卡"）。
+     *   ⇒ 与「暂停」共用同一套延时收尾：本函数只负责**发起淡出**，真正停传输交给
+     *     audio_out_tick 在 AO_PAUSE_FADE_TICKS(12) 拍（≈192 ms）后做。
      *
-     * 【收口二：不再调 es8311_stop_dac() —— 停止不再给 codec 断电】
-     *   es8311_stop_dac() 是**真·掉电**：它把 REG0D 写成 0xFC，连内部参考 VREF(bit2) 与
-     *   VMIDSEL 一起断掉。而"模拟基准塌掉 → 下次上电重新建立"会在输出耦合电容上产生一次
-     *   低频台阶（几十毫秒的"咚/噗"）—— 这是**同一声爆音的另一个来源**，而且它发生在
-     *   模拟域，任何数字静音都挡不住（静音只能保证"送到调制器的输入是 0"，管不了
-     *   "基准电压本身塌了")。
-     *   【实测旁证】走"通电不动电源"策略的「暂停」路径（补丁10 起）没有爆音抱怨，而走
-     *   本函数的「停止/切歌」一直有 —— 两者的差别就在这一行断电。
-     *   ⇒ 停止后芯片保持"通电 + 无 MCLK + 已静音"，与暂停是**同一个状态**（该状态自
-     *     补丁10 起就在每次暂停时被真实使用并验证过，所以这不是新引入的风险）。
-     *     代价只是停播期间 codec 静态电流略高（模块 5 V 本来常亮，且这是台面机）。
-     *   ⚠ 真·掉电的路径没有消失：audio_test.c 的一次性自检、以及排障钩子
-     *     `g_es_pdown_req`（主循环消费一次）仍在用它 ⇒ "掉电 → 起播恢复时钟"这条配对的
-     *     验收覆盖由 tools/es8311_clk_check.py 显式触发，不再依赖"每次停止都断电"。 */
-    (void)es8311_dac_become_silent();
-    HAL_Delay(4);                       /* 等模拟真正落到中位再切时钟 */
-    tim6_stop();
-    i2s_dma_stop();                     /* 没起 DMA 时内部直接返回 */
-    i2s_stop();
-    i2s_gpio_release();                 /* PB9 还给 UART4 */
-    /* ⚠ 这里**不调** es8311_stop_dac()：理由见上「收口二」。 */
-    g_ao_playing = 0u;
-    g_ao_codec   = 0u;
-    s_wr = 0u;
-    s_rd = 0u;
-    s_tim_pending = 0u;
-    s_dac_pending   = 0u;               /* 起播防咔哒状态一并归零 */
-    s_vol_ramp_left = 0u;
-    s_dac_rb_pending = 0u;
-    s_pause_fade_ticks = 0u;            /* 万一停传输时正卡在暂停淡出，清掉免得 tick 又来停一次 */
-    g_ao_dac_ready  = 0u;
-    g_ao_dac_ramp   = 0u;
+     * 【对外语义的两点变化（已逐点核对影响面）】
+     *   · 本函数返回时 `g_ao_playing` 仍为 1，约 192 ms 后才变 0。
+     *     `audio_out_playing()` 在 src 下**没有别的调用点**（UI 用的是
+     *     wav_play_busy()/g_wav_state，那两个在 wav_play_stop() 里是立即置位的）⇒ 无影响。
+     *   · `wav_play_stop()` 紧随其后会 `audio_out_set_feeder(NULL)` + `s_opened=0` +
+     *     `f_close()`：淡出期间 feeder 为 NULL，`feeder_cb` 也不会被调到（先判 s_opened）
+     *     ⇒ **不会去读已关闭的文件**（安全性已逐行核对）。
+     *   · 「停止 → 立即起播」（切歌）：`audio_out_start()` 里已有"正在播 + 淡出中 ⇒
+     *     取消淡出并把音量 ramp 回去"的分支 ⇒ 切歌变成"不断音换源"，比原来硬切更好。 */
+
+    s_stop_after_fade = 1u;             /* 淡出走完后断开 feeder（与暂停的唯一区别） */
+
+    if (s_dac_rb_pending != 0u) { s_dac_rb_pending = 0u; }  /* 取消"起播音量确认期" */
+    s_vol_ramp_left   = 0u;             /* 停掉起播 ramp，免得与淡出抢 REG32 */
+    g_ao_dac_ramp     = 0u;
+    g_ao_stop_calls++;
+
+    (void)es8311_dac_become_silent();   /* 平滑淡出的第一步：REG32 → 0（不写 REG31）*/
+    s_pause_fade_ticks = (uint8_t)AO_PAUSE_FADE_TICKS;
+
+    /* ⚠ 这里**不做**任何"立刻停"的动作：传输/A 时钟/GPIO 的收尾全部在 tick 里
+     *   （ao_pause_stop_transport）。也**不调** es8311_stop_dac()：理由见下方注释。 */
 }
+    /* ---- 以下两条是补丁12/13 的历史结论，**仍然成立，勿回退** ---- */
+    /* 【收口一】切钟前必须让"音量确实归零"。原来只"写一笔就算"，而 I2C 首试 NACK
+     *   约 5%~30%（实测失败环里 0x31/0x32 命中最多）⇒ 写了没落进芯片 = 切钟时 DAC 还
+     *   挂在有效音量上。现在由 es8311_dac_become_silent() 负责"写 + 回读确认 + 补写"，
+     *   未确认就 +1 g_es_silent_ng（把"有爆音风险"变成可见计数）。
+     * 【收口二】本路径**不调** es8311_stop_dac()：那是**真·掉电**（REG0D=0xFC 连内部参考
+     *   VREF/VMIDSEL 一起断），而"基准塌掉 → 下次上电重建"会在输出耦合电容上产生一次
+     *   低频台阶（"咚/噗"）—— 同一声爆音的另一个来源，且发生在模拟域，数字静音挡不住。
+     *   实测旁证：走"通电不动电源"的暂停路径（补丁10 起）没有爆音抱怨，而走断电的
+     *   停止/切歌一直有。⇒ 停止后芯片保持"通电 + 无 MCLK + 音量 0"，与暂停同一个状态。
+     *   ⚠ 真·掉电路径没有消失：audio_test.c 的一次性自检 + 排障钩子 g_es_pdown_req
+     *     （主循环消费一次）仍在用它 ⇒ 由 tools/es8311_clk_check.py 显式触发来保覆盖。
+     * ⚠⚠ 补丁15 更正了上面【收口一】的一个误解：当时以为"REG31 数字静音"是消爆音的
+     *   手段，**恰恰相反 —— 数字静音本身就是那声咔**（即时把调制器输入钳 0 ⇒ 输出瞬跳
+     *   到中点）。所以 become_silent() 现在**只写 REG32**，靠硬件软 ramp 平滑渐弱；
+     *   而"等软 ramp 走完"这件事由本函数与 tick 的延时收尾共同保证。 */
 
 /* 暂停：停出音链路，但**不给 codec 断电**。
  *
@@ -1221,8 +1469,80 @@ void audio_out_tick(void)
     {
         if (--s_pause_fade_ticks == 0u)
         {
-            ao_pause_stop_transport();
+            uint8_t was_stop = s_stop_after_fade;
+
+            s_stop_after_fade = 0u;
+            ao_pause_stop_transport();   /* ← 内部把 g_ao_playing 归零 */
+            if (was_stop != 0u)
+            {
+                /* ★ 补丁15：淡出走完 ⇒ 真正"停"：断开喂数并记账。
+                 *   ⚠ 只有"停"才断 feeder；"暂停"必须留着它，否则续播接不上。 */
+                audio_out_set_feeder(NULL);
+                g_ao_stop_done++;
+            }
+            /* ★ 补丁15b：**在 playing 归零之后补一次快照**。
+             *   dbg_snapshot() 受 `if (g_ao_playing != 0u)` 保护，而上面刚把 playing 清了
+             *   ⇒ 若不补这一次，`g_ao_dbg3` 会**冻结在"淡出最后一拍开头"的值**，读出来就是
+             *   "停: 发起=N、收尾完成=N-1"这种差一拍的假象（板上实测踩到：
+             *   tools/click_source_probe.py 相位④ 显示 发起=3/收尾=2，下一个相位才变成 3/3）。
+             *   修完之后这条不变量（发起 == 收尾）才真的是可读判据。 */
+            dbg_snapshot();
             return;                     /* 本拍不再喂数据 / 做别的事 */
+        }
+    }
+
+    /* ---- ★ 补丁15：**补数块搬到这里（原来是本函数最后一步）** ----
+     *
+     * 【为什么必须提前】起播后的**第一拍**紧接着要跑 `s_dac_pending` 那一整段 codec 通路
+     *   I2C（`dac_path_regs` 约 20 笔写 + 若干读改写）。实测：总线干净时这段只要 ~17 ms，
+     *   但在"NACK 风暴"下能长到 **143 ms**（每笔写都要 3 次重试 × 5 ms 超时）。
+     *   而 `audio_out_start()` 交给 CSTART 的垫子只有 **4096 半字 = 42 ms**
+     *   （环铺满 8192 后被 `dma_fill_half` 取走 4096）。
+     *   ⇒ 若补数留在函数末尾，这一整段 I2C 期间**一次补数都不会发生**，DMA 在 42 ms 处
+     *     就把环抽干 ⇒ 整块 2048 半字的缺口（实测 `g_ao_under_short=2048`、
+     *     `g_ao_under_first_ms≈62`、`g_ao_t_pump1_ms≈84`，板板上可复现）。
+     *   ⇒ 提到前面后：进 I2C 之前环已是满的（8192 半字 = 84 ms），加上 DMA 缓冲里的
+     *     42 ms，手里共 **126 ms** 余量 —— 覆盖住那段最长 143 ms 的停顿（余下十几毫秒
+     *     由补丁15 的"线性衰减"兜底，不会出现阶跃）。
+     *   ⚠ 补数只碰环形缓冲，与 DAC 通路/音量状态完全无关 ⇒ 提前执行是安全的。 */
+    /* 补数：**只要环里还有空间就补**，把环尽可能维持在"接近满"。
+     *
+     * 【2026-10-14 补丁14：为什么把判据从"占用 ≤ 半环"改成"剩余空间 ≥ 1/4 环"】
+     *   旧判据 `used <= 半环 ⇒ 补半环` 让环占用长期停在 **0~4096 半字（0~42 ms）**，而 DMA 的
+     *   消耗是**成批**的（每次半传/全传中断一次性取走 2048 半字）：实测（tools/tim6_vs_dma_check.py，
+     *   同一段音乐、同一次干扰）环占用在 0 与 4096 之间摆动、**最低到 0** ⇒ 主循环只要耽误一拍，
+     *   下一次 dma_fill_half 就找不到 2048 半字，只能把尾部**填硬 0**（一次 2048 半字 = 21 ms
+     *   电平跳变块 = 一声"咔"）。
+     *   对照：TIM6 路径的消耗是**逐个半字**的（ISR 每次只写 1 个），同样干扰下环最低水位实测
+     *   2304 半字、缺口 0 —— 这就是"同样一次供数失误，两条路径代价差 2048 倍"的由来。
+     *   新判据下环稳定在 6144~8192 半字（63~84 ms），扛得住约 3 次连续的半缓冲补数，
+     *   即主循环被堵 ~63 ms 也不破音（旧设计余量 = 0）。 */
+    {
+        uint32_t used  = s_wr - s_rd;
+        uint32_t space = RING_HALFWORDS - used;
+
+        /* 补丁12：记录播放期环占用的**最小值** —— 它就是"抗主循环卡顿的垫子"。 */
+        if (used < g_ao_ring_used_min)
+        {
+            g_ao_ring_used_min = used;
+        }
+        /* 空间够补半环就补半环；只剩 1/4 环的空间就补 1/4 —— 绝不因"没地方放"而放弃补数
+         * （放弃补数 = 环就地见底 = 下一拍就可能填硬 0）。 */
+        if (space >= (RING_HALF_FRAMES * 2u))
+        {
+            pump_half();
+            if (g_ao_t_pump1_ms == 0u)
+            {
+                g_ao_t_pump1_ms = HAL_GetTick() - g_ao_t_cstart_ms;
+            }
+        }
+        else if (space >= (RING_QUARTER_FRAMES * 2u))
+        {
+            pump_quarter();
+            if (g_ao_t_pump1_ms == 0u)
+            {
+                g_ao_t_pump1_ms = HAL_GetTick() - g_ao_t_cstart_ms;
+            }
         }
     }
 
@@ -1235,9 +1555,20 @@ void audio_out_tick(void)
     {
         int ready = (g_ao_use_dma != 0u) ? (s_dma_ready != 0u) : (g_ao_isr > 0u);
 
+        /* ★ 补丁15c：首次起播时再等一个"落定窗口"（s_wake_settle_ms，见 audio_out_start）。
+         *   这几十毫秒里 I2S 照常送数但 REG32 还是 0（听不见），主循环把环补满；
+         *   顺带避开芯片复位窗口里的 I2C NACK 风暴（那正是唤醒要 110~129 ms 的原因，
+         *   而 DMA 的余量只有 ~37.5 ms ⇒ 会合成一整个半缓冲）。 */
+        if ((ready != 0) && (s_wake_settle_ms != 0u) &&
+            ((uint32_t)(HAL_GetTick() - g_ao_t_cstart_ms) < s_wake_settle_ms))
+        {
+            ready = 0;                  /* 还没到点：这一拍只补数，不唤醒 */
+        }
+
         if (ready != 0)
         {
             s_dac_pending = 0u;
+            s_wake_settle_ms = 0u;      /* 落定窗口一次性用完 */
             /* 整段"静音接通 DAC"重试一次：I2C 写是**会失败**的（见 es8311.c），
              * 而这一段的返回值以前是直接丢掉的 —— 丢一笔就可能 DAC 没上电/音量没升，
              * 正是"续播没声音"。失败就整段重来（第二遍基本都能过）。 */
@@ -1329,44 +1660,7 @@ void audio_out_tick(void)
         return;
     }
 
-    /* 补数：**只要环里还有空间就补**，把环尽可能维持在"接近满"。
-     *
-     * 【2026-10-14 补丁14：为什么把判据从"占用 ≤ 半环"改成"剩余空间 ≥ 1/4 环"】
-     *   旧判据 `used <= 半环 ⇒ 补半环` 让环占用长期停在 **0~4096 半字（0~42 ms）**，而 DMA 的
-     *   消耗是**成批**的（每次半传/全传中断一次性取走 2048 半字）：实测（tools/tim6_vs_dma_check.py，
-     *   同一段音乐、同一次干扰）环占用在 0 与 4096 之间摆动、**最低到 0** ⇒ 主循环只要耽误一拍，
-     *   下一次 dma_fill_half 就找不到 2048 半字，只能把尾部**填硬 0**（一次 2048 半字 = 21 ms
-     *   电平跳变块 = 一声"咔"）。
-     *   对照：TIM6 路径的消耗是**逐个半字**的（ISR 每次只写 1 个），同样干扰下环最低水位实测
-     *   2304 半字、缺口 0 —— 这就是"同样一次供数失误，两条路径代价差 2048 倍"的由来。
-     *   新判据下环稳定在 6144~8192 半字（63~84 ms），扛得住约 3 次连续的半缓冲补数，
-     *   即主循环被堵 ~63 ms 也不破音（旧设计余量 = 0）。 */
-    {
-        uint32_t used  = s_wr - s_rd;
-        uint32_t space = RING_HALFWORDS - used;
-
-        /* 补丁12：记录播放期环占用的**最小值** —— 它就是"抗主循环卡顿的垫子"。 */
-        if (used < g_ao_ring_used_min)
-        {
-            g_ao_ring_used_min = used;
-        }
-        /* 空间够补半环就补半环；只剩 1/4 环的空间就补 1/4 —— 绝不因"没地方放"而放弃补数
-         * （放弃补数 = 环就地见底 = 下一拍就可能填硬 0）。 */
-        if (space >= (RING_HALF_FRAMES * 2u))
-        {
-            pump_half();
-            if (g_ao_t_pump1_ms == 0u)
-            {
-                g_ao_t_pump1_ms = HAL_GetTick() - g_ao_t_cstart_ms;
-            }
-        }
-        else if (space >= (RING_QUARTER_FRAMES * 2u))
-        {
-            pump_quarter();
-            if (g_ao_t_pump1_ms == 0u)
-            {
-                g_ao_t_pump1_ms = HAL_GetTick() - g_ao_t_cstart_ms;
-            }
-        }
-    }
+    /* ★ 补丁15：补数块已**上移到本函数前半段**（在 `s_dac_pending` 唤醒 DAC 之前）——
+     *   理由见那里的长注释：起播第一拍那段 codec 通路 I2C 在 NACK 风暴下能长达 143 ms，
+     *   而补数若留在末尾，这 143 ms 内环不会被补，DMA 在 42 ms 处就把起播垫子抽干。 */
 }

@@ -241,16 +241,23 @@ def main():
             fails.append("[%d] P1 暂停写了 %d 笔 REG32（补丁13 起应为 2~4：半步降+归零"
                          "[+每轮未确认再补 1 笔]；=9 说明又走了 stop_dac 断电路径）"
                          % (cyc, pause_writes))
-        # ---- P8 ★补丁13：静音必须"被确认"（否则切时钟时还有效音量 = 爆音根因）----
+        # ---- P8 ★补丁13：淡出必须"被确认"（否则切时钟时还有效音量 = 爆音根因）----
+        # ⚠ 补丁15 判据修正：旧口径还要求 REG31 数字静音已置位（(s_mute&0x60)==0x60）。
+        #   补丁15 已证伪那个前提 —— 数字静音是"即时把调制器输入钳 0"，**它本身就是那声咔**
+        #   （见 src/es8311.c → es8311_dac_become_silent 的函数头）。现在只认 REG32 归零，
+        #   并**额外要求 REG31 未被置位**（= 没有对调制器做硬切）。
         sil_fail = bench.rd("g_ao_silent_fail", 1)[0]
         s_vol = bench.rd("g_es_silent_vol", 1)[0]
         s_mute = bench.rd("g_es_silent_mute", 1)[0]
         if sil_fail != 0:
-            fails.append("[%d] ★P8 静音未确认 %d 次（g_ao_silent_fail>0 ⇒ 有爆音风险）"
+            fails.append("[%d] ★P8 淡出未确认 %d 次（g_ao_silent_fail>0 ⇒ 有爆音风险）"
                          % (cyc, sil_fail))
-        elif s_vol != 0x00 or (s_mute & 0x60) != 0x60:
-            fails.append("[%d] ★P8 暂停后静音回读不对（REG32=%#04x 应 0；REG31=%#04x 应 bit6/5=1）"
-                         % (cyc, s_vol, s_mute))
+        elif s_vol != 0x00:
+            fails.append("[%d] ★P8 暂停后音量回读不对（REG32=%#04x 应 0）"
+                         % (cyc, s_vol))
+        elif (s_mute & 0x60) != 0x00:
+            fails.append("[%d] ★P8 暂停对调制器做了数字硬切（REG31=%#04x bit6/5 应=0；"
+                         "补丁15 起禁止，硬切本身就是那声咔）" % (cyc, s_mute))
         # ---- P2 暂停后 codec 仍通电可达 ----
         if B["ESRBPWR"] == 0xFFFF:
             fails.append("[%d] P2 暂停后读不回 REG12（芯片不可达/已断电）—— 应保持通电" % cyc)

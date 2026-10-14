@@ -14,17 +14,24 @@
 两条路径的**结构性差别**（本脚本要量的就是这些）：
   1 单次搬运粒度：TIM6 = 1 个半字(10.24 µs) / DMA = 2048 个半字(21.0 ms) —— 差 2048 倍
   2 缺数据时做什么：TIM6 = ISR 空转、**保持上一个采样**（无电平跳变）；
-                     DMA  = `dma_fill_half` 尾部**填硬 0**（有电平跳变 ⇒ 一声"咔"）
+                     DMA  = `dma_fill_half` 尾部**冻结上一采样 + 下一块头 ramp-in**
+                            （★ 补丁15c 起；15 之前是**填硬 0** ⇒ 一块 21 ms 的直流台阶
+                             ⇒ 那才是"咔"。现在两端 C0 连续，与 TIM6 的天然行为对齐）
   3 停机瞬间"已锁定待搬"的数据量：TIM6 = 0 半字；DMA = 0~2048 半字（实测掐钟前 NDTR=1688）
   4 是否经过 DMA1 仲裁：DMA 与 LCD band(MEM2MEM/HIGH) 争端口（补丁5d 实测 UDR≈1/s）；TIM6 不经过
 
 测量手法（沿用本工程铁律）：
-  * 诊断量在内存里**不连续** ⇒ 一次批读整个窗口 0x20006700..0x200067C0（48 字），再按 nm 取值。
+  * 诊断量在内存里**不连续** ⇒ 一次批读整个窗口，再按 nm 取值。
+    ⚠ 窗口**由符号地址现算**（见下方 LO/NW），不再硬编码 0x20006700/48 ——
+      补丁15 新增诊断量后 .bss 排布变了，硬编码窗口会漏符号 ⇒ 直接 IndexError 崩掉。
   * 「干扰窗」的读**故意保留** —— 它就是这个相位要施加的干扰；「静窗」内绝不读。
 
 判据：
   V1  静窗：两条路径欠载都应 0（基线干净）
-  V2  干扰窗：DMA 若出现 under_short == 2048（整块 21 ms 硬静音）而 TIM6 为 0 ⇒ 失败模式不对称成立
+  V2  干扰窗：DMA 出现 under_short > 0 而 TIM6 为 0 ⇒ 失败模式不对称成立。
+       ★ 但**注意口径**（补丁15c 起）：under_short>0 本身**不再等于"能听见咔"** ——
+         缺口已改成"冻结 + ramp-in"（两端 C0 连续）。它现在只说明"环被抽干过"。
+         真正判"有没有咔"要看 g_ao_seam_n（跨半缓冲接缝的大跳变次数）与听感。
   V3  TIM6 路径 DMA 半传/全传中断必须为 0（不进 DMA1）
   V4  报告环最低水位：它就是"抗卡顿垫子"，DMA 若为 0 即"零余量"
 
@@ -52,8 +59,16 @@ NAMES = ["g_ao_t_ramp_ms", "g_ao_t_dacwake_ms", "g_ao_t_pump1_ms", "g_ao_t_cstar
          "g_ao_dma_gap_max", "g_ao_dma_cplt", "g_ao_dma_half", "g_ao_stage",
          "g_ao_isr_dry", "g_ao_isr", "g_ao_pump", "g_ao_underrun", "g_ao_frames",
          "g_ao_udr", "g_ao_playing"]
-if bench.T["g_ao_under_first_ms"][0] < LO or bench.T["g_ao_under_first_ms"][0] >= LO + NW * 4:
-    raise RuntimeError("批读窗口与符号地址不匹配，请按 nm 重新计算 LO/NW")
+# ★ 2026-10-14（补丁15c）：窗口**由符号地址现算**，不再硬编码 0x20006700/48。
+#   起因：补丁15 新增了若干诊断量（g_ao_seam_*/g_ao_dbg3/s_gap_tail/s_wake_settle_ms …），
+#   .bss 的排布随之变化 ⇒ 硬编码的窗口会漏掉某个符号 ⇒ `w[o]` 直接 IndexError 崩掉
+#   （本轮实测：DMA 相位一进来就 Traceback）。现按 NAMES 的最小/最大地址取窗口，
+#   窗口变大只是多读几个无关字，不影响按偏移取值。
+_addrs = [bench.T[n][0] for n in NAMES]
+LO = min(_addrs) & ~3
+NW = (max(_addrs) - LO) // 4 + 1
+if NW > 256:
+    raise RuntimeError("批读窗口跨度过大（%d 字）—— 诊断量可能已被挪到不连续的位置" % NW)
 OFF = {n: (bench.T[n][0] - LO) // 4 for n in NAMES}
 
 
@@ -157,8 +172,10 @@ def main():
           % (ds["g_ao_under_short"], ds["g_ao_under_short"] * HALFWORD_US / 1000.0,
              ds["g_ao_under_dma"], ts["g_ao_under_short"], ts["g_ao_under_dma"]))
     if ds["g_ao_under_dma"] > ts["g_ao_under_dma"]:
-        print("[INFO] V2 失败模式不对称成立：同样干扰下 DMA 会写整块硬 0（电平跳变 ⇒ 可闻），")
-        print("          TIM6 只是 FIFO 饿一下（引擎重复上一采样 ⇒ 无跳变）")
+        print("[INFO] V2 失败模式不对称成立：同样干扰下 DMA 会把整块换成'冻结样本'（21 ms），")
+        print("          TIM6 只是 FIFO 饿一下（引擎重复上一采样，粒度 10 µs）")
+        print("         ⚠ 补丁15c 起缺口已 ramp-in 补回（两端 C0 连续）⇒ 该计数只说明'环被抽干'，")
+        print("           不再等价于'能听见咔'；判听感请看 g_ao_seam_n 与实测听感。")
     else:
         print("[INFO] V2 本相位未拉开差距（干扰强度不够或环余量已足够）")
 

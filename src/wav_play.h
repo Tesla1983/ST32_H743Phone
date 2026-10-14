@@ -81,6 +81,12 @@ extern volatile uint32_t g_wav_pos;      /* 已读字节 */
 extern volatile uint32_t g_wav_underrun; /* 卡没供给上的次数 */
 extern volatile uint32_t g_wav_read_ms;  /* 最近一次补数耗时（毫秒，判卡够不够快）*/
 extern volatile uint32_t g_wav_test;     /* 诊断：写 1 起播 /YMGUI/MUSIC/TOKYOHOT.WAV（SWD 验收用）*/
+/* ★ 补丁15d：板上「暂停 → N ms → 续播」突发（写 g_wav_test=5 触发）。
+ *   专测"快速连点 暂停→播放"那条 audio_out_start() 幂等分支 —— 主机侧做不出来，
+ *   因为 probe-rs 单次写 ≈400 ms > 淡出 204 ms（详见 wav_play.c 里的说明块）。
+ *   证据看 g_ao_idem_cancel（audio_out.c）的增量。 */
+extern volatile uint32_t g_wav_burst_ms;   /* 间隔毫秒，默认 30 */
+extern volatile uint32_t g_wav_burst_done; /* 板上突发成功完成的次数 */
 
 /* ====================== 验收「相位锁存」表（2026-10-13）======================
  * 目的：把"测量"从主机搬到板上，根治"逐符号读 ⇒ 每次一次内核停机 ⇒ I2C 假 NACK"。
