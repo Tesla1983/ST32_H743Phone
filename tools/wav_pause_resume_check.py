@@ -28,8 +28,8 @@
   芯片保持可达 ⇒ 续播那段 ~19 笔 I2C 不再有 NACK 窗口。
   「切歌 / 播完 / 退出」仍走 `audio_out_stop()`（断电是对的，下次是全新起播）。
 
-【判据（P1~P6 全部只看锁存表）】
-  P1 暂停只发 1 笔 I2C 写：暂停前后 `wr_ok` 增量 == 1（旧实现是 9）
+【判据（P1~P8；P1~P7 只看锁存表，P8 另读两个稳定计数器）】
+  P1 暂停的静音动作只发**少量** REG32 写（补丁13 起为 2~4 笔：半步降 + 归零 [+每轮补写]）
   P2 暂停后 codec 仍通电可达：`rb_pwr != 0xFFFF` 且 power-down 位 == 0
   P3 ★终态权威判据：续播后 `reg32_wr == es8311_volume_reg(UI音量)`
      （这是**写入值**，与 I2C 成败无关 ⇒ 不受探针伪影影响；== 0 ⇒ 停在静音 = 没声音）
@@ -37,6 +37,16 @@
   P5 续播真的在出声：`wav_state==1` 且 `playing==1` 且 frames 在涨
   P6 不变量自洽：`ng_head == wr_ng + rd_ng`（失败环计数与分项一致）且 `fail == 0`
      （重试 3 次仍失败的次数；>0 才是真丢写）
+  P8 ★补丁13：暂停时"静音**被确认**" —— 读回 REG32==0x00 且 REG31 的 bit6/5==1，
+     且 `g_ao_silent_fail == 0`。为什么这一条不能省：I2C 写会失败（实测首试 NACK
+     5%~30%，失败环里 0x31/0x32 命中最多），而"写了就算"恰好让"切时钟时 DAC 还挂在
+     有效音量上"这个**爆音根因**变成一个看不出来的坏状态；P1 只数笔数、看不出这个。
+
+⚠ 补丁13 的改动影响到 P1 的口径："暂停只发 1 笔 REG32"这条判据的前提（一次写就能静音）
+  已被证伪 —— 现在暂停走 `es8311_dac_become_silent()`：REG32 半步降 → 归零 → REG31 静音
+  → **回读确认**（不对就补写再验）。笔数改为动作内**实测**（用 g_es_reg32_n 的前后差），
+  因此 P1 由"== 1"改为"2~4 笔"（下界 2 = 半步降+归零；上界 4 = 两轮未确认时各补 1 笔）。
+  判据的**意图不变**（"暂停不许走 stop_dac 的断电路径" 由 P2 直接覆盖）。
 
 ⚠ 只验链路；听感由耳朵判定。
 用法：
@@ -227,9 +237,20 @@ def main():
         # ---- P1 暂停只发 1 笔 I2C 写（★动作级判据，不受窗口影响）----
         if pause_calls != 1:
             fails.append("[%d] P1 暂停动作执行了 %d 次（应为 1）" % (cyc, pause_calls))
-        if pause_writes != 1:
-            fails.append("[%d] P1 暂停写了 %d 笔 REG32（应为 1 静音；>1 ⇒ 又走了 stop_dac 断电路径）"
+        if not (1 <= pause_writes <= 4):
+            fails.append("[%d] P1 暂停写了 %d 笔 REG32（补丁13 起应为 2~4：半步降+归零"
+                         "[+每轮未确认再补 1 笔]；=9 说明又走了 stop_dac 断电路径）"
                          % (cyc, pause_writes))
+        # ---- P8 ★补丁13：静音必须"被确认"（否则切时钟时还有效音量 = 爆音根因）----
+        sil_fail = bench.rd("g_ao_silent_fail", 1)[0]
+        s_vol = bench.rd("g_es_silent_vol", 1)[0]
+        s_mute = bench.rd("g_es_silent_mute", 1)[0]
+        if sil_fail != 0:
+            fails.append("[%d] ★P8 静音未确认 %d 次（g_ao_silent_fail>0 ⇒ 有爆音风险）"
+                         % (cyc, sil_fail))
+        elif s_vol != 0x00 or (s_mute & 0x60) != 0x60:
+            fails.append("[%d] ★P8 暂停后静音回读不对（REG32=%#04x 应 0；REG31=%#04x 应 bit6/5=1）"
+                         % (cyc, s_vol, s_mute))
         # ---- P2 暂停后 codec 仍通电可达 ----
         if B["ESRBPWR"] == 0xFFFF:
             fails.append("[%d] P2 暂停后读不回 REG12（芯片不可达/已断电）—— 应保持通电" % cyc)

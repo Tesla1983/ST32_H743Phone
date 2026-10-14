@@ -85,6 +85,43 @@ extern volatile uint32_t g_es_fail;    /* 重试 3 次仍失败 的次数（应�
 extern volatile uint32_t g_es_fix_wr;  /* 回读校验发现不对、补写 的次数 */
 extern volatile uint32_t g_es_recover_pe;/* 因 BUSY/TIMEOUT 做 I2C 软复位(PE 0→1)的次数 */
 extern volatile uint32_t g_es_readback; /* 回读体检执行次数（起播后那次 + 播放中每秒那次）*/
+
+/* ★★ 2026-10-14（补丁13）：I2C 阻塞时间 + 静音确认 —— "偶发卡死"与"爆音"的量化判据 ★★
+ *
+ * 【为什么有这一组量】用户报两个现象：① 音频里仍有咔嗒（爆音）；② 快速点播放/暂停
+ *   若干轮后整个 UI 卡住（约 1/3 概率）。本轮实测（tools/ui_freeze_repro.py 40 轮真实点击）
+ *   两者是**同一个根因**：I2C 控制通道不可靠 ——
+ *     · 复现瞬间 `g_es_fail = 49`（49 个寄存器 5 次重试全灭）、`g_es_breaker_trip` **恒 0**
+ *       （熔断器从未生效）；失败类型 100% 是 NACK，失败环里出现最多的是 **0x31（静音）
+ *       与 0x32（音量）** —— 恰好就是"切时钟前最后一道防线"那两个寄存器。
+ *     · 卡死的直接机制：HAL 的 `HAL_I2C_Master_Transmit` 开头等 BUSY 的时长是
+ *       **源文件里的常量 25 ms**，与本项目传的 5 ms 无关 ⇒ 总线烂掉时每笔都白等 25 ms。
+ *   于是：静音写丢了 ⇒ 切时钟时 DAC 满音量 ⇒ **爆音**；重试风暴 × 25 ms ⇒ 主循环停转。
+ *
+ * 【本组量的读法】
+ *   · g_es_tx_us_max / g_es_slow_n —— 单笔事务最长耗时与"慢笔"计数：**卡死的直接量化**。
+ *   · g_es_busy_stuck_n / g_es_rcc_rst_n —— 命中"外设卡在 BUSY"并绕开 HAL 的次数（每次
+ *     命中就省下 25 ms）；外层用 RCC 硬件复位清 BUSY。
+ *   · g_es_bc_fail —— bus clear 做完 SDA 仍被钳住的次数（真·卡死 still there 的证据）。
+ *   · g_es_silent_n / g_es_silent_ng —— "静音并确认"成功/失败次数。**ng > 0 = 有爆音风险**
+ *     （那一刻切时钟时 DAC 可能还挂在有效音量上）。
+ *   · g_es_pdown_n —— 真·掉电（es8311_stop_dac）执行次数。补丁13 起**正常播放/停止路径
+ *     不再调用它** ⇒ 应恒 0；>0 只可能来自自检或排障钩子。 */
+extern volatile uint32_t g_es_tx_us_max;
+extern volatile uint32_t g_es_slow_n;
+extern volatile uint32_t g_es_busy_stuck_n;
+extern volatile uint32_t g_es_rcc_rst_n;
+extern volatile uint32_t g_es_bc_fail;
+extern volatile uint32_t g_es_silent_n;
+extern volatile uint32_t g_es_silent_ng;
+extern volatile uint32_t g_es_silent_vol;  /* 那次确认读到的 REG32（应 0x00）*/
+extern volatile uint32_t g_es_silent_mute; /* 那次确认读到的 REG31（bit6/5 应为 1）*/
+extern volatile uint32_t g_es_pdown_n;
+extern volatile uint32_t g_es_reg01_n;   /* REG01（时钟管理寄存器）被写的次数 */
+extern volatile uint32_t g_es_reg01_val; /* REG01 最后一次写入的值（应恒 0x3F）*/
+/* 排障钩子（SWD 写；纯软件、不碰任何电气）： */
+extern volatile uint32_t g_es_pdown_req; /* 写 1 ⇒ 主循环下一拍执行一次"真掉电"（验 D9 配对）*/
+extern volatile uint32_t g_es_nack_sim;  /* 0=正常；1=每笔事务直接判失败；2=另假装 SDA 被钳住 */
 /* ---- 2026-10-13：UI 卡死修复新增（快速点播放/暂停后主循环被 I2C 拖死）----
  * 板上实测根因：I2C 从机在事务被中途打断后把 SDA 钳低 ⇒ 总线卡死；旧代码对 NACK
  * 直接 return、从不做总线恢复，且单笔超时 50 ms × 5 重试 = 250 ms/笔，一次起播
@@ -226,6 +263,23 @@ int es8311_stop_dac(void);
  * @return 0=OK；<0=失败（走 es8311_write_reg 的重试，仍失败才返回 <0）
  */
 int es8311_dac_mute(void);
+
+/**
+ * @brief  ★ 2026-10-14（补丁13）：让 DAC **确定地**变静音，并且**当场回读确认**。
+ *
+ * 【解决什么】"切 I2S 时钟前必须已经静音"是防爆音的最后一道防线，而 I2C 写是**会失败**的
+ *   （实测首试 NACK 5%~30%，失败环里 0x31/0x32 命中最多）。"写了就算"= 有相当概率不静音
+ *   ⇒ 切时钟那一刻 DAC 还挂在有效音量 ⇒ 直流阶跃 ⇒ 那声爆音。
+ *
+ * 【做什么】① REG32 先砍一半（兜底）→ ② REG32=0 → ③ REG31 数字静音
+ *   → ④ 回读 0x32/0x31 确认，不对就补写一轮再验（最多 2 轮）。
+ *   **完全不碰电源/时钟寄存器**：芯片保持"通电 + VMIDSEL 仍工作"，与「暂停」同构。
+ *   （真·掉电是 es8311_stop_dac()：它会把内部参考 VREF 断掉，基准塌掉/重建本身也是
+ *    一声爆音，所以正常播放/停止路径已不再调用它。）
+ *
+ * @return 0 = 已确认静音；-1 = 未能确认（g_es_silent_ng +1，调用方按"有爆音风险"记录）
+ */
+int es8311_dac_become_silent(void);
 
 /**
  * @brief  REG31 的**专用数字静音位**（on=1 静音 / 0 解静音）—— 官方防爆音手段。

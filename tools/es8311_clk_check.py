@@ -14,11 +14,22 @@ REG32 照样可读）—— 所以必须单独看时钟管理寄存器（本脚�
 
 【判据】
   K1 首次起播后 REG01 == 0x3F（MCLK/BCLK/ADCCLK/DACCLK 全使能）
-  K2 ★ 停 → 起播（**走完整掉电尾之后的续播**）后 REG01 仍 == 0x3F   ← D9 配套恢复的证明
+  K2 ★ 显式掉电 → 起播后 REG01 仍 == 0x3F   ← D9 配套恢复的证明
   K3 REG02 == 0x00（本项目 48k 分频/倍频）、REG06 与首次起播一致（bclk_div=4、SCK 不反相）
   K4 续播后 REG32 回读 == es8311_volume_reg(UI 音量)（芯片里真实音量对）
-  K5 全程 g_es_fail 无增量（= 15 笔掉电尾写全部成功 ⇒ REG01 真的被写成 0x00，
-     否则"起播后又读到 0x3F"可能是"从来没被关过"）
+  K5 全程 g_es_fail 无增量（掉电尾/起播没有真丢写）
+  K6 ★ K2 非空判据的**写入侧证据**（见下）
+
+⚠⚠ 2026-10-14（补丁13）本脚本的关键改动：**掉电改为"显式触发"**。
+  补丁13 起，正常播放/停止路径**不再**调用 es8311_stop_dac()（它会连内部参考 VREF 一起
+  断掉，"基准塌掉 → 重建"本身就是一声爆音；用户报的爆音与此直接相关）。
+  ⇒ 若本脚本还按老写法"停一下就期待读到掉电后的状态"，K2 就变成**空判据**：
+    读到 REG01==0x3F 可能只是"它从来没被关过"，而不是"被关掉后又被写回来"。
+  ⇒ 所以现在用排障钩子 `g_es_pdown_req=1` **显式**执行一次真·掉电，并用**写入侧**证据
+     把配对钉死：
+       K6a 掉电后 `g_es_reg01_val == 0x00`（掉电尾确实把时钟关了）
+       K6b 起播后 `g_es_reg01_val == 0x3F` 且 `g_es_reg01_n` 有增量（起播路径确实写回来了）
+     这两条与硬件回读独立，不受"读失败"影响，是真正不可绕过的证据。
 
 ⚠ 只验寄存器链路；听感由耳朵判定（判据只保证"时钟/通路/音量都对"）。
 用法：python tools/es8311_clk_check.py [轮数，默认 2]
@@ -80,22 +91,44 @@ def main():
         print("-" * 74)
         print("轮 %d/%d" % (r, ROUNDS))
 
-        # ① 停（走**完整掉电尾 D9**：REG00 CSM_ON=0、REG01 全时钟关、REG0D=0xFC）
-        snap(2, 1.6)
+        # ① 停（补丁13 起"停止"**不再**自动给 codec 断电，见 es8311_stop_dac 的说明）
+        snap(2, 1.4)
+        # ①b **显式**触发一次真·掉电（排障钩子 g_es_pdown_req，主循环消费一次）。
+        #     ⚠ 这一步是本脚本在补丁13 之后**不能省**的：否则 K2 会退化成空判据。
+        p0  = rd1("g_es_pdown_n")
+        n0  = rd1("g_es_reg01_n")
+        bench.wr("g_es_pdown_req", [1])
+        time.sleep(0.8)
+        p1  = rd1("g_es_pdown_n")
+        v01_after_pdown = rd1("g_es_reg01_val")
+        if p1 <= p0:
+            fails.append("[%d] K6 显式掉电钩子没被消费（g_es_pdown_n %d→%d）" % (r, p0, p1))
+        if v01_after_pdown != 0x00:
+            fails.append("[%d] K6a 掉电后 REG01 最后写入值 = %#04x（应 0x00：掉电尾确实关了时钟）"
+                         % (r, v01_after_pdown))
+
         # ② 起播（走 dac_path_regs：应把 REG00=0x80 / REG01=0x3F 写回）
         snap(1, 2.6)
+        n1  = rd1("g_es_reg01_n")
+        v01_after_start = rd1("g_es_reg01_val")
 
         c1, c2, c6 = clk()
         ui = rd1("g_audio_volume")
         exp = vol_reg(ui)
         vol = rd1("g_es_rb_vol")
 
-        print("  停→起播后: REG01=%#04x REG02=%#04x REG06=%#04x | REG32 回读=%#04x 期望=%#04x（UI %d）"
+        print("  起播后: REG01=%#04x REG02=%#04x REG06=%#04x | REG32 回读=%#04x 期望=%#04x（UI %d）"
               % (c1, c2, c6, vol, exp, ui))
+        print("          掉电: pdown %d→%d，REG01 写入值→%#04x；起播: REG01 写入值→%#04x（写入侧计数 %d→%d）"
+              % (p0, p1, v01_after_pdown, v01_after_start, n0, n1))
 
         if c1 != 0x3F:
-            fails.append("[%d] ★K2 停→起播后 REG01=%#04x（应 0x3F）—— 掉电尾关掉的时钟没被写回，"
+            fails.append("[%d] ★K2 显式掉电→起播后 REG01=%#04x（应 0x3F）—— 掉电尾关掉的时钟没被写回，"
                          "芯片无时钟 ⇒ 续播无声" % (r, c1))
+        # ★ K6b：写入侧证据 —— 起播路径确实写过 REG01=0x3F（这样 K2 才不是空判据）
+        if (n1 <= n0) or (v01_after_start != 0x3F):
+            fails.append("[%d] K6b 起播没有写回 REG01（写入次数 %d→%d，最后值 %#04x，应 +1 且 0x3F）"
+                         % (r, n0, n1, v01_after_start))
         if c2 != 0x00:
             fails.append("[%d] K3 REG02=%#04x（应 0x00：本项目 48k 分频/倍频）" % (r, c2))
         if c6 != c6a:

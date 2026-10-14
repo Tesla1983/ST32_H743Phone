@@ -53,6 +53,34 @@ volatile uint32_t g_es_busclear_en = 1u;   /* ★排障开关：1=允许自动 b
 volatile uint32_t g_es_ng_idr  = 0xFFFFu;  /* 失败瞬间 PB6(SCL)/PB7(SDA) 的电平（GPIOB->IDR bit6/bit7）
                                             * 0x40/0x80 = 已释放（有上拉）；缺 0x80 ⇒ SDA 被从机压住 = 总线卡死*/
 
+/* ★★ 2026-10-14（补丁13）：I2C **阻塞时间**诊断 —— "偶发卡死"的量化依据 ★★
+ * 【为什么必须量它】"整个 UI 卡住无法滑动"的本质是**主循环单拍被 I2C 阻塞**（I2C 是
+ *   阻塞轮询、跑在主循环线程里）。此前只知道"卡"，不知道**卡在哪一笔、卡了多久**。
+ *   本轮实测（tools/ui_freeze_repro.py 40 轮真实点击）：第 5 次点击后主循环停转，
+ *   同期 `g_es_fail` 从 0 涨到 49、`g_es_breaker_trip` **恒为 0**（熔断器从未触发）。
+ *   ⇒ 把"每笔事务耗时"和"绕开了多少次 HAL 的固定等待"直接量出来。 */
+volatile uint32_t g_es_tx_us_max = 0u;      /* 单笔 HAL I2C 事务的**最长耗时(µs)** */
+volatile uint32_t g_es_slow_n    = 0u;      /* 耗时 > 5 ms 的事务笔数 */
+volatile uint32_t g_es_busy_stuck_n = 0u;   /* 进 HAL 之前就发现 BUSY=1（外设卡住）的次数 ——
+                                             * 每命中一次就省下 HAL 内部那笔**固定 25 ms** 等待 */
+volatile uint32_t g_es_rcc_rst_n = 0u;      /* 对 I2C1 外设做 RCC 强制复位（I2C1RST）的次数 */
+volatile uint32_t g_es_bc_fail   = 0u;      /* bus clear 之后 SDA 仍被从机钳住的次数 */
+volatile uint32_t g_es_silent_n  = 0u;      /* "静音并确认"成功次数（es8311_dac_become_silent）*/
+volatile uint32_t g_es_silent_ng = 0u;      /* "静音未能确认"次数（>0 = 切时钟时刻有爆音风险）*/
+volatile uint32_t g_es_silent_vol = 0xFFu;  /* 上面那次确认读到的 REG32（应为 0x00）*/
+volatile uint32_t g_es_silent_mute = 0xFFu; /* 上面那次确认读到的 REG31（bit6/5 应为 1）*/
+volatile uint32_t g_es_pdown_n   = 0u;      /* es8311_stop_dac()（真·掉电）执行次数 ——
+                                             * 补丁13 起**正常播放/停止路径不再调用它**，应恒 0 */
+volatile uint32_t g_es_reg01_n   = 0u;      /* REG01（时钟管理）被写的次数 */
+volatile uint32_t g_es_reg01_val = 0xFFFFu; /* REG01 最后一次写进去的值（应恒 0x3F）*/
+volatile uint32_t g_es_pdown_req = 0u;      /* 排障钩子：写 1 ⇒ 主循环下一拍执行一次"真掉电"
+                                             * （用于验证"掉电 → 起播恢复时钟"这条配对，见
+                                             *  tools/es8311_clk_check.py 的 K2）*/
+volatile uint32_t g_es_nack_sim  = 0u;      /* 排障钩子：0=正常；1=每笔事务直接判失败（模拟对端
+                                             * 永不回应）；2=另假装 SDA 被钳住（把 bus clear 与
+                                             * 熔断一起演练）。**纯软件、不碰任何电气**，
+                                             * 用来把"最坏情况下的单拍阻塞上限"变成可复现的判据。*/
+
 /* 写失败后的 I2C 现场复位（只动 I2C1 自己的寄存器 + HAL 句柄，不碰任何 GPIO 电气；
  * 定义放在 s_hi2c 声明之后，见下面 es8311_write_reg 之前）。 */
 
@@ -77,6 +105,18 @@ static uint8_t           s_codec_ready = 0u;
  * breaker_tick    ：熔断后 HAL_GetTick() 的冷却起点；冷却期内所有 I2C 立即快速失败。*/
 static uint32_t          s_es_consec_fail = 0u;
 static uint32_t          s_es_breaker_tick = 0u;
+/* ★ 补丁13 新增：
+ *   s_es_bc_streak —— 连续"做了 bus clear 却仍没换来一次成功"的次数。达 ES8311_BC_TRIP
+ *                     即直接判总线不可用（把熔断阈值填满）—— 见 es8311_bus_clear() 的说明。
+ *   s_es_fast_fail —— 1 = 已进入"降级快速失败"模式：上一笔事务耗时 > 5 ms（说明总线/从机
+ *                     出问题），此后每笔只用**1 次尝试 + 1 ms 超时**，直到某笔又快又成功地
+ *                     完成才退出。作用：把"烂总线"下单拍的 I2C 阻塞上限收缩一个量级。
+ *   s_reg31        —— REG31 的**写侧缓存**：官方语义是"读-改-写只动 bit6/5"，但每笔读
+ *                     都是一次额外的 NACK 机会（实测 0x31 正是失败最多的寄存器之一）
+ *                     ⇒ 改成只在回读体检时刷新缓存、写的时候直接拼值。 */
+static uint32_t          s_es_bc_streak = 0u;
+static uint8_t           s_es_fast_fail = 0u;
+static uint8_t           s_reg31        = 0x00u;
 
 /* ★ SCL 目标频率（Hz）。默认 100 kHz；SWD 写 `g_es_i2c_hz` 后调 es8311_i2c_retiming()
  *   现场改 TIMINGR —— 用于验证"降频能否消除 ~30% 首试 NACK"的电气边际假设。
@@ -258,11 +298,39 @@ uint32_t es8311_i2c_retiming(void)
 #define ES8311_BREAKER_N    6u
 #define ES8311_BREAKER_MS   250u
 
+/* ★ 补丁13 新增的三个阈值（"偶发卡死"的收敛手段，全部与 25 ms 那个坑有关）：
+ *
+ * ① ES8311_SLOW_US / "降级快速失败"
+ *    单笔事务耗时超过 5 ms 就说明总线已经不正常（正常一字节事务 ~90 µs，含从机拉伸
+ *    时钟也就几百 µs）。此后**每笔只用 1 次尝试 + 1 ms 超时**，直到某笔在 1 ms 内
+ *    完成才恢复满重试。为什么按"上一笔的耗时"而不是"失败次数"降级：真正的卡顿源自
+ *    **HAL 内部的等待**（见 ②），而不是重试次数本身，所以必须由"已经慢了"这件事触发。
+ *
+ * ② ES8311_TIMEOUT_FAST_MS —— 降级模式下的单笔超时。
+ *    ⚠⚠ 【这是本轮找到的最直接的卡死来源】HAL 的 `HAL_I2C_Master_Transmit()` 开头会
+ *    `I2C_WaitOnFlagUntilTimeout(hi2c, I2C_FLAG_BUSY, SET, I2C_TIMEOUT_BUSY, ...)`，
+ *    而 `I2C_TIMEOUT_BUSY = 25 ms` 是 **HAL 源文件里的常量**（stm32h7xx_hal_i2c.c:344），
+ *    与本项目传进去的 5 ms **没有任何关系**。总线烂掉时 BSY 会一直置位 ⇒ **每次尝试
+ *    都先白等 25 ms**；19 笔起播 × 5 次重试 × 25 ms ≈ 2.4 s ⇒ 主循环停转。
+ *    本版两道防线：先自己查 BUSY（命中就绕开 HAL，见 es8311_i2c_busy_stuck），
+ *    以及降级模式下把单笔超时压到 1 ms。
+ *
+ * ③ ES8311_BC_TRIP —— 连续几次 bus clear 没换来成功就判总线不可用。
+ *    旧代码在 bus_clear 里把熔断计数清零，而 bus_clear 恰恰只在"SDA 被钳住"时触发
+ *    ⇒ 熔断**永远攒不满**（实测复现里 breaker_trip 恒 0、fail 涨到 49）。 */
+#define ES8311_SLOW_US          5000u
+#define ES8311_TIMEOUT_FAST_MS  1u
+#define ES8311_BC_TRIP          3u
+
 /* ---- 前置声明：probe 在这些实现之前就用到它们（bus clear / 熔断 / 计数）----
  * 定义在文件下方（bus clear 需要 GPIO + I2C 寄存器，集中放在一起更清楚）。 */
 static void es8311_i2c_recover(HAL_StatusTypeDef st);
 static uint32_t es8311_retry_budget(void);
 static void es8311_i2c_note(int failed);
+static void es8311_i2c_hw_reset(void);
+static int  es8311_i2c_busy_stuck(void);
+static void es8311_tx_begin(uint32_t *t0);
+static void es8311_tx_end(uint32_t t0);
 
 int es8311_probe(uint8_t addr7)
 {
@@ -297,7 +365,25 @@ int es8311_probe_to(uint8_t addr7, uint32_t timeout_ms)
 
     for (uint32_t att = 0u; att < tries; ++att)
     {
-        if (HAL_I2C_IsDeviceReady(&s_hi2c, (uint16_t)(addr7 << 1), 3u, timeout_ms) == HAL_OK)
+        uint32_t t0;
+        int      ready;
+
+        if (g_es_nack_sim != 0u)
+        {
+            ready = 0;
+        }
+        else if (es8311_i2c_busy_stuck() != 0)
+        {
+            ready = 0;                  /* 外设卡住：不交给 HAL（它要等 25 ms）*/
+        }
+        else
+        {
+            es8311_tx_begin(&t0);
+            ready = (HAL_I2C_IsDeviceReady(&s_hi2c, (uint16_t)(addr7 << 1), 3u, timeout_ms)
+                     == HAL_OK) ? 1 : 0;
+            es8311_tx_end(t0);
+        }
+        if (ready != 0)
         {
             if (att != 0u)
             {
@@ -308,7 +394,10 @@ int es8311_probe_to(uint8_t addr7, uint32_t timeout_ms)
         }
         /* 探测失败同样要看总线电平：SDA 被钳住就做 bus clear（否则后面全卡）。 */
         es8311_i2c_recover(HAL_ERROR);
-        HAL_Delay(ES8311_TRY_MS);
+        if (tries > 1u)                /* ★ 补丁13：与读写同口径，降级态不付这笔延时 */
+        {
+            HAL_Delay(ES8311_TRY_MS);
+        }
     }
     es8311_i2c_note(1);
     return -1;
@@ -317,6 +406,75 @@ int es8311_probe_to(uint8_t addr7, uint32_t timeout_ms)
 void es8311_set_addr(uint8_t addr7)
 {
     s_addr7 = addr7;
+}
+
+/* ★★ 2026-10-14（补丁13）：把"偶发卡死"从"靠运气"变成"有上限"的三个小工具 ★★ */
+
+/* 单笔 I2C 事务计时（DWT 周期计数，µs 分辨率；DWT 在本工程常开，见 main.c/audio_out.c）。
+ * 统计量落到 g_es_tx_us_max / g_es_slow_n，并按"上一笔快慢"维护降级标志 s_es_fast_fail。 */
+static void es8311_tx_begin(uint32_t *t0)
+{
+    *t0 = DWT->CYCCNT;
+}
+
+static void es8311_tx_end(uint32_t t0)
+{
+    uint32_t us = (uint32_t)((DWT->CYCCNT - t0) / (SystemCoreClock / 1000000u));
+
+    if (us > g_es_tx_us_max)
+    {
+        g_es_tx_us_max = us;
+    }
+    if (us > ES8311_SLOW_US)
+    {
+        g_es_slow_n++;
+        s_es_fast_fail = 1u;            /* 一笔就慢了 ⇒ 后面每笔只用 1 次尝试 + 1 ms 超时 */
+    }
+    /* ⚠ 这里**不**清 s_es_fast_fail：NACK 本身只要 ~200 µs，"快"不代表"好"。
+     *   降级态的出口只有一个 —— 某笔**整笔成功**（es8311_i2c_note(0)）。
+     *   这很重要：若按"上一笔快不快"来退出降级，NACK 风暴里会反复进出，
+     *   每次都先付满"5 次尝试 + 5 × 2 ms 延时"，单拍又会被拖长。 */
+}
+
+/* I2C1 外设的**硬件复位**（RCC 的 I2C1RST）。
+ *
+ * 【为什么不能只写 PE=0/1】PE 复位只清外设的寄存器，**不保证清掉 BUSY 标志**：BUSY 的语义是
+ *   "总线上有一次传输还没结束"，当从机把 SDA 钳低时主机永远等不到 STOP，BUSY 就一直置位。
+ *   而 HAL 每个事务开头都要等 BUSY 清零（固定 25 ms，见文件上方 ② 的说明）⇒ 卡死放大。
+ *   RCC 强制复位把整个外设（含状态机）归零，是 ST 官方给出的确定性手段。
+ *
+ * 【电气安全】只复位 I2C1 这一个外设的寄存器，**不碰任何 GPIO 的电气配置**、不改变
+ *   引脚模式、不驱动任何线；PB6/PB7 的 AF 与上拉保持原样。I2C1 在本工程是 ES8311 独占
+ *   （全仓 grep 确认：除 es8311.c 外只有 audio_test.c 的自检会临时关它）。
+ *   ⚠ 复位会把 TIMINGR 一起清掉 ⇒ 必须紧跟一次 HAL_I2C_Init 把时序写回。 */
+static void es8311_i2c_hw_reset(void)
+{
+    __HAL_RCC_I2C1_FORCE_RESET();
+    for (volatile uint32_t i = 0u; i < 32u; ++i) { }
+    __HAL_RCC_I2C1_RELEASE_RESET();
+
+    s_hi2c.State     = HAL_I2C_STATE_READY;
+    s_hi2c.ErrorCode = HAL_I2C_ERROR_NONE;
+    s_hi2c.Lock      = HAL_UNLOCKED;
+    (void)HAL_I2C_Init(&s_hi2c);
+    g_es_rcc_rst_n++;
+}
+
+/* 进 HAL 之前先看 BUSY：返回 1 = 外设卡住（**本笔不要再交给 HAL**，否则要白等 25 ms）。
+ * 命中就先做一次硬件复位；复位后 BUSY 仍未清 ⇒ 判定卡住，让调用方快速失败。 */
+static int es8311_i2c_busy_stuck(void)
+{
+    if ((I2C1->ISR & I2C_ISR_BUSY) == 0u)
+    {
+        return 0;
+    }
+    g_es_busy_stuck_n++;
+    es8311_i2c_hw_reset();
+    if ((I2C1->ISR & I2C_ISR_BUSY) == 0u)
+    {
+        return 0;                       /* 复位救回来了：本笔照常走 HAL */
+    }
+    return 1;                           /* 仍卡住：不要再让 HAL 去等 25 ms */
 }
 
 /* ★★ I2C 总线恢复：9 个 SCL 脉冲 + STOP（bus clear）— 2026-10-13 UI 卡死根因之一 ★★
@@ -412,9 +570,28 @@ static void es8311_bus_clear(void)
     s_hi2c.Lock      = HAL_UNLOCKED;
     g_es_recover_pe++;
 
-    /* --- 6) 复位熔断：总线刚清理过，给一次"干净"的机会 --- */
-    s_es_consec_fail  = 0u;
-    s_es_breaker_tick = 0u;
+    /* --- 6) ★ 补丁13：熔断计数**不再清零**，改为"连续几次 bus clear 都没换来成功
+     *        就判总线不可用"。 ---
+     * 【旧代码错在哪】原来这里是 `s_es_consec_fail = 0; s_es_breaker_tick = 0;`
+     *   —— 而本函数**只在"SDA 被从机钳住"时被调用**，那恰好就是熔断器被设计出来要对付的
+     *   那种状态。于是：每次失败都触发一次 bus clear ⇒ 计数被清零 ⇒ 永远攒不到
+     *   ES8311_BREAKER_N=6 ⇒ **熔断永不触发**。实测（ui_freeze_repro 40 轮真实点击）：
+     *   主循环停转、`g_es_fail` 涨到 49，而 `g_es_breaker_trip` 恒为 0 —— 保护形同虚设。
+     * 【现在】只有"整笔事务成功"才清计数（es8311_i2c_note(0)）；bus clear 连续做满
+     *   ES8311_BC_TRIP 次仍没有任何一笔成功 ⇒ 直接把计数填满阈值，进入冷却半开。 */
+    if (++s_es_bc_streak >= ES8311_BC_TRIP)
+    {
+        s_es_consec_fail  = ES8311_BREAKER_N;
+        s_es_breaker_tick = HAL_GetTick();
+        g_es_breaker_trip++;
+    }
+
+    /* --- 7) 清完再看一眼：SDA 还是低 ⇒ 这次 bus clear 没救回来（量化 it，别猜）--- */
+    for (volatile uint32_t i = 0u; i < 2000u; ++i) { }
+    if ((GPIOB->IDR & GPIO_PIN_7) == 0u)
+    {
+        g_es_bc_fail++;
+    }
     g_es_bus_clear++;
 }
 
@@ -442,6 +619,12 @@ static void es8311_i2c_recover(HAL_StatusTypeDef st)
      *   ⇒ 采样前先等几个 µs（并连读两次取"稳定态"）。 */
     for (volatile uint32_t i = 0u; i < 2000u; ++i) { }   /* ≈ 20 µs @100 MHz：等 SDA 抬起 */
     idr = GPIOB->IDR & (GPIO_PIN_6 | GPIO_PIN_7);
+    /* ★ 补丁13：排障仿真 g_es_nack_sim>=2 ⇒ 假装 SDA 被钳住，把 bus clear 与熔断一起演练
+     * （纯软件，不改任何电气；见 g_es_nack_sim 的声明）。 */
+    if (g_es_nack_sim >= 2u)
+    {
+        idr &= ~(uint32_t)GPIO_PIN_7;
+    }
     if ((g_es_busclear_en != 0u) && ((idr & GPIO_PIN_7) == 0u))
     {
         es8311_bus_clear();
@@ -453,14 +636,11 @@ static void es8311_i2c_recover(HAL_StatusTypeDef st)
     {
         return;                       /* NACK 且总线电平正常：等调用方的延时即可 */
     }
-    CLEAR_BIT(I2C1->CR1, I2C_CR1_PE);
-    (void)I2C1->CR1;                  /* 读回：保证写已到达外设 */
-    for (volatile uint32_t i = 0u; i < 32u; ++i) { }   /* ≥3 个 APB 周期 */
-    SET_BIT(I2C1->CR1, I2C_CR1_PE);
-    s_hi2c.State     = HAL_I2C_STATE_READY;
-    s_hi2c.ErrorCode = HAL_I2C_ERROR_NONE;
-    s_hi2c.Lock      = HAL_UNLOCKED;
-    g_es_recover_pe++;
+    /* ★ 补丁13：BUSY/TIMEOUT 改用**外设硬件复位**（RCC 的 I2C1RST）。
+     *   原来只写 PE=0/1 不够 —— BUSY 的语义是"总线上还有一次传输没结束"，SDA 被钳住时
+     *   永远等不到 STOP，PE 复位不保证能清它。而 HAL 每个事务开头要等 BUSY（固定 25 ms）
+     *   ⇒ 卡死会被逐笔放大。RCC 复位把状态机一并归零，才是确定性的做法。 */
+    es8311_i2c_hw_reset();
 }
 
 /* 熔断查询：返回**本次调用允许的最大重试次数**（实现"半开"语义，避免误伤正常播放）。
@@ -471,6 +651,13 @@ static void es8311_i2c_recover(HAL_StatusTypeDef st)
  *      真恢复了立刻转正常；仍失败则继续冷却，代价仅 5 ms。 */
 static uint32_t es8311_retry_budget(void)
 {
+    /* ★ 补丁13：降级快速失败优先 —— 上一笔已经慢了（>5 ms）就只给 1 次机会。
+     *   这一条与熔断互补：熔断按"整笔全灭"计数、反应慢半拍；这里按"单笔耗时"即时收敛，
+     *   保证"烂总线"下单拍的 I2C 阻塞上限不会因为 19 笔起播而线性放大。 */
+    if (s_es_fast_fail != 0u)
+    {
+        return 1u;
+    }
     if (s_es_consec_fail < ES8311_BREAKER_N)
     {
         return ES8311_WR_TRIES;
@@ -490,6 +677,11 @@ static void es8311_i2c_note(int failed)
     if (failed)
     {
         s_es_consec_fail++;
+        /* ★ 补丁13：整笔全灭是"这条链路现在不好使"的强信号 ⇒ 进入降级快速失败。
+         *   效果：**第一个**失败的寄存器付 5×(0.2 ms + 2 ms) ≈ 11 ms，其后每一笔只
+         *   0.2 ms（1 次尝试、不延时、1 ms 超时）⇒ 一次 19~40 笔的起播/初始化序列
+         *   单拍总开销被压在 ~20 ms 量级，而不是 167 ms（实测）或 ~2.4 s（旧代码）。 */
+        s_es_fast_fail = 1u;
         if (s_es_consec_fail == ES8311_BREAKER_N)
         {
             s_es_breaker_tick = HAL_GetTick();
@@ -499,6 +691,10 @@ static void es8311_i2c_note(int failed)
     else
     {
         s_es_consec_fail = 0u;
+        /* ★ 补丁13：只有**真正成功**才退出降级 + 清"bus clear 连击"计数。
+         *   （旧代码在 bus_clear 里清 consec_fail，等于自己把熔断关掉，见其说明。） */
+        s_es_bc_streak   = 0u;
+        s_es_fast_fail   = 0u;
     }
 }
 
@@ -508,13 +704,15 @@ int es8311_write_reg(uint8_t reg, uint8_t val)
 {
     uint8_t           buf[2];
     HAL_StatusTypeDef st = HAL_ERROR;
-
-    buf[0] = reg;
-    buf[1] = val;
-
+    uint32_t          t0;
     /* ★ 熔断（半开）：冷却期只允许 1 次快速尝试，绝不拖成 UI 卡顿。
      *   理由见 es8311_retry_budget：直接失败会把"慢但能用"退化成"点了没反应"。 */
     uint32_t tries = es8311_retry_budget();
+    /* ★ 补丁13：降级模式下把单笔超时也压到 1 ms（见 ES8311_TIMEOUT_FAST_MS 的说明）。 */
+    uint32_t to    = (s_es_fast_fail != 0u) ? ES8311_TIMEOUT_FAST_MS : ES8311_TIMEOUT_MS;
+
+    buf[0] = reg;
+    buf[1] = val;
 
     /* 最多写 tries 次：失败后按类型处置再重试（理由见上）。
      * ⚠ 只在**第一次**失败时记账（否则重试会把失败现场冲掉，复盘时就看不到真因）。
@@ -523,8 +721,23 @@ int es8311_write_reg(uint8_t reg, uint8_t val)
      *   "没声音"和"音量大小混乱"。 */
     for (uint32_t att = 0u; att < tries; ++att)
     {
-        st = HAL_I2C_Master_Transmit(&s_hi2c, (uint16_t)(s_addr7 << 1), buf, 2u,
-                                     ES8311_TIMEOUT_MS);
+        /* ★ 补丁13 的两道防线（顺序有意义）：
+         *   ① 排障仿真（g_es_nack_sim）直接判失败 —— 用于复现"对端永不回应"的最坏情况；
+         *   ② 自己查 BUSY：命中就绕开 HAL，省下它内部那笔**固定 25 ms** 的等待。 */
+        if (g_es_nack_sim != 0u)
+        {
+            st = HAL_ERROR;
+        }
+        else if (es8311_i2c_busy_stuck() != 0)
+        {
+            st = HAL_BUSY;
+        }
+        else
+        {
+            es8311_tx_begin(&t0);
+            st = HAL_I2C_Master_Transmit(&s_hi2c, (uint16_t)(s_addr7 << 1), buf, 2u, to);
+            es8311_tx_end(t0);
+        }
         if (st == HAL_OK)
         {
             if (att != 0u)
@@ -535,6 +748,15 @@ int es8311_write_reg(uint8_t reg, uint8_t val)
             {
                 g_es_reg32_wr = val;
                 g_es_reg32_n++;
+            }
+            if (reg == 0x01u)             /* ★ 补丁13：时钟管理寄存器（K2 的"起播确实写过"证据）*/
+            {
+                g_es_reg01_val = val;
+                g_es_reg01_n++;
+            }
+            if (reg == 0x31u)             /* ★ 补丁13：静音寄存器写侧缓存（见 s_reg31 说明）*/
+            {
+                s_reg31 = val;
             }
             g_es_wr_ok++;
             es8311_i2c_note(0);
@@ -558,7 +780,14 @@ int es8311_write_reg(uint8_t reg, uint8_t val)
         }
 
         es8311_i2c_recover(st);
-        HAL_Delay(ES8311_TRY_MS);         /* NACK：给芯片一点时间走出"不应答"窗口 */
+        /* ★ 补丁13：只在"还有下一次尝试"时才付这 2 ms 延时。
+         *   这笔延时本来是给芯片"走出 NACK 窗口"用的（实测有效：首试 NACK 后延时再试
+         *   基本都能成 —— g_es_retry_ok 在涨）。但降级/熔断态下 tries==1，没有下一次了，
+         *   再加延时就是在白白拖长主循环单拍，所以跳过。 */
+        if (tries > 1u)
+        {
+            HAL_Delay(ES8311_TRY_MS);
+        }
     }
 
     g_es_fail++;
@@ -569,21 +798,34 @@ int es8311_write_reg(uint8_t reg, uint8_t val)
 int es8311_read_reg(uint8_t reg, uint8_t *val)
 {
     HAL_StatusTypeDef st = HAL_ERROR;
-
+    uint32_t          t0;
     /* ★ 熔断（半开）：冷却期只允许 1 次快速尝试（理由见 es8311_retry_budget）。 */
     uint32_t tries = es8311_retry_budget();
+    /* ★ 补丁13：降级模式下单笔超时压到 1 ms（与 write 同口径）。 */
+    uint32_t to    = (s_es_fast_fail != 0u) ? ES8311_TIMEOUT_FAST_MS : ES8311_TIMEOUT_MS;
 
     /* 与写同样要重试：读失败会让调用方**跳过**后续写（config_i2s 就是
      * `if (read == 0) write(...)`），结果是数据格式没配却"看起来成功"——又是
      * 一类只有耳朵能发现的静默故障。 */
     for (uint32_t att = 0u; att < tries; ++att)
     {
-        st = HAL_I2C_Master_Transmit(&s_hi2c, (uint16_t)(s_addr7 << 1), &reg, 1u,
-                                     ES8311_TIMEOUT_MS);
-        if (st == HAL_OK)
+        if (g_es_nack_sim != 0u)
         {
-            st = HAL_I2C_Master_Receive(&s_hi2c, (uint16_t)(s_addr7 << 1), val, 1u,
-                                        ES8311_TIMEOUT_MS);
+            st = HAL_ERROR;
+        }
+        else if (es8311_i2c_busy_stuck() != 0)
+        {
+            st = HAL_BUSY;
+        }
+        else
+        {
+            es8311_tx_begin(&t0);
+            st = HAL_I2C_Master_Transmit(&s_hi2c, (uint16_t)(s_addr7 << 1), &reg, 1u, to);
+            if (st == HAL_OK)
+            {
+                st = HAL_I2C_Master_Receive(&s_hi2c, (uint16_t)(s_addr7 << 1), val, 1u, to);
+            }
+            es8311_tx_end(t0);
         }
         if (st == HAL_OK)
         {
@@ -602,7 +844,10 @@ int es8311_read_reg(uint8_t reg, uint8_t *val)
             g_es_ng_idr = GPIOB->IDR & (GPIO_PIN_6 | GPIO_PIN_7);
         }
         es8311_i2c_recover(st);
-        HAL_Delay(ES8311_TRY_MS);
+        if (tries > 1u)                /* ★ 补丁13：降级/熔断态（tries==1）不付这笔延时 */
+        {
+            HAL_Delay(ES8311_TRY_MS);
+        }
     }
     es8311_i2c_note(1);
     return -1;
@@ -765,6 +1010,15 @@ static int dac_path_regs(uint8_t vol_reg)
     rc |= es8311_write_reg(0x00, 0x80);
     rc |= es8311_write_reg(0x01, 0x3F);
 
+    /* ★ 补丁13：**先数字静音，再上电**（防爆音的通用次序：上电全程 muted）。
+     *   为什么补这一笔：芯片复位默认 REG31 = 0x00（未静音）。首次起播时若正好把
+     *   模拟通路（REG0E/REG12/REG0D）在一颗"未静音"的芯片上拉起来，输出节点从
+     *   断电态跳到工作点的那个台阶会**直接出来**（只是幅度被 REG32=0 压着）。
+     *   本函数末尾本来就有一笔解静音，这里补上与之配对的"先静音"，使通路
+     *   **在整个上电过程中都处于静音** —— 与官方 es8311_enable(false)→(true)
+     *   的次序一致（set_mute(true) → … → set_mute(false)）。 */
+    rc |= es8311_set_mute(1);
+
     /* DAC 通路开（0x09 bit6=0），ADC 通路关（0x0A bit6=1）*/
     if (es8311_read_reg(0x09, &v) == 0)
     {
@@ -850,22 +1104,95 @@ int es8311_dac_mute(void)
  *   ⚠ 与 REG32 无关、互不覆盖：所以"起播时 REG32=0 + REG31 解静音"两条路都安全。 */
 int es8311_set_mute(int on)
 {
-    uint8_t v = 0u;
+    uint8_t v;
     int rc;
 
-    if (es8311_read_reg(0x31, &v) != 0)
-    {
-        v = 0u;      /* 读失败：按复位默认（全 0 = 未静音）算，只清/置 bit6/5 */
-    }
-    v = (uint8_t)((v & 0x9Fu) | (on ? 0x60u : 0x00u));
+    /* ★ 补丁13：不再"先读再写"，直接用写侧缓存 s_reg31（由每次成功的 0x31 写入与
+     *   es8311_dac_readback 的回读共同维护）。
+     * 【为什么改】官方语义确实是"读-改-写只动 bit6/5"，但那一笔**读**每一次都是一次
+     *   独立的 NACK 机会 —— 实测失败环里 0x31 出现频率最高（g_es_ng_ring），而它恰好是
+     *   "切时钟前最后一道防线"：写丢了就是那声爆音。少一笔读 = 少一次失败机会。
+     *   缓存失真不会长期存在：es8311_dac_readback() 每 ~1 s 回读一次并把缓存对齐。 */
+    v = (uint8_t)((s_reg31 & 0x9Fu) | (on ? 0x60u : 0x00u));
     rc = es8311_write_reg(0x31, v);
     g_es_rc = rc;
     return rc;
 }
 
+/* ★★ 2026-10-14（补丁13）：让 DAC **确定地**变静音，并且**当场确认**。 ★★
+ *
+ * 【为什么需要"确认"这一步】这是"停时钟之前"的最后一道防线：
+ *   若切 I2S 时钟的那一刻 DAC 还挂在有效音量上，ΣΔ 调制器停摆 ⇒ 输出保住一个直流电平
+ *   ⇒ 相对上一刻的波形就是一次阶跃 ⇒ **那声爆音**。
+ *   而 I2C 是**会失败**的：实测首试 NACK 约 5%~30%，且失败环里 0x31/0x32 命中最多。
+ *   "写了就算"在这条路径上等于"有相当概率不静音"。
+ *
+ * 【动作顺序（每一步都有理由）】
+ *   ① REG32 先砍一半 —— 即便后面两笔全丢，切时钟时的跳变也已小 6 dB（兜底）；
+ *   ② REG32 = 0    —— 音量到最小（-95.5 dB）；
+ *   ③ REG31 = 静音 —— 数字静音是**即时**的，且时钟仍在跑，调制器能正常完成过渡；
+ *   ④ 回读 0x32/0x31 **确认**；没确认就补写一轮再验（最多 2 轮）。
+ *
+ * 【与 es8311_stop_dac() 的分工】本函数**完全不碰电源/时钟寄存器**：
+ *   芯片保持"通电 + VMIDSEL 仍工作"，与「暂停」是同一个状态。而 es8311_stop_dac()
+ *   会把内部参考 VREF/VMIDSEL 一起断掉 —— 基准塌掉/重建会在输出耦合电容上产生一次
+ *   低频台阶（同一声爆音的另一个来源）。所以**正常播放/停止不再调它**。
+ *
+ * @return 0 = 已确认静音；-1 = 未能确认（调用方应把 g_es_silent_ng 当作"有爆音风险"看）*/
+int es8311_dac_become_silent(void)
+{
+    /* ① 半步降（兜底：万一 ②③ 都丢，跳变也只有原来的一半） */
+    if ((g_es_reg32_wr != 0xFFFFu) && (g_es_reg32_wr > 1u))
+    {
+        (void)es8311_write_reg(0x32u, (uint8_t)(g_es_reg32_wr / 2u));
+    }
+    /* ②③ 音量归零 + 数字静音 */
+    (void)es8311_write_reg(0x32u, 0x00u);
+    (void)es8311_set_mute(1);
+
+    /* ④ 确认（最多三轮：前两轮各补写一轮再验；第三轮是给"探针 halt / 芯片电源态窗口"
+     *   这种连续多笔 NACK 的极端情形留的 —— 实测 40 轮快速启停里会出现 1 次连两轮都
+     *   验不过的情况。确认不了就记 g_es_silent_ng，让"有爆音风险"可见。） */
+    for (uint32_t round = 0u; round < 3u; ++round)
+    {
+        uint8_t vol = 0xFFu;
+        uint8_t m   = 0xFFu;
+        int ok = (es8311_read_reg(0x32u, &vol) == 0) && (vol == 0u);
+
+        ok = ok && (es8311_read_reg(0x31u, &m) == 0) && ((m & 0x60u) == 0x60u);
+        if (ok != 0)
+        {
+            s_reg31 = m;                /* 缓存对齐（回读到的才是芯片里真实的）*/
+            g_es_rb_mute = m;
+            /* ⚠ 这里**不**写 g_es_rb_vol / g_es_rb_pwr：那两个是"起播后音量确认期"的口径，
+             *   被停/暂停覆盖会让 tools/wav_pause_resume_check.py 的 P3 判据读到 0 而误报。
+             *   本函数自己的回读值另存 g_es_silent_vol / g_es_silent_mute。 */
+            g_es_silent_vol  = vol;
+            g_es_silent_mute = m;
+            g_es_silent_n++;
+            return 0;
+        }
+        (void)es8311_write_reg(0x32u, 0x00u);
+        (void)es8311_set_mute(1);
+    }
+    g_es_silent_ng++;
+    return -1;
+}
+
 int es8311_stop_dac(void)
 {
     int rc = 0;
+
+    /* ★ 补丁13：计数 + 说明为什么正常路径不再调它。
+     * 【为什么"停止播放"不再走本函数】本函数是**真·掉电**（含 REG0D=0xFC 把内部参考
+     *   VREF 断掉）。而"模拟基准塌掉 → 下次上电重新建立"会在输出耦合电容上产生一次
+     *   低频台阶 —— 这正是那声爆音的另一个来源。实测证据：走同一套"通电不动电源"策略的
+     *   「暂停」路径（补丁10 起）没有爆音抱怨，而走本函数的「停止/切歌」一直有。
+     *   ⇒ 停止改为 es8311_dac_become_silent()（只静音、不断电），与暂停同构。
+     * 【那谁还在用它】① audio_test.c 的一次性自检；② 排障钩子 g_es_pdown_req
+     *   （主循环消费一次）—— 用它继续保住"掉电 → 起播恢复时钟"这条配对的验收覆盖
+     *   （tools/es8311_clk_check.py）。 */
+    g_es_pdown_n++;
 
     /* ★ 2026-10-14（补丁11·D8/D9）：照搬官方 esp_codec_dev 的 es8311_suspend()
      *   ——**完整有序掉电尾**，掉电态比旧版"半掉电"更确定、更干净。
@@ -993,6 +1320,14 @@ int es8311_dac_readback(void)
         int mute_ok = (es8311_read_reg(0x31, &v) == 0);
         if (mute_ok) { g_es_rb_mute = v; } else { g_es_rb_mute = 0xFFFFu; }
         mute_ok = mute_ok && ((g_es_rb_mute & 0x60u) == 0u);
+        if (mute_ok != 0)
+        {
+            /* ★ 补丁13：把 REG31 的**写侧缓存**对齐到芯片里的真实值。
+             *   为什么必须有这一步：es8311_set_mute() 已改成"不读、直接用缓存拼值"
+             *   （少一笔读 = 少一次 NACK 机会，见其说明）。缓存若永远不校正，一次丢写
+             *   就会让缓存与芯片永久分叉。这里每 ~1 s 回读一次 ⇒ 分叉最多存在 1 s。 */
+            s_reg31 = (uint8_t)g_es_rb_mute;
+        }
 
         /* 终态判据：音量 == 目标、REG12 的 power-down 位(bit1)为 0、且 REG31 未静音。*/
         if (vol_ok && pwr_ok && mute_ok && (g_es_rb_vol == target) && ((g_es_rb_pwr & 0x02u) == 0u))

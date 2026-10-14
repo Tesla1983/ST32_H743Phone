@@ -112,6 +112,17 @@ def main():
     d3 = dbg()
     print("  g_es_rb_mute=0x%02X（bit6/5 应=0 ⇒ 未静音）  g_ao_t_dacwake_ms=%d  音量 ramp 走完 +%d ms"
           % (mute & 0xFF, d3[T_DACWAKE], bench.rd("g_ao_t_ramp_ms", 1)[0]))
+    # ★ 补丁13：停止/切歌**不再给 codec 断电**（断电会带来 VMIDSEL/VREF 台阶 = 爆音）。
+    #   同时"切时钟前的静音"必须**被确认**，不能只是"写了"。
+    pdown = bench.rd("g_es_pdown_n", 1)[0]
+    sil_ng = bench.rd("g_es_silent_ng", 1)[0]
+    sil_fail = bench.rd("g_ao_silent_fail", 1)[0]
+    sil_vol = bench.rd("g_es_silent_vol", 1)[0]
+    sil_mute = bench.rd("g_es_silent_mute", 1)[0]
+    print("  补丁13：真·掉电次数=%d（正常路径应 0）  静音确认：成功=%d 未确认=%d  音频层失败=%d"
+          % (pdown, bench.rd("g_es_silent_n", 1)[0], sil_ng, sil_fail))
+    print("          最后一次静音回读：REG32=%#04x（应 0x00）  REG31=%#04x（bit6/5 应=1）"
+          % (sil_vol & 0xFF, sil_mute & 0xFF))
     bench.wr("g_wav_test", [2])
     time.sleep(0.5)
 
@@ -129,6 +140,17 @@ def main():
         ("C6 环未溢出丢数（g_ao_ring_drop == 0）", rd_ == 0),
         ("C7 读卡不断供（g_wav_underrun == 0）", wu == 0),
         ("C8 停止后再播已解静音（REG31 bit6/5 == 0）", (mute & 0x60) == 0),
+        # ★ 补丁13 新增两条：直指用户报的"爆音"
+        #   C9：切时钟之前"静音"必须是**被确认**的，而不是"写了就算"。I2C 写会失败
+        #       （实测首试 NACK 5%~30%，失败环里 0x31 静音/0x32 音量命中最多），
+        #       "写了就算"= 有相当概率在满音量下切时钟 ⇒ 直流阶跃 ⇒ 那声爆音。
+        ("C9 静音已确认（REG32 回读==0 且 REG31 bit6/5==1，且无未确认记录）",
+         (sil_vol == 0) and ((sil_mute & 0x60) == 0x60) and (sil_ng == 0) and (sil_fail == 0)),
+        #   C10：正常播放/停止**不再给 codec 断电**。es8311_stop_dac() 的掉电尾会把
+        #        内部参考 VREF(REG0D bit2) 与 VMIDSEL 一起断掉，"基准塌掉 → 重建"会在
+        #        输出耦合电容上产生一次低频台阶（几十毫秒的"咚/噗"）—— 那是模拟域的台阶，
+        #        任何数字静音都挡不住。所以这条是"爆音"修复的另一半。
+        ("C10 正常路径未给 codec 断电（g_es_pdown_n == 0）", pdown == 0),
     ]
     for name, ok in checks:
         print("  %s  %s" % ("✅" if ok else "❌", name))

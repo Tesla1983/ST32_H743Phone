@@ -1590,5 +1590,40 @@
 #        wav_pause_resume_check 3/3 PASS、wav_play_check PASS、audio_start_ramp_check R1~R7 PASS、
 #        es8311_clk_check 2/2 PASS、i2s_dma_check PASS、volume_check PASS。
 #   FLASH 1 665 228 B（79.40%），比补丁11 +640 B。
-d1504569ecd30fd25988f676a3788a7e0337ad87a25f4c9070cae2a6fbf08ad2  ymgui-h743.bin
-d112e925489d8547c87327045eb8b1e475e875f027f63eb14ec40d7092bac89e  ymgui-h743.elf
+# 【已被补丁13取代】d1504569ecd30fd25988f676a3788a7e0337ad87a25f4c9070cae2a6fbf08ad2  ymgui-h743.bin
+# 【已被补丁13取代】d112e925489d8547c87327045eb8b1e475e875f027f63eb14ec40d7092bac89e  ymgui-h743.elf
+#
+# 【补丁 13 · 2026-10-14 · 「咔嗒爆音」与「I2C bus-clear 偶发卡死」同源收口】
+#   用户报（引用两段原文）：「咔嗒（爆音）」仍未解决 + 「补丁9b 的 I2C bus-clear 偶发卡死
+#   （约 1/3 概率）」。本轮先复现再动手：
+#   复现：tools/ui_freeze_repro.py 40（真实点击路径，补丁12 固件）第 5 次点击后主循环停转；
+#         g_es_fail=49 而 g_es_breaker_trip=0；失败 100% NACK（ng_nack=10/busy=0/tmo=0）、
+#         失败瞬间 g_es_ng_idr=0xC0（总线已释放）⇒ 不是补丁9 那种"从机钳住 SDA"的死锁。
+#   卡死三处根因：① 熔断器被 bus_clear 自己清零（它只在 SDA 被钳住时才被调 ⇒ 永不触发）；
+#         ② HAL 内部固定 I2C_TIMEOUT_BUSY=25 ms（stm32h7xx_hal_i2c.c:344，与传入 5 ms 无关）
+#            ⇒ 19 笔 × 5 重试 × 25 ms ≈ 2.4 s；③ 无单拍预算，逐笔线性放大。
+#   修法：进 HAL 前预检 ISR.BUSY（es8311_i2c_busy_stuck，省掉 25 ms 白等）+ RCC 硬复位兜底；
+#         降级快速失败（首笔即退、不付 2 ms 延时，唯一出口是某笔整笔成功）；
+#         bus_clear 连续 3 次无成功直接跳熔断；DWT 计时诊断 g_es_tx_us_max/g_es_slow_n。
+#   爆音第二条来源（模拟域）：es8311_stop_dac() 真掉电 REG0D=0xFC 连 PDN_VREF+VMIDSEL 一起断
+#         ⇒ 基准塌掉→重建的低频台阶，REG31 数字静音挡不住（旁证：暂停路径不断电、无抱怨）。
+#   修法：audio_out_stop()/pause() 改走新增 es8311_dac_become_silent()（半步降→REG32=0→
+#         REG31 静音→3 轮回读确认），**不再调 es8311_stop_dac()**；dac_path_regs() 上电全程静音。
+#         es8311_set_mute() 改缓存直写（省一笔读、少一次 NACK 机会）。
+#   新增诊断：g_es_silent_n/ng + g_es_silent_vol/mute（静音是否被读回确认）、g_es_pdown_n（恒 0）、
+#         g_es_reg01_n/val（写入侧证据）、g_es_pdown_req/g_es_nack_sim（排障钩子）、
+#         g_ao_silent_fail、g_ao_csusp_ms_max/tmo（实测 0 ms ⇒ 否掉"167 ms 来自 CSUSP"猜想）、
+#         main.c 的 g_tick_ms_max/g_tick_ms_over20（"最长那一拍"记在板上，主机整轮读一次）。
+#   新验收：tools/i2c_stall_check.py（新）S1~S8 全 PASS（含 g_es_nack_sim=2 最坏仿真：
+#         单拍 17 ms、熔断触发 97 次）；audio_click_check 扩到 C1~C10（C9 静音已确认/C10 未掉电）；
+#         es8311_clk_check K2 改"显式掉电→起播"非空判据（K6a/K6b 写入侧）；wav_pause_resume_check
+#         新增 P8（口径 P1 由 1 笔改 2~4 笔）。回归全绿：ui_freeze_repro 40 / wav_play_check /
+#         audio_start_ramp_check R1~R7 / i2s_dma_check / audio_buf_probe / volume_check（S1 为
+#         测试撞值非回归：残留 32 == 点击换算值 32，对照实验 32→74→9 机制正常）。
+#   量→改→再量（同一 40 轮）：主循环 第5轮停转→全程转；g_tick_ms_max >350→167→30 ms；
+#         g_es_fail 49→31→0；静音未确认 无→1/20→0/20。
+#   FLASH 1 666 308 B（79.46%），比补丁12 +1080 B。
+#   ⚠ 未证到部分：REG31 数字静音是瞬时切断（跳变=切断那刻波形瞬时值，寄存器手段无法消除）；
+#         爆音是否完全消失只能由耳朵判定；I2C 首试 NACK 5%~30% 属电气边际（模块无外部上拉）。
+b461c5fcf9f2fbcacf392ad0678d3866c6c09d9f056b700aec9bf41b24f196d9  ymgui-h743.bin
+a89bb741e66b0c306e1c7d45e195477f9309b2fdd42dff95b6d973a8ebc52b38  ymgui-h743.elf

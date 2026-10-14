@@ -145,6 +145,15 @@ extern volatile uint32_t g_ao_t_dacwake_ms;/* DAC 通路唤醒完成时刻（相
 extern volatile uint32_t g_ao_t_ramp_ms;   /* 起播音量 ramp 走完时刻（相对 CSTART）*/
 extern volatile uint32_t g_ao_ring_used_min;/* 播放期环形缓冲占用最小值（半字）= 抗卡顿垫子的下限 */
 
+/* ★ 2026-10-14（补丁13）：防爆音闭环的量。
+ * 【为什么必须有】"切 I2S 时钟之前 DAC 必须已经静音"是防爆音的最后一道防线，而 I2C 写
+ *   是**会失败**的（实测首试 NACK 5%~30%，失败环里 0x31 静音 / 0x32 音量命中最多）。
+ *   补丁13 把"写入"升级成"写入 + 回读确认"，这两个量就是"确认失败"的可见计数 ——
+ *   没有它们，这个坏状态是**看不出来的**（音量/电源回读全都会显示"正常"）。 */
+extern volatile uint32_t g_ao_silent_fail; /* 静音未能确认的次数（>0 = 有爆音风险）*/
+extern volatile uint32_t g_ao_csusp_ms_max;/* i2s_stop() 等"先挂起生效"的最长耗时(ms)，正常 0~1 */
+extern volatile uint32_t g_ao_csusp_tmo;   /* 等满 100 ms 兜底才走的次数（>0 = 停机路径被拖长）*/
+
 /* ---- 起播"防咔哒"时序（2026-10-13）----
  * 起播那一声响来自"DAC 通路在 I2S 时钟还没建立时就上电，且音量一步到位"。
  * 现在改成三步：I2S 先跑 → 静音接通 DAC → 音量分步 ramp。诊断量：

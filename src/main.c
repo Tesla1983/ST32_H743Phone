@@ -93,6 +93,14 @@ volatile int32_t  g_port_rc    = 99;          /* ymgui_port_init 的返回值，
 volatile int32_t  g_ctx_rc     = 0;           /* 1 = 上下文创建成功 */
 volatile int32_t  g_shell_rc   = 99;          /* PhoneShell_BoardInit 的返回值，0 = 成功 */
 volatile uint32_t g_tick_ms    = 0;           /* 上一拍实测经过的毫秒数 */
+/* ★ 2026-10-14（补丁13）：主循环**单拍最长耗时**与"长拍"计数 —— "UI 卡死"的量化判据。
+ * 【为什么需要它】用户报"快速点播放/暂停几轮后整个 UI 卡住"。probe-rs 每次读数都会
+ *   短暂停机内核，所以**靠主机侧高频采样去抓单拍尖峰是抓不准的**（而且采样本身会造伪影，
+ *   见 tools/audio_click_check.py 的测量方法学说明）。把"最长那一拍有多长"记在板上，
+ *   主机只需在整轮跑完后来读一次 —— 一次读数、零伪影、且抓得到尖峰。
+ * 【判据】正常情况下应 ≈16~20 ms（主循环未被阻塞）；数值越大 = 被 I2C/渲染阻塞得越久。 */
+volatile uint32_t g_tick_ms_max = 0;          /* 开机以来单拍最长耗时（ms）；SWD 写 0 可清零 */
+volatile uint32_t g_tick_ms_over20 = 0;       /* 单拍 > 20 ms 的拍数（正常 0）*/
 volatile uint32_t g_dwt_hz     = 0;           /* DWT 计数频率（= CPU 主频），用于核对时基 */
 
 /* CYCCNT 快照：给不直接包含 CMSIS 头的模块（如 phone_ime.c 的按键耗时台架）用。 */
@@ -846,6 +854,14 @@ int main(void)
             ms = 1u;              /* 至少推进 1ms，避免长按等计时永远不动 */
         }
         g_tick_ms = ms;
+        if (ms > g_tick_ms_max)
+        {
+            g_tick_ms_max = ms;      /* ★ 补丁13：板上记录"最长那一拍"，主机读一次即可 */
+        }
+        if (ms > 20u)
+        {
+            g_tick_ms_over20++;
+        }
         YMGUI_Inject_Tick(ms);
         g_mark_tick = g_loop_count + 1;
 
