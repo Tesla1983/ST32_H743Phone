@@ -119,6 +119,15 @@ volatile uint32_t g_ao_resume_calls = 0u;  /* 续播（起播）动作被真正�
  * （实测窗口持续到数十毫秒），给足余量又不至于长期占用 I2C 影响播放。 */
 #define AO_RB_CONFIRM_TRIES 12u
 
+/* 暂停淡出等待拍数（2026-10-14 修"播放/暂停咔嗒声"）：
+ * 暂停时先把 REG32 写成 0（ES8311 硬件软 ramp：REG37=0x48 = 0.25 dB / 32 LRCK，
+ * ≈ 0.655 ms / 0.25 dB）。DAC 音量被硬件平滑降向 -95.5 dB。从 0 dB 降到听感静音
+ * （~-60 dB）约需 240 步 ≈ 157 ms ⇒ 取 12 拍（≈192 ms）再停 I2S 传输，此时已基本
+ * 无声，切断时钟不再可闻。
+ * ⚠ 为什么必须"先静音、后停时钟"：原来 audio_out_pause 先 i2s_stop() 掐时钟、再
+ *   es8311_dac_mute()，时钟断的瞬间 DAC 还满音量 ⇒ 输出电平瞬跳 ⇒ 那声"咔嗒"。 */
+#define AO_PAUSE_FADE_TICKS 12u
+
 /* ---- 环形缓冲 → SRAM1 的 .bss_audio（MPU region0：非缓存）----
  * 8192 个半字 = 16 KB = 4096 帧 ≈ 84 ms 的音频；一次补半个环（2048 帧 ≈ 42 ms）。 */
 #define AUDIO_BUF_ATTR   __attribute__((section(".bss_audio"), aligned(32)))
@@ -143,6 +152,7 @@ static volatile uint8_t  s_dac_pending = 0u;   /* 起播后延到下一拍再唤
 static volatile uint8_t  s_vol_ramp_left = 0u; /* 音量 ramp 剩余步数（0 = 不动）*/
 static volatile uint8_t  s_dac_rb_pending = 0u;/* "确认期"剩余尝试次数（见 tick；0 = 不在确认期）*/
 static volatile uint32_t s_rb_tick = 0u;       /* 播放中定期回读体检的节流计数（~1 s 一次）*/
+static volatile uint8_t  s_pause_fade_ticks = 0u;  /* 暂停淡出：写完 REG32=0 后，延几拍等 HW 软 ramp 落静音再停传输（0 = 不在淡出）*/
 
 static I2S_HandleTypeDef s_hi2s;        /* I2S2 = SPI2 的 I2S 模式 */
 static audio_out_feeder  s_feeder = NULL;
@@ -729,6 +739,18 @@ int audio_out_start(void)
 
     if (g_ao_playing != 0u)
     {
+        /* 正在播、但"暂停淡出"还在进行（g_ao_playing 尚未归零、s_pause_fade_ticks > 0）
+         * ⇒ 取消淡出、把音量重新 ramp 回目标，否则会卡在"正在淡出到静音"且永远回不来。
+         * 典型场景：快速连点 暂停→播放，暂停的淡出还没走完就点了播放。 */
+        if (s_pause_fade_ticks != 0u)
+        {
+            s_pause_fade_ticks = 0u;
+            s_dac_rb_pending   = (uint8_t)AO_RB_CONFIRM_TRIES;
+            s_vol_ramp_left    = (uint8_t)AO_VOL_RAMP_STEPS;  /* 从当前低音量重新 ramp 上去 */
+            g_ao_dac_ramp      = s_vol_ramp_left;
+            g_ao_wake_cnt++;
+            g_ao_resume_calls++;
+        }
         return 0;                       /* 已在播：幂等 */
     }
     g_ao_resume_calls++;                /* ★ 动作级计数：本次起播/续播真的执行了 */
@@ -891,6 +913,7 @@ void audio_out_stop(void)
     s_dac_pending   = 0u;               /* 起播防咔哒状态一并归零 */
     s_vol_ramp_left = 0u;
     s_dac_rb_pending = 0u;
+    s_pause_fade_ticks = 0u;            /* 万一停传输时正卡在暂停淡出，清掉免得 tick 又来停一次 */
     g_ao_dac_ready  = 0u;
     g_ao_dac_ramp   = 0u;
 }
@@ -917,29 +940,51 @@ void audio_out_stop(void)
  *   又省掉一次"软复位 → 芯片不应答"的窗口。
  * ⚠ 真正的"停"（切歌 / 播完 / 退出）仍走 audio_out_stop()：那时把 codec 断电是对的，
  *   下次是全新起播，本来就要完整 init。 */
+/* 停"出音传输"但**保留 codec 通电与通路**（暂停淡出末步用）：与 audio_out_stop 的
+ * 区别是**不**调 es8311_stop_dac()（不给 codec 断电）、也**不**清 es8311 侧的
+ * s_codec_ready ⇒ 续播能跳过完整 init、不再撞 NACK 窗口（见 audio_out_pause 顶部说明）。 */
+static void ao_pause_stop_transport(void)
+{
+    tim6_stop();
+    i2s_dma_stop();                     /* 没起 DMA 时内部直接返回 */
+    i2s_stop();
+    i2s_gpio_release();                 /* PB9 还给 UART4 */
+    g_ao_playing = 0u;
+    g_ao_codec   = 0u;
+    s_wr = 0u;
+    s_rd = 0u;
+    s_tim_pending      = 0u;
+    s_dac_pending      = 0u;
+    s_vol_ramp_left    = 0u;
+    s_dac_rb_pending   = 0u;
+    s_pause_fade_ticks = 0u;
+    g_ao_dac_ready     = 0u;
+    g_ao_dac_ramp      = 0u;
+}
+
 void audio_out_pause(void)
 {
     if (g_ao_playing == 0u)
     {
         return;
     }
+    if (s_pause_fade_ticks != 0u)
+    {
+        return;                         /* 已在淡出，忽略重复请求（g_ao_pause_calls 不重复 +1）*/
+    }
     g_ao_pause_calls++;                 /* ★ 动作级计数：本次暂停真的执行了 */
-    tim6_stop();
-    i2s_dma_stop();                     /* 没起 DMA 时内部直接返回 */
-    i2s_stop();
-    i2s_gpio_release();
-    (void)es8311_dac_mute();            /* ★ 只静音，**不** es8311_stop_dac()（断电）*/
+
+    /* ★ 修"暂停咔嗒"：先静音（REG32=0），此刻 I2S 传输**仍在跑**、数据**仍在流** ——
+     *   ES8311 硬件软 ramp（REG37=0x48）会把音量平滑降向 -95.5 dB（≈0.655 ms/0.25 dB），
+     *   不会爆音。等 HW 软 ramp 落静音后，再由 audio_out_tick 的 s_pause_fade_ticks
+     *   分支停传输（见下方）。
+     *   原来：先 i2s_stop() 掐时钟、再 es8311_dac_mute() —— 时钟断的瞬间 DAC 还满音量
+     *   ⇒ 输出电平瞬跳 ⇒ 那声"咔嗒"。
+     * ⚠ 只静音、**不** es8311_stop_dac()（断电）：芯片保持可达，续播跳过完整 init。 */
+    (void)es8311_dac_mute();            /* ★ 只写 REG32=0（静音），HW 软 ramp 接管 */
     g_ao_pause_volwr++;                 /* ★ 本次暂停对 REG32 的写笔数（与上面一行 1:1）*/
-    g_ao_playing = 0u;
-    g_ao_codec   = 0u;
-    s_wr = 0u;
-    s_rd = 0u;
-    s_tim_pending = 0u;
-    s_dac_pending   = 0u;
-    s_vol_ramp_left = 0u;
-    s_dac_rb_pending = 0u;
-    g_ao_dac_ready  = 0u;
-    g_ao_dac_ramp   = 0u;
+    s_dac_rb_pending = 0u;              /* 取消起播后的"音量确认期"，别回头把音量写回去 */
+    s_pause_fade_ticks = (uint8_t)AO_PAUSE_FADE_TICKS;  /* 延几拍再停传输 */
 }
 
 int audio_out_playing(void)
@@ -993,6 +1038,20 @@ void audio_out_tick(void)
     if ((READ_BIT(s_hi2s.Instance->SR, SPI_SR_TXP) & SPI_SR_TXP) != 0UL)
     {
         g_ao_txp_seen++;
+    }
+
+    /* ---- 暂停淡出：REG32 已被写成 0（HW 软 ramp 正在把音量降向 -95.5 dB），
+     *   等 AO_PAUSE_FADE_TICKS 拍、音量基本落静音后再停传输 —— 切断 I2S 时钟时 DAC
+     *   已静音，不会爆音（见 audio_out_pause 顶部说明）。
+     *   ⚠ 淡出期间**不 return**：仍让下方逻辑照常补数、DAC 继续出（渐弱）的声音，
+     *   直到淡出走完才真正停传输。 */
+    if (s_pause_fade_ticks != 0u)
+    {
+        if (--s_pause_fade_ticks == 0u)
+        {
+            ao_pause_stop_transport();
+            return;                     /* 本拍不再喂数据 / 做别的事 */
+        }
     }
 
     /* ---- 起播防咔哒：第二拍才唤醒 DAC，随后把音量分步 ramp 上去 ----
@@ -1069,7 +1128,7 @@ void audio_out_tick(void)
             s_rb_tick = 0u;
         }
     }
-    else if ((s_vol_ramp_left == 0u) && (g_ao_dac_ready != 0u))
+    else if ((s_vol_ramp_left == 0u) && (g_ao_dac_ready != 0u) && (s_pause_fade_ticks == 0u))
     {
         /* 播放中的定期体检（每 ~1 s 一次）：以**回读值**为准确认"音量还在芯片里、
          * DAC 还上着电"，不对就补写。为什么必须做：I2C 写是会失败的（见 es8311.c
