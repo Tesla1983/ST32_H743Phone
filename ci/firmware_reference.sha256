@@ -1527,5 +1527,15 @@
 #   · tools/verify_board_image.py build/ymgui-h743.bin --sampled 8192 ⇒ 5 段全一致。
 # FLASH 1 664 204 B（79.36%），比补丁9 +152 B。
 # ===========================================================================
-b280886d6494a41f1bc06677f67857a27e382d102521026e528211143cae8c0d  ymgui-h743.bin
-ddcd4d31efb5255c86c7a6d64ee2b3f04fe092119bf44d29dcc95f1da36b4869  ymgui-h743.elf
+# [补丁9b 基准，已被补丁10取代]
+# b280886d6494a41f1bc06677f67857a27e382d102521026e528211143cae8c0d  ymgui-h743.bin
+# ddcd4d31efb5255c86c7a6d64ee2b3f04fe092119bf44d29dcc95f1da36b4869  ymgui-h743.elf
+#
+# 【补丁 10 · 2026-10-14 · 修「播放/暂停咔嗒(爆音)声」】
+#   根因：audio_out_pause() 先 i2s_stop() 掐 I2S 时钟、再 es8311_dac_mute()，时钟断时 DAC 满音量 ⇒ 爆音。
+#   修法：暂停改"先静音(REG32=0，ES8311 硬件软 ramp REG37=0x48 接管)后停时钟"，tick 延 12 拍(~192ms)
+#        音量落静音后再停传输；新增取消淡出分支兼容快速连点。起播路径逐字节未动。
+#   验收：wav_pause_resume_check 4/4 PASS；ui_freeze_repro 30 轮 2/3 通过、1/3 偶发冻结(补丁9b 残留)。
+#   FLASH 1 664 348 B（79.36%），比补丁9b +144 B。
+8fc99a828086b441491fedb6766673b8398e20117d944984efef21ed2773358a  ymgui-h743.bin
+604331f52cbe26ef577196eb5581f578ac9ccb6dcb10fce4ef3c354d769cbadf  ymgui-h743.elf
