@@ -628,6 +628,16 @@ int es8311_init(void)
     uint8_t v;
     int rc = 0;
 
+    /* ---- 1a0. I2C 噪声免疫前置（2026-10-14 补丁11·D2，照抄官方 esp_codec_dev）----
+     * 官方 es8311_open() 在**配置最前面**写 0x44=0x08 两次，官方注释两条：
+     *   ① "Enhance ES8311 I2C noise immunity" —— 0x44 含 I2C 噪声免疫位；
+     *   ② "occasional failures during the first I2C write ⇒ 再写一次保可靠"。
+     * 本板 I2C 上拉极弱（仅 MCU 内部 ~40 kΩ、无外部上拉），零探针窗口实测首试 NACK
+     * 约 30%，这一笔"早写 + 双写"值得照抄。⚠ 本项目 es8311_write_reg 自带 5 次重试，
+     * 此处双写只是额外冗余、不是唯一防线（D2 官方差异，低风险顺带采纳）。 */
+    rc |= es8311_write_reg(0x44, 0x08);
+    rc |= es8311_write_reg(0x44, 0x08);
+
     /* ---- 1a. 上电默认配置 ---- */
     rc |= es8311_write_reg(0x01, 0x30);   /* CLK_MANAGER_REG01 */
     rc |= es8311_write_reg(0x02, 0x00);   /* clk divider/multiplier */
@@ -690,7 +700,12 @@ int es8311_init(void)
     rc |= es8311_write_reg(0x13, 0x10);   /* SYSTEM_REG13 */
     rc |= es8311_write_reg(0x1B, 0x0A);   /* ADC_REG1B */
     rc |= es8311_write_reg(0x1C, 0x6A);   /* ADC_REG1C */
-    rc |= es8311_write_reg(0x44, 0x08);   /* GPIO_REG44 */
+    /* ★ 2026-10-14（补丁11·D3）：末步 0x44 由 0x08 改为 **0x58**（开内部参考 ADCL+DACR）。
+     *   官方 esp_codec_dev 的 es8311_open() 末步正是 0x44=0x58（no_dac_ref=false 默认）；
+     *   本项目序列是官方"旧祖源"、官方后来补的这一笔我们缺了。0x58 打开内部参考信号
+     *   （ADCL+DACR），改善参考/偏置稳定性（→ 噪声）；是所有官方 ES8311 板卡的默认值。
+     *   ⚠ bit3（I2C 噪声免疫）在 0x08 与 0x58 里都是 1，故 D2 那两笔前置写不受影响。 */
+    rc |= es8311_write_reg(0x44, 0x58);   /* GPIO_REG44：0x58=开内部参考 ADCL+DACR */
 
     /* esp-adf 这里还有 pa_power(true)（GPIO 拉高外部功放使能）——
      * 本模块 NS4150B 无常闭使能脚，跳过。 */
@@ -732,6 +747,23 @@ static int dac_path_regs(uint8_t vol_reg)
 {
     uint8_t v;
     int rc = 0;
+
+    /* ★★ 2026-10-14（补丁11·D9 配套）：先恢复"时钟管理"，再走 DAC 通路。
+     *
+     * 【为什么必须在最前面】es8311_stop_dac() 的**完整掉电尾**（补丁11·D9，照抄官方
+     *   es8311_suspend）会把 REG00 的 CSM_ON(bit7) 清 0、把 REG01 的 MCLK_ON(bit5)/
+     *   BCLK_ON(bit4)/CLKADC_ON(bit3)/CLKDAC_ON(bit2)/ANACLKADC_ON(bit1)/ANACLKDAC_ON(bit0)
+     *   全部清 0（位定义见 Linux 内核 sound/soc/codecs/es8311.h）。
+     *   而本项目续播**跳过完整 init**（audio_out.c：s_codec_ready 一旦置位就不再跑 init）
+     *   ⇒ 若不在这里写回来，芯片就"没有时钟"，数据进不去 DAC ⇒ **续播无声**。
+     *   官方 esp_codec_dev 的 es8311_start() 开头正是重写这两笔（REG00/REG01），此处照搬。
+     *     0x00=0x80：CSM_ON=1 + MSC=0（I2S 从机；本板 STM32 出 MCLK/SCK/LRCK 作主机）；
+     *                RST 位保持 0（不复位数字核，避免多造一个"上电窗口 NACK"）。
+     *     0x01=0x3F：MCLK 取引脚(bit7=0)、不反相(bit6=0)、MCLK/BCLK/ADCCLK/DACCLK/
+     *                ANACLKADC/ANACLKDAC 全开(bit5..bit0=1) —— 与本项目 init 的收尾值一致。
+     *   ⚠ 首次起播（刚 init 完）时这两笔是幂等的，不改变状态；只有 D9 掉电后才真正起作用。 */
+    rc |= es8311_write_reg(0x00, 0x80);
+    rc |= es8311_write_reg(0x01, 0x3F);
 
     /* DAC 通路开（0x09 bit6=0），ADC 通路关（0x0A bit6=1）*/
     if (es8311_read_reg(0x09, &v) == 0)
@@ -797,15 +829,41 @@ int es8311_stop_dac(void)
 {
     int rc = 0;
 
-    rc |= es8311_write_reg(0x32, 0x00);
-    rc |= es8311_write_reg(0x17, 0x00);
-    rc |= es8311_write_reg(0x0E, 0xFF);
-    rc |= es8311_write_reg(0x12, 0x02);
+    /* ★ 2026-10-14（补丁11·D8/D9）：照搬官方 esp_codec_dev 的 es8311_suspend()
+     *   ——**完整有序掉电尾**，掉电态比旧版"半掉电"更确定、更干净。
+     *
+     * 【与旧版的差异】
+     *   · D8：0x45 由 **0x01 改回 0x00**。旧值 0x01 方向与官方相反（官方 start 与
+     *         suspend 都写 0x00），本项目起播路径 dac_path_regs 也写 0x00 ⇒ 旧值 0x01
+     *         是旧祖源遗留、无依据。改 0x00 后 stop 与 start 对它一致、不再有无谓跳变。
+     *   · D9：补齐官方掉电尾四组：
+     *         0x02=0x10 → 0x00         （REG02：时钟分频收尾，终值 0x00 = 本项目 48k 配置值）
+     *         0x00=0x00 → 0x1F         （REG00：关 CSM_ON + 置 RST 位）
+     *         0x01=0x30 → 0x00         （REG01：关掉全部时钟使能）
+     *         0x0D=0xFC                （REG0D：连内部参考 VREF(bit2) 一起断电 = 真·全掉电；
+     *                                   旧版停在 0xFA，VREF 仍开着，VMIDSEL=2 仍在工作）
+     *       旧版最后那笔 0x37=0x08 已删除：官方 suspend 不写 0x37，而本项目起播
+     *       dac_path_regs 必写 0x37=0x48 ⇒ 旧那笔是冗余（写完马上被起播覆盖）。
+     *
+     * 【⚠⚠ 配套铁律：这些寄存器必须由起播路径写回来】见 dac_path_regs() 开头新增的
+     *   REG00=0x80 / REG01=0x3F 恢复。本项目续播跳过完整 init，所以"stop 写了 X ⇒
+     *   start 必须恢复 X"是硬不变量；缺了恢复 ⇒ 时钟全关 ⇒ 续播无声。官方 es8311_start()
+     *   正是这么配对的（开头重写 REG00/REG01）。 */
+    rc |= es8311_write_reg(0x32, 0x00);   /* DAC 音量 → 静音 */
+    rc |= es8311_write_reg(0x17, 0x00);   /* ADC 音量 → 0 */
+    rc |= es8311_write_reg(0x0E, 0xFF);   /* 关内部块 */
+    rc |= es8311_write_reg(0x12, 0x02);   /* REG12：DAC power-down */
     rc |= es8311_write_reg(0x14, 0x00);
-    rc |= es8311_write_reg(0x0D, 0xFA);
+    rc |= es8311_write_reg(0x0D, 0xFA);   /* REG0D：关模拟/偏置（VREF 与 VMIDSEL 稍后彻底关）*/
     rc |= es8311_write_reg(0x15, 0x00);
-    rc |= es8311_write_reg(0x37, 0x08);
-    rc |= es8311_write_reg(0x45, 0x01);
+    rc |= es8311_write_reg(0x02, 0x10);   /* D9：时钟分频收尾（官方 suspend 首笔）*/
+    rc |= es8311_write_reg(0x00, 0x00);   /* D9：REG00 CSM_ON=0 */
+    rc |= es8311_write_reg(0x00, 0x1F);   /* D9：REG00 置 RST 位（官方"定义好的掉电态"）*/
+    rc |= es8311_write_reg(0x01, 0x30);   /* D9：REG01 时钟管理收尾 */
+    rc |= es8311_write_reg(0x01, 0x00);   /* D9：REG01 关全部时钟使能 ← 起播必须写回 0x3F */
+    rc |= es8311_write_reg(0x45, 0x00);   /* D8：原为 0x01（方向与官方相反，已修正）*/
+    rc |= es8311_write_reg(0x0D, 0xFC);   /* D9：REG0D 末步——连 VREF 一起断电（真·全掉电）*/
+    rc |= es8311_write_reg(0x02, 0x00);   /* D9：REG02 回到本项目 48k 配置值 */
 
     g_es_rc = rc;
     return rc;
@@ -849,6 +907,14 @@ int es8311_set_volume_ui(uint32_t vol0_100)
 volatile uint32_t g_es_rb_vol  = 0xFFFFu;
 volatile uint32_t g_es_rb_pwr  = 0xFFFFu;
 volatile uint32_t g_es_rb_dac0e = 0xFFFFu;
+/* ★ 2026-10-14（补丁11·D9 配套验证）：回读"时钟管理"寄存器，用来在板上**证明**
+ *   "stop 的完整掉电尾（D9）关掉的时钟，起播时确实被写回来了" —— 尤其 REG01 必须回到
+ *   0x3F（全时钟使能），否则芯片无时钟、DAC 收不到数据 ⇒ 续播无声。
+ *   ⚠ 这件事**音量回读验不出来**（REG32/REG12 走 I2C，与音频时钟无关，照样可读），
+ *     所以必须单独看这三个量。纯诊断、不参与控制流、失败即置 0xFFFF。 */
+volatile uint32_t g_es_rb_clk1 = 0xFFFFu;   /* REG01：期望 0x3F（MCLK/BCLK/ADCCLK/DACCLK 全开）*/
+volatile uint32_t g_es_rb_clk2 = 0xFFFFu;   /* REG02：期望 0x00（本项目 48k 分频/倍频）*/
+volatile uint32_t g_es_rb_clk6 = 0xFFFFu;   /* REG06：期望与起播前一致（bclk_div=4、SCK 不反相）*/
 
 int es8311_dac_readback(void)
 {
@@ -857,6 +923,12 @@ int es8311_dac_readback(void)
     int      confirmed = 0;
 
     g_es_readback++;
+
+    /* ★ 补丁11·D9 配套验证：先各回读一次时钟管理寄存器（纯诊断，见 g_es_rb_clk* 说明）。
+     *   若 stop_dac 的完整掉电尾把 REG01 清零、而起播没写回，这里会读到 0x00 ⇒ 一眼可见。 */
+    if (es8311_read_reg(0x01, &v) == 0) { g_es_rb_clk1 = v; } else { g_es_rb_clk1 = 0xFFFFu; }
+    if (es8311_read_reg(0x02, &v) == 0) { g_es_rb_clk2 = v; } else { g_es_rb_clk2 = 0xFFFFu; }
+    if (es8311_read_reg(0x06, &v) == 0) { g_es_rb_clk6 = v; } else { g_es_rb_clk6 = 0xFFFFu; }
 
     /* 最多 3 轮"读 → 不对就补 → 再读"。之所以要补写：I2C 写是**会失败**的（见
      * es8311_write_reg 的说明），而 volume ramp / dac_path_regs 的返回值历史上被忽略

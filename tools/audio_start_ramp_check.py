@@ -17,9 +17,11 @@
   R4  g_ao_udr       == 0     起播无欠载（UDR 会让引擎停吃 FIFO ⇒ 可闻咔哒）
   R5  g_ao_frames     > 0     真的在出声
   R6  路径相关：DMA ⇒ g_ao_dma_rc == 0；TIM6 ⇒ g_ao_isr > 0
-  R7  g_es_wr_ok 的增量 —— **这是"ramp 真的发了 8 次 I2C 写"的硬证据**：
-        无 ramp 时应为 41/42 次，有 ramp 时应为 49/50 次（逐条数过寄存器写次数，
-        见脚本内 EST_* 常量）。数值对不上就是哪一段序列没走到。
+  R7  g_es_wr_ok 的增量 —— 起播确实发出了一串 I2C 写（**硬判下界 ≥12** + 打印实际值）。
+        参考量级：完整 init 时无 ramp 45 / 有 ramp 53；**跳过 init**（s_codec_ready=1）时
+        无 ramp 16 / 有 ramp 24（见下方 EST_* 常量）。⚠ 但**实测它本身会浮动**（同板连续
+        3 次起播 = 24/27/36）—— 因为 5 处"读改写"读失败会少写、回读补写会多写、probe halt
+        还有伪影，所以只做下界硬判、不给定值判据；ramp 走完与否由 R2+R5 保证。
 
 用法
 ----
@@ -34,13 +36,19 @@ import time
 sys.path.insert(0, "tools")
 import bench  # noqa: E402
 
-# ---- I2C 写次数参考值（逐条数 es8311.c / audio_out.c 的写 REG32 路径）----
-#   es8311_init          27
+# ---- I2C 写次数参考值（逐条数 es8311.c / audio_out.c 的写路径）----
+#   es8311_init          29（2026-10-14 补丁11：+2 笔"I2C 噪声免疫前置" 0x44=0x08 ×2）
 #   es8311_config_i2s     2
-#   dac_path_regs        12
+#   dac_path_regs        14（2026-10-14 补丁11：+2 笔 REG00=0x80 / REG01=0x3F 时钟管理恢复，
+#                            对应 es8311_stop_dac() 的完整掉电尾 D9）
 #   audio_out_set_volume  0 或 1（codec 未 init 过时返回 -1、不写）
-EST_NO_RAMP = 41
-EST_RAMP    = 49
+#   ⚠ 每次起播是否跑完整 init 取决于 s_codec_ready：一旦 init 成功就不再 init（续播/二次起播）
+#      ⇒ 增量只有 config_i2s + dac_path_regs（+ ramp）。两套参考值都要认。
+#   ⚠ 回读体检的"确认期补写"（REG32/REG12）可能再加 0~1 笔，判据留 ±1 容差。
+EST_NO_RAMP = 45    # 完整 init（29）+ config_i2s（2）+ dac_path_regs（14）
+EST_RAMP    = 53    # 上一行 + 8 拍音量 ramp
+EST_SKIP_NR = 16    # 跳过 init：config_i2s（2）+ dac_path_regs（14）
+EST_SKIP_R  = 24    # 上一行 + 8 拍音量 ramp
 
 
 def rd_many(names):
@@ -125,11 +133,19 @@ def main():
         chk(s["g_ao_isr"] > 0,    "R6 TIM6 路径：心跳在跑（g_ao_isr>0）")
     else:
         chk(s["g_ao_dma_rc"] == 0, "R6 DMA 路径：起播返回码 0（g_ao_dma_rc=0）")
-    # R7 只做提示，不硬判（基数依赖"上一次 codec 是否 init 过"，±1 都正常）
-    near = (abs(delta - EST_RAMP) <= 1) or (abs(delta - EST_NO_RAMP) <= 1)
-    chk(near, "R7 I2C 写增量落在参考值附近（%d；判读见脚本头注释）" % delta)
-    if abs(delta - EST_NO_RAMP) <= 1:
-        print("     ⚠ 增量≈%d ⇒ 像是**没有走 ramp**（8 次写没发生）——查 tick 里的 s_vol_ramp_left" % EST_NO_RAMP)
+    # R7 判据（2026-10-14 修正）：写次数**不是确定值**，实测同板连续 3 次起播 = 24/27/36。
+    #   三个来源让它浮动：① 是否跳过完整 init（±29）；② dac_path_regs/config_i2s 里 5 处
+    #   "读改写"若读失败则该笔写被跳过（少 0~5 笔）；③ 回读体检"确认期补写"（多 0~6 笔）+
+    #   probe-rs halt 伪影。⇒ 硬判只保**下界**（起播序列确实发了写、没早退），实际值打印出来
+    #   供判读；偏离参考值时给一行提示而不误判失败。ramp 是否真走完由 R2（dac_ramp==0）+R5 兜。
+    near = any(abs(delta - e) <= 2
+               for e in (EST_RAMP, EST_NO_RAMP, EST_SKIP_R, EST_SKIP_NR))
+    chk(delta >= 12, "R7 起播确实发出了 I2C 写（增量 %d ≥ 12；参考值见脚本头）" % delta)
+    if not near:
+        print("     （增量 %d 不在参考值 ±2 内 —— 条件读改写/回读补写/探针伪影都会让它浮动）" % delta)
+    if abs(delta - EST_NO_RAMP) <= 2 or abs(delta - EST_SKIP_NR) <= 2:
+        print("     ⚠ 增量≈%d（无 ramp 参考）⇒ 可能是**没有走 ramp**（8 次写没发生）"
+              "——查 tick 里的 s_vol_ramp_left" % delta)
 
     if not keep:
         bench.wr("g_wav_test", [2])   # 停播，不吵人

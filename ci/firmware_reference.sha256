@@ -1537,5 +1537,27 @@
 #        音量落静音后再停传输；新增取消淡出分支兼容快速连点。起播路径逐字节未动。
 #   验收：wav_pause_resume_check 4/4 PASS；ui_freeze_repro 30 轮 2/3 通过、1/3 偶发冻结(补丁9b 残留)。
 #   FLASH 1 664 348 B（79.36%），比补丁9b +144 B。
-8fc99a828086b441491fedb6766673b8398e20117d944984efef21ed2773358a  ymgui-h743.bin
-604331f52cbe26ef577196eb5581f578ac9ccb6dcb10fce4ef3c354d769cbadf  ymgui-h743.elf
+# [补丁10 基准，已被补丁11取代]
+# 8fc99a828086b441491fedb6766673b8398e20117d944984efef21ed2773358a  ymgui-h743.bin
+# 604331f52cbe26ef577196eb5581f578ac9ccb6dcb10fce4ef3c354d769cbadf  ymgui-h743.elf
+#
+# 【补丁 11 · 2026-10-14 · 采纳 esp_codec_dev 的三处序列改进（D3/D8/D9）】
+#   背景：用户选 A —— 把 Espressif 官方 esp_codec_dev 的 ES8311 序列与本项目 src/es8311.c
+#   逐条核对（差异清单 docs/ES8311_LIB_COMPARE.md），再把其中 3 处吃进本项目。**不换库**。
+#   权威位定义取自 Linux 内核 sound/soc/codecs/es8311.h（REG00 bit7=CSM_ON、REG01 bit5=MCLK_ON/
+#   bit4=BCLK_ON/bit3=CLKADC_ON/bit2=CLKDAC_ON、REG0D bit2=PDN_VREF、REG31 bit6/5=DSM/DEMMUTE）。
+#   D3 init 末步 0x44 由 0x08 → **0x58**（开内部参考 ADCL+DACR，官方默认值）。
+#   D2（顺带）init 最前面加官方"噪声免疫"0x44=0x08 ×2（本板 I2C 上拉极弱，值得照抄）。
+#   D8 stop 的 0x45 由 0x01 → **0x00**（旧值方向与官方相反、无依据）。
+#   D9 stop 补齐官方 es8311_suspend() 的**完整有序掉电尾**：0x02=0x10→0x00、0x00=0x00→0x1F、
+#      0x01=0x30→0x00、0x45=0x00、0x0D=0xFC(连 VREF 一起断电，旧版停在 0xFA)；删掉冗余的 0x37=0x08。
+#   ⚠⚠ **配套铁律**：D9 关掉了 REG00.CSM_ON 与 REG01 全部时钟使能，而本项目续播**跳过完整 init**
+#      （s_codec_ready 一旦置位就不再 init）⇒ dac_path_regs() 开头**必须**补写 REG00=0x80 /
+#      REG01=0x3F 把它们恢复（官方 es8311_start 正是这么配对的）。缺了恢复 ⇒ 芯片无时钟 ⇒ 续播无声。
+#   新增诊断：g_es_rb_clk1/clk2/clk6（回读 REG01/02/06）—— 音量回读（REG32/REG12）验不出"时钟没了"。
+#   验收：tools/es8311_clk_check.py（新）2 轮 PASS（停→起播后 REG01=0x3F、REG02=0x00、g_es_fail 增量 0）；
+#        wav_pause_resume_check 4/4、wav_play_check B1~B6 全 PASS、audio_start_ramp_check R1~R7 全 PASS、
+#        ui_freeze_repro 20 轮未复现、volume_check PASS、i2s_dma_check PASS。
+#   FLASH 1 664 588 B（79.37%），比补丁10 +240 B（含 3 个新诊断量 + 新增写/读）。
+1160255d2abaa99163e1fa116578fe47b3202cd6815e12bf0fb7bcb6748ed711  ymgui-h743.bin
+58e599b7438a02fb647eb2c04ef33d9224aefe4d46367fdfdfbebd856190c2e6  ymgui-h743.elf

@@ -60,6 +60,13 @@ extern volatile uint32_t g_es_reg32_n; /* REG32 写入次数（每次起播/续�
 extern volatile uint32_t g_es_rb_vol;  /* REG32 回读值（ramp 走完那一刻，见 es8311_dac_readback）*/
 extern volatile uint32_t g_es_rb_pwr;  /* REG12 回读值（0x00 = DAC 上电；0x02 = power-down）*/
 extern volatile uint32_t g_es_rb_dac0e;/* REG0E 回读值（0x02 = 正常；0xFF = 挂起后残留）*/
+/* ★ 2026-10-14（补丁11·D9 配套验证）：**时钟管理寄存器**回读 —— 用来证明"stop 的完整
+ *   掉电尾（D9）关掉的时钟（REG00.CSM_ON / REG01 各位使能）在起播时确实被写回来了"。
+ *   尤其 g_es_rb_clk1 必须回到 0x3F（MCLK/BCLK/ADCCLK/DACCLK 全开），否则芯片无时钟、
+ *   DAC 收不到数据 ⇒ 续播无声；而这件事**音量回读验不出来**（I2C 与音频时钟无关）。 */
+extern volatile uint32_t g_es_rb_clk1; /* REG01 回读（期望 0x3F）*/
+extern volatile uint32_t g_es_rb_clk2; /* REG02 回读（期望 0x00）*/
+extern volatile uint32_t g_es_rb_clk6; /* REG06 回读（期望与起播前一致）*/
 /* ---- I2C 写失败现场（2026-10-13；暂停→续播"没声音/音量乱"排障）----
  * 每次写失败都先复位 I2C 现场再重试（最多 3 次，g_es_retry_ok 计恢复数）；三次都失败
  * 才计 g_es_fail。失败现场（寄存器号 / HAL 状态 / 总线电平）留在下面这几个量里。 */
@@ -186,8 +193,20 @@ int es8311_start_dac(void);
 int es8311_dac_start_muted(void);
 
 /**
- * @brief  挂起/静音（esp-adf es8311_suspend）
- * @return 0=OK；<0=失败
+ * @brief  停止 DAC 并**完整有序掉电**（2026-10-14 补丁11·D8/D9，照抄官方 esp_codec_dev
+ *         的 es8311_suspend()："关机"语义，比旧版"半掉电"更干净、掉电态更确定）
+ *
+ * 【与起播的硬配对（⚠⚠ 改这里必须同步看 dac_path_regs）】
+ *   本函数会把 REG00 的 CSM_ON 清 0、把 REG01 的全部时钟使能清 0（MCLK_ON/BCLK_ON/
+ *   CLKADC_ON/CLKDAC_ON/ANACLKx_ON），并把 REG0D 写 0xFC（连内部参考 VREF 一起断电）；
+ *   而**起播路径 `dac_path_regs()` 开头会重写 REG00=0x80 / REG01=0x3F 把它们恢复**。
+ *   本项目续播跳过完整 init（见 es8311_is_inited 的说明）⇒ 若起播不恢复 ⇒ 时钟全关
+ *   ⇒ 续播无声。官方 es8311_start() 正是这么与 suspend() 配对的。
+ *
+ * 【触发场景】仅"真正的停"走它：切歌 / 播完 / 退出 app（audio_out_stop）、自检收尾。
+ *   「暂停」**不**走它 —— 暂停走 es8311_dac_mute()：只写 1 笔 REG32=0 静音、**不给芯片
+ *   断电**，这样续播时芯片保持可达、不撞"掉电/上电窗口 NACK"（见 es8311_dac_mute 说明）。
+ * @return 0=全部写成功；<0=仍有写失败（g_es_fail 会涨）
  */
 int es8311_stop_dac(void);
 
