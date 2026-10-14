@@ -1559,5 +1559,36 @@
 #        wav_pause_resume_check 4/4、wav_play_check B1~B6 全 PASS、audio_start_ramp_check R1~R7 全 PASS、
 #        ui_freeze_repro 20 轮未复现、volume_check PASS、i2s_dma_check PASS。
 #   FLASH 1 664 588 B（79.37%），比补丁10 +240 B（含 3 个新诊断量 + 新增写/读）。
-1160255d2abaa99163e1fa116578fe47b3202cd6815e12bf0fb7bcb6748ed711  ymgui-h743.bin
-58e599b7438a02fb647eb2c04ef33d9224aefe4d46367fdfdfbebd856190c2e6  ymgui-h743.elf
+# 【已被补丁12取代】1160255d2abaa99163e1fa116578fe47b3202cd6815e12bf0fb7bcb6748ed711  ymgui-h743.bin
+# 【已被补丁12取代】58e599b7438a02fb647eb2c04ef33d9224aefe4d46367fdfdfbebd856190c2e6  ymgui-h743.elf
+#
+# 【补丁 12 · 2026-10-14 · 定位并消除"按下播放/停止/切歌"的咔哒，欠载按类拆分】
+#   用户报："音频中仍然存在的噪声和咔嗒声"。本轮先做**只读取证**，再针对性改 3 处：
+#   ① 起播窗口成片填静音（**旧固件一次起播 g_ao_underrun +6**）。机理：DMA 路径起播时
+#      i2s_dma_start() 紧跟两次 dma_fill_half() 把两个半缓冲都取走，而此前只铺半环(4096)
+#      ⇒ CSTART 瞬间环里**正好空**；此后只要主循环被堵一次，第一个半传中断就填进一整块
+#      硬静音。修法：起播无条件下**铺满整环**（两次 pump=8192 半字=84 ms），DMA 取走后
+#      环里仍剩 4096(21 ms) + DMA 缓冲 42 ms = 63 ms 余量。实测：起播 under_dma 6 → 0。
+#   ② 停止/切歌/退出 app 的爆音：audio_out_stop() 第一刀就掐 I2S 时钟，而 DAC **还挂在
+#      当前音量** ⇒ ΣΔ 调制器停摆 ⇒ 直流阶跃 ⇒ "咔"。暂停路径(补丁10)早改成"先静音后停钟"，
+#      这条路一直漏着。修法：照官方 es8311_enable(false) 次序 —— **先 REG31 专用数字静音**
+#      （新增 es8311_set_mute()，位取法 (v&0x9F)|0x60，与 Linux 内核 es8311 一致）→ 等 4 ms
+#      落定 → 再停时钟 → 最后掉电。
+#   ③ 上述静音的**闭环**：REG31 是芯片内持久状态 ⇒ dac_path_regs() 末尾必须解静音（否则
+#      "停过一次再也出不了声"），且 es8311_dac_readback() 的终态判据加入"REG31 bit6/5==0"
+#      （新增诊断 g_es_rb_mute），否则这种坏状态音量/电源回读**全对、看不出来**。
+#   新增诊断（g_ao_dbg[16..23] 一次批读）：g_ao_under_dma/under_feed/under_short/under_first_ms、
+#     g_ao_t_cstart_ms/pump1_ms/dacwake_ms/ramp_ms、g_ao_ring_used_min。
+#   ⚠⚠ 测量方法学（本轮实测，必须遵守）：**SWD 探针自己会造欠载** —— probe-rs 读写会短暂
+#      停机内核，停机 >42 ms 时环被抽干 ⇒ 自己制造一次静音填充。实测同一固件同一音乐：
+#      窗内密集采样(每 50 ms 一读)28 s 得 +9 次，而窗内完全不读的 20 s 得 **0 次**，
+#      同期 g_tick_ms 恒 16 ms 无尖峰。⇒ 欠载判据只能在"两端各读一次"的窗口里看。
+#      同轮排除的候选：LRCK 偏差（60 s 精测 49 079 Hz，与标称 48 828.125 差 +0.5%，非噪声源）、
+#      I2C 每秒体检致堵（A/B 关掉后仍欠载 ⇒ 否掉）、数据通路脏（抓 DMA 缓冲实测：无零样点、
+#      无静音段、L≡R、两半缓冲接缝 Δ98 ⇒ 干净）。
+#   验收：tools/audio_click_check.py（新）C1~C8 全 PASS；tools/audio_buf_probe.py（新）波形体检干净；
+#        wav_pause_resume_check 3/3 PASS、wav_play_check PASS、audio_start_ramp_check R1~R7 PASS、
+#        es8311_clk_check 2/2 PASS、i2s_dma_check PASS、volume_check PASS。
+#   FLASH 1 665 228 B（79.40%），比补丁11 +640 B。
+d1504569ecd30fd25988f676a3788a7e0337ad87a25f4c9070cae2a6fbf08ad2  ymgui-h743.bin
+d112e925489d8547c87327045eb8b1e475e875f027f63eb14ec40d7092bac89e  ymgui-h743.elf

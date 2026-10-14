@@ -792,6 +792,16 @@ static int dac_path_regs(uint8_t vol_reg)
     rc |= es8311_write_reg(0x37, 0x48);   /* DAC_REG37：ramp */
     rc |= es8311_write_reg(0x45, 0x00);
 
+    /* ★ 2026-10-14（补丁12）：**解静音**（REG31 bit6/5 清 0）—— 必须是最后一步。
+     * 【为什么必须有】audio_out_stop() 现在会先 `es8311_set_mute(1)` 再停时钟
+     *   （消"停止/切歌"那声爆音，见 audio_out.c）。而 REG31 是**芯片内持久**的
+     *   ⇒ 不解静音的话，"停过一次之后再也出不了声"。
+     * 【为什么放最后】此时：① 通路上电（REG0E/REG12/REG0D）已完成；
+     *   ② REG32 刚被写成参数值（起播传 0x00 = -95.5 dB）⇒ 解静音这一步的输出电平
+     *   在噪声底以下，听不见；③ 在它之后没有任何后续写入会覆盖。
+     *   顺序错误（比如把它放在 REG0D 上电之前）会让"上电瞬间"直接以有效音量出波形。 */
+    rc |= es8311_set_mute(0);
+
     g_es_rc = rc;
     return rc;
 }
@@ -815,12 +825,40 @@ int es8311_dac_start_muted(void)
 int es8311_dac_mute(void)
 {
     int rc;
-
     /* 只写音量 = 静音。**不写 0x0E/0x12/0x0D/0x14/0x15/0x37/0x45** —— 那些是
      * "关机"序列（es8311_stop_dac）的一部分，会制造 power-down 的 NACK 窗口。
      * 暂停后芯片仍保持通电与通路就绪，所以续播时 dac_path_regs 全是"有效时钟下的写"。
      * ⚠ 仍要过 es8311_write_reg 的重试：单笔也可能撞上别的窗口（比如 probe halt）。 */
     rc = es8311_write_reg(0x32, 0x00);
+    g_es_rc = rc;
+    return rc;
+}
+
+/* ★ 2026-10-14（补丁12）：REG31 的**专用数字静音位** —— 官方 esp_codec_dev /
+ *   Linux 内核 es8311 驱动用来消上下电爆音的手段（本工程此前从不碰 0x31）。
+ *
+ * 【为什么要它，而不是继续用 REG32=0】
+ *   REG32=0 是"把音量降到 -95.5 dB"：靠 REG37 的硬件软 ramp 平滑下降，**慢**（实测
+ *   从 0 dB 到听感静音约 160~190 ms），适合"暂停"这种可以等的动作。
+ *   而"停止/切歌/退出 app"要的是**立刻断**。REG31 的 bit6(DSMMUTE)/bit5(DEMMUTE) 是从
+ *   ΣΔ 调制器的输入端把信号钳到 0 —— 生效是即时的，且**时钟还在跑**，调制器能正常
+ *   完成这次过渡 → 随后再切时钟就不会有阶跃（见 audio_out.c → audio_out_stop 的说明）。
+ *   官方次序 `es8311_enable(false)` = set_mute(true) → 关 pa → suspend()，正是这个顺序。
+ *
+ * 【位的取法】照官方实现：`v = (v & 0x9F) | (on ? 0x60 : 0)`。
+ *   bit7 与 bit4..0 原样保留（本工程从未写过它们，保留最稳），只改 bit6/bit5。
+ *   ⚠ 与 REG32 无关、互不覆盖：所以"起播时 REG32=0 + REG31 解静音"两条路都安全。 */
+int es8311_set_mute(int on)
+{
+    uint8_t v = 0u;
+    int rc;
+
+    if (es8311_read_reg(0x31, &v) != 0)
+    {
+        v = 0u;      /* 读失败：按复位默认（全 0 = 未静音）算，只清/置 bit6/5 */
+    }
+    v = (uint8_t)((v & 0x9Fu) | (on ? 0x60u : 0x00u));
+    rc = es8311_write_reg(0x31, v);
     g_es_rc = rc;
     return rc;
 }
@@ -907,6 +945,7 @@ int es8311_set_volume_ui(uint32_t vol0_100)
 volatile uint32_t g_es_rb_vol  = 0xFFFFu;
 volatile uint32_t g_es_rb_pwr  = 0xFFFFu;
 volatile uint32_t g_es_rb_dac0e = 0xFFFFu;
+volatile uint32_t g_es_rb_mute  = 0xFFFFu;   /* REG31 回读值（补丁12：bit6/5 = 0 才算"没被静音"）*/
 /* ★ 2026-10-14（补丁11·D9 配套验证）：回读"时钟管理"寄存器，用来在板上**证明**
  *   "stop 的完整掉电尾（D9）关掉的时钟，起播时确实被写回来了" —— 尤其 REG01 必须回到
  *   0x3F（全时钟使能），否则芯片无时钟、DAC 收不到数据 ⇒ 续播无声。
@@ -946,8 +985,17 @@ int es8311_dac_readback(void)
 
         if (es8311_read_reg(0x0Eu, &v) == 0) { g_es_rb_dac0e = v; } else { g_es_rb_dac0e = 0xFFFFu; }
 
-        /* 终态判据：音量 == 目标 且 REG12 的 power-down 位(bit1)为 0。*/
-        if (vol_ok && pwr_ok && (g_es_rb_vol == target) && ((g_es_rb_pwr & 0x02u) == 0u))
+        /* ★ 补丁12：REG31 的专用静音位也必须确认是"未静音"。
+         *   为什么非查不可：audio_out_stop() 现在会 es8311_set_mute(1) 再停时钟，
+         *   而 REG31 是**芯片内持久**状态 —— 起播时那一笔"解静音"若被 NACK 吃掉，
+         *   表现就是"停过一次之后再也出不了声"，而音量/电源回读**全都是对的**
+         *   （正是本项目最忌讳的"看不出来的坏状态"）。⇒ 纳入终态判据。 */
+        int mute_ok = (es8311_read_reg(0x31, &v) == 0);
+        if (mute_ok) { g_es_rb_mute = v; } else { g_es_rb_mute = 0xFFFFu; }
+        mute_ok = mute_ok && ((g_es_rb_mute & 0x60u) == 0u);
+
+        /* 终态判据：音量 == 目标、REG12 的 power-down 位(bit1)为 0、且 REG31 未静音。*/
+        if (vol_ok && pwr_ok && mute_ok && (g_es_rb_vol == target) && ((g_es_rb_pwr & 0x02u) == 0u))
         {
             confirmed = 1;
             break;
@@ -974,6 +1022,10 @@ int es8311_dac_readback(void)
             if (!pwr_ok || ((g_es_rb_pwr & 0x02u) != 0u))
             {
                 (void)es8311_write_reg(0x12, 0x00u);
+            }
+            if (!mute_ok)
+            {
+                (void)es8311_set_mute(0);   /* 卡在静音：立刻补一次解静音 */
             }
         }
         else

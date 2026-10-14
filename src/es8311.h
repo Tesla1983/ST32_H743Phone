@@ -60,6 +60,7 @@ extern volatile uint32_t g_es_reg32_n; /* REG32 写入次数（每次起播/续�
 extern volatile uint32_t g_es_rb_vol;  /* REG32 回读值（ramp 走完那一刻，见 es8311_dac_readback）*/
 extern volatile uint32_t g_es_rb_pwr;  /* REG12 回读值（0x00 = DAC 上电；0x02 = power-down）*/
 extern volatile uint32_t g_es_rb_dac0e;/* REG0E 回读值（0x02 = 正常；0xFF = 挂起后残留）*/
+extern volatile uint32_t g_es_rb_mute;  /* REG31 回读值（补丁12）；bit6/5 必须为 0（未静音）*/
 /* ★ 2026-10-14（补丁11·D9 配套验证）：**时钟管理寄存器**回读 —— 用来证明"stop 的完整
  *   掉电尾（D9）关掉的时钟（REG00.CSM_ON / REG01 各位使能）在起播时确实被写回来了"。
  *   尤其 g_es_rb_clk1 必须回到 0x3F（MCLK/BCLK/ADCCLK/DACCLK 全开），否则芯片无时钟、
@@ -225,6 +226,20 @@ int es8311_stop_dac(void);
  * @return 0=OK；<0=失败（走 es8311_write_reg 的重试，仍失败才返回 <0）
  */
 int es8311_dac_mute(void);
+
+/**
+ * @brief  REG31 的**专用数字静音位**（on=1 静音 / 0 解静音）—— 官方防爆音手段。
+ *
+ * 【与 es8311_dac_mute() 的区别】es8311_dac_mute() 是"把音量降到 -95.5 dB"，
+ *   慢（硬件软 ramp 160~190 ms 才到听感静音），适合可以等的「暂停」。
+ *   本函数直接把 ΣΔ 调制器输入端钳 0，**即时生效**，适合要求"立刻断"的
+ *   「停止 / 切歌 / 退出 app」—— 在**时钟仍在跑**的时候静音，随后再切时钟就不会
+ *   有直流阶跃（那正是停止时那声"咔"的来源，见 audio_out.c → audio_out_stop）。
+ * ⚠ REG31 是芯片内持久状态：置过静音后，**下次起播必须解静音**——已由
+ *   dac_path_regs() 末尾统一负责（调用方不需要再管）。
+ * @return 0=OK；<0=失败（仍会按复位默认值写一次，不会把状态留在中间态）
+ */
+int es8311_set_mute(int on);
 
 /**
  * @brief  数字音量 0~255 → REG32（0=静音，0xBF≈75%，0xFF 最大）

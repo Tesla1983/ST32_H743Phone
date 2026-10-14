@@ -76,8 +76,33 @@ volatile uint32_t g_ao_dma_err   = 0;    /* DMA 错误回调次数 */
 volatile uint32_t g_ao_dbg2[16];         /* DMA/SPI 现场快照（见 dbg2_snapshot）*/
 volatile uint32_t g_ao_ring_drop = 0;    /* 环形缓冲满而被丢弃的半字数（应为 0；>0 = 补数越界）*/
 volatile uint32_t g_ao_dma_gap_max = 0;  /* 相邻两次"半传输中断"之间的**最大间隔(µs)**：
-                                          * 正常 ≈ 21 000 µs（1024 帧）；若明显更大 ⇒ DMA 流
-                                          * 被总线/DMA 端口仲裁挡住过（2026-10-13 排障用）。*/
+                                          * ⚠ 口径修正（2026-10-14）：半传中断(HT)每个完整 DMA
+                                          * 周期只来一次（HT@21 ms、全传@42 ms）⇒ **HT→HT 的
+                                          * 正常值本来就是 ≈42 000 µs，不是 21 000**。旧注释按
+                                          * "半缓冲时长"写，曾把它误读成异常。真正的异常判据是
+                                          * 明显 **超过 42 000**（=DMA 引擎被 UDR 压停过）。*/
+
+/* ---- 2026-10-14（补丁12）：欠载**分类** + 起播窗口时序量化 ----
+ * 【为什么必须分类】`g_ao_underrun` 把两条完全不同的路混在一个数里：
+ *   ① `dma_fill_half()` 发现环形缓冲不足 ⇒ 该半缓冲尾部填**硬静音**、直接进 DAC
+ *      ⇒ 阶跃 ⇒ **听得到"咔/断音"**；
+ *   ② `pump_half()` 的 feeder 取不满（卡慢 / 播到尾巴 / f_read 短读）⇒ 缺口一般很小，
+ *      多数时候听不出来。
+ * 只报一个总数 ⇒ 无法判断该修哪条。⇒ 拆开计数，并把"最大缺口有多大"记下来
+ * （缺口 = 缺多少个半字；2048 = 整整半个缓冲全被填零 = 21 ms 静音）。
+ * 【为什么还要起播时序表】用户报的"按下播放那一声咔"集中在起播窗口。有了
+ * CSTART 时刻与"第一次补满环 / DAC 唤醒 / ramp 走完"的时刻差，就能直接回答
+ * "起播后主循环被堵了多久、堵到有没有把环里的垫子耗光"。 */
+volatile uint32_t g_ao_under_dma   = 0u;   /* ① 次数：DMA 半缓冲补不满（**会听到**）*/
+volatile uint32_t g_ao_under_feed  = 0u;   /* ② 次数：feeder 取不满（多半无害）*/
+volatile uint32_t g_ao_under_short = 0u;   /* 单次最大缺口（半字数）；2048 = 整半缓冲全填零 */
+volatile uint32_t g_ao_under_first_ms = 0u;/* 起播后第一次 ① 距 CSTART 的 ms（0=从未发生）*/
+volatile uint32_t g_ao_t_cstart_ms  = 0u;  /* CSTART 那一刻的 HAL_GetTick()（本次播放的时间原点）*/
+volatile uint32_t g_ao_t_pump1_ms   = 0u;  /* 起播后第一次补满环形缓冲的完成时刻（相对 CSTART）*/
+volatile uint32_t g_ao_t_dacwake_ms = 0u;  /* DAC 通路唤醒（静音接通）完成时刻（相对 CSTART）*/
+volatile uint32_t g_ao_t_ramp_ms    = 0u;  /* 起播音量 ramp 走完时刻（相对 CSTART）*/
+volatile uint32_t g_ao_ring_used_min = 0xFFFFFFFFu; /* 播放期环形缓冲占用最小值（半字）
+                                          * ⇒ 起播/播放中"垫子"最少还剩多少（4096 ≈ 42 ms）*/
 
 /* ---- 起播"防咔哒"时序（2026-10-13；诊断量声明见 audio_out.h）----
  * 【那一声"咔哒"从哪来】起播序列原来把 DAC 通路（es8311_start_dac）放在 I2S **之前**
@@ -190,8 +215,14 @@ extern volatile uint32_t g_audio_volume;
  * 索引：0 SPI_CR1 / 1 SPI_SR / 2 SPI_CFG1 / 3 SPI_I2SCFGR / 4 TIM6_ARR
  *      5 ring 已用半字 / 6 g_ao_push / 7 ISR 空转次数 / 8 g_ao_isr
  *      9 NVIC ISER0 / 10 ring 起始地址低 16 位 / 11 txp_seen
- *     12 RCC->APB1LENR / 13 RCC->D2CCIP1R */
-volatile uint32_t g_ao_dbg[16];
+ *     12 RCC->APB1LENR / 13 RCC->D2CCIP1R
+ *     14/15 保留
+ *     16..23（2026-10-14 补丁12 新增）：欠载分类与起播时序 —— 见 g_ao_under_* 的注释。
+ *      16 g_ao_underrun   17 g_ao_under_dma   18 g_ao_under_feed  19 g_ao_under_short
+ *      20 g_ao_under_first_ms  21 g_ao_t_pump1_ms  22 g_ao_t_dacwake_ms  23 g_ao_ring_used_min
+ * ⚠ 主机侧一次 `probe-rs read b32 &g_ao_dbg 24` 就能整块拿走 —— 这几个量都是"同时刻"的，
+ */
+volatile uint32_t g_ao_dbg[24];
 
 static void dbg_snapshot(void)
 {
@@ -209,6 +240,16 @@ static void dbg_snapshot(void)
     g_ao_dbg[11] = g_ao_txp_seen;
     g_ao_dbg[12] = RCC->APB1LENR;
     g_ao_dbg[13] = RCC->D2CCIP1R;
+    g_ao_dbg[14] = 0u;
+    g_ao_dbg[15] = 0u;
+    g_ao_dbg[16] = g_ao_underrun;
+    g_ao_dbg[17] = g_ao_under_dma;
+    g_ao_dbg[18] = g_ao_under_feed;
+    g_ao_dbg[19] = g_ao_under_short;
+    g_ao_dbg[20] = g_ao_under_first_ms;
+    g_ao_dbg[21] = g_ao_t_pump1_ms;
+    g_ao_dbg[22] = g_ao_t_dacwake_ms;
+    g_ao_dbg[23] = g_ao_ring_used_min;
 }
 
 /* ---- DMA 现场快照（2026-10-13）----
@@ -418,7 +459,20 @@ static void dma_fill_half(uint32_t half)
     }
     if (avail < DMA_HALF_HALFWORDS)
     {
+        /* ⚠ 这是**真会被听到**的一类欠载：尾部这些半字是硬 0，紧跟着前面真实音乐进 DAC
+         *   ⇒ 电平从任意值瞬跳到 0（再跳回来）⇒ 一声"咔"。缺口越大越明显。 */
+        uint32_t short_by = DMA_HALF_HALFWORDS - avail;
+
         g_ao_underrun++;                /* 供不上：这一半尾部填静音 */
+        g_ao_under_dma++;
+        if (short_by > g_ao_under_short)
+        {
+            g_ao_under_short = short_by;
+        }
+        if ((g_ao_under_first_ms == 0u) && (g_ao_t_cstart_ms != 0u))
+        {
+            g_ao_under_first_ms = HAL_GetTick() - g_ao_t_cstart_ms;
+        }
     }
     g_ao_push   += avail;
     g_ao_frames += (avail / 2u);        /* 2 个半字 = 1 帧 */
@@ -549,6 +603,7 @@ static int i2s_dma_start(void)
     }
 
     SET_BIT(SPI2->CR1, SPI_CR1_CSTART);
+    g_ao_t_cstart_ms = HAL_GetTick();   /* 起播时间原点（后面几个 g_ao_t_* 都相对它）*/
 
     s_dma_ready = 1u;
     g_ao_dma_rc = 0u;
@@ -661,6 +716,7 @@ static void pump_half(void)
         if ((s_feeder != NULL) && (s_demo_left == 0u))
         {
             g_ao_underrun++;             /* 数据供不上（卡慢/播到最后一段）*/
+            g_ao_under_feed++;           /* ⚠ 与 ① 分开计：多数只是短读/尾巴，听不出来 */
         }
     }
     ring_put(s_tmp, RING_HALF_FRAMES * 2u);
@@ -830,14 +886,24 @@ int audio_out_start(void)
 
     s_wr = 0u;
     s_rd = 0u;
-    pump_half();                        /* 先铺半环，避免第一拍就断 */
-    if (g_ao_use_dma == 0u)
-    {
-        /* TIM6 路径保持原行为（铺满整环）。DMA 路径**只铺半环**：另外半个环由
-         * i2s_dma_start 的两次 dma_fill_half 取走 —— 否则环满时写读指针相等，
-         * "已用 = (wr-rd)&MASK" 会算成 0（环满与环空同形），DMA 只会填到静音。 */
-        pump_half();
-    }
+    /* ★ 2026-10-14（补丁12）：起播把环形缓冲**铺满**（两次 pump = 8192 半字 = 84 ms）。
+     *
+     * 【为什么原来只铺半环是个坑】DMA 路径起播时，i2s_dma_start() 紧接着会调两次
+     *   dma_fill_half() 把**两个半缓冲都取走**（4096 半字）——若此前只铺了半环（4096），
+     *   环里就**正好空**。于是从 CSTART 到"主循环下一拍补数完成"这段时间，环里一颗数据
+     *   都没有：只要这期间主循环被堵（起播那一拍要塞 codec 通路 ~16 笔 I2C + 两次现场快照
+     *   + 读卡），第一个半传中断就会补进一整块硬静音 ⇒ 起播处一声"咔/断"。
+     *   板上实测（tools/audio_buf_probe.py，2026-10-14）：从按下播放起算
+     *   `g_ao_underrun` 一次就是 +6 ⇒ 起播窗口确实在成片填静音。
+     *
+     * 【修法】永远铺满整环：DMA 取走 4096 后环里仍剩 4096（= 21 ms 垫子），
+     *   加上 DMA 缓冲本身的 42 ms，CSTART 瞬间手里共 63 ms 余量 —— 主循环哪怕被堵
+     *   ~60 ms 也不会破音。
+     *   ⚠ 安全性：写/读指针是**单调 32 位计数器**（只在取下标时 & RING_MASK），
+     *     "满"表现为差值 == RING_HALFWORDS（不是 0）⇒ 不存在"满空同形"，铺满不会误判。
+     *     旧注释担心的 `(wr-rd)&MASK == 0` 早已不适用于当前实现（见 ring_put 的守卫）。 */
+    pump_half();
+    pump_half();
     g_ao_stage = 3u;
 
     if (g_ao_use_dma != 0u)
@@ -854,6 +920,7 @@ int audio_out_start(void)
         /* ⚠⚠ H7 铁律：SPE 只使能外设，必须再置 CSTART 才开始传输（2026-10-12 实测）。 */
         __HAL_I2S_ENABLE(&s_hi2s);
         SET_BIT(s_hi2s.Instance->CR1, SPI_CR1_CSTART);
+        g_ao_t_cstart_ms = HAL_GetTick();  /* 起播时间原点（两路径统一口径）*/
 
         /* ⚠⚠ 心跳**不在这里起**：tim6_start 末尾的 NVIC_EnableIRQ 会让中断在
          *   audio_out_start() 还没返回时就进来一次（即便没有 EGR_UG，也使能即可能
@@ -891,6 +958,15 @@ int audio_out_start(void)
     g_ao_ring_drop = 0u;
     g_ao_dma_gap_max = 0u;
     s_last_half_cyc  = 0u;
+    /* 补丁12：欠载分类 + 起播时序表（每次播放重新计时）*/
+    g_ao_under_dma       = 0u;
+    g_ao_under_feed      = 0u;
+    g_ao_under_short     = 0u;
+    g_ao_under_first_ms  = 0u;
+    g_ao_t_pump1_ms      = 0u;
+    g_ao_t_dacwake_ms    = 0u;
+    g_ao_t_ramp_ms       = 0u;
+    g_ao_ring_used_min   = 0xFFFFFFFFu;
     return 0;
 }
 
@@ -900,6 +976,24 @@ void audio_out_stop(void)
     {
         return;
     }
+    /* ★ 2026-10-14（补丁12）：**先数字静音、再停时钟**。
+     * 【那一声"咔"从哪来】原来这里第一刀就是 tim6_stop/i2s_dma_stop/i2s_stop ——
+     *   I2S 的 MCLK/BCLK/LRCK 在 DAC **还挂在当前音量**（REG32 没归零）时被掐断。
+     *   ES8311 的 ΣΔ 调制器一没时钟就不再翻转，模拟输出立刻保住/跳到一个直流电平
+     *   ⇒ 相对"上一刻的波形值"就是一次阶跃 ⇒ 可闻的"咔/啪"。
+     *   暂停路径（补丁10）早就改成"先静音、后停钟"，但**停止/切歌/退出 app** 这条路
+     *   一直漏着 —— 而它比暂停更常见（点停止、切下一首、退出音乐 app）。
+     * 【修法】照官方 esp_codec_dev 的上下电次序：`es8311_enable(false)` =
+     *   set_mute(true) → 关 pa → suspend()。即**先把 DAC 数字静音**（REG31 专用静音位，
+     *   官方防爆音机制），让调制器在**时钟仍在跑**的时候把输入钳到 0、经重建滤波平滑
+     *   落向中位；给约 4 ms 落定，再停时钟、最后才给芯片断电。
+     *   ⚠ 为什么不复用暂停那套"REG32=0 + 硬件软 ramp + 等 12 拍"：停止是要求**立刻断**
+     *     的动作（切歌/退出），等 190 ms 会让人以为卡了。数字静音是即时的，
+     *     只多花一个 4 ms 落定时间（人耳完全感知不到）。
+     *   ⚠ 静音后**必须**在下次起播解静音 —— 由 dac_path_regs() 负责，
+     *     否则"停过一次之后再也出不了声"。 */
+    (void)es8311_set_mute(1);
+    HAL_Delay(4);                       /* 等模拟真正落到中位再切时钟 */
     tim6_stop();
     i2s_dma_stop();                     /* 没起 DMA 时内部直接返回 */
     i2s_stop();
@@ -1078,6 +1172,7 @@ void audio_out_tick(void)
             g_ao_dac_ready  = 1u;
             g_ao_stage      = 7u;
             g_ao_wake_cnt++;
+            g_ao_t_dacwake_ms = HAL_GetTick() - g_ao_t_cstart_ms;  /* 补丁12：起播时序表 */
             /* 进入"音量确认期"：不是"ramp 走完读一次"就完事，而是**逐拍确认**
              * 直到 es8311_dac_readback() 明确回报"音量已落进芯片"（最多 AO_RB_CONFIRM_TRIES 拍）。
              * 理由见 es8311_dac_readback 的说明与 tools/wav_pause_resume_check.py 的实测：
@@ -1102,6 +1197,10 @@ void audio_out_tick(void)
                                                           : (target * step) / AO_VOL_RAMP_STEPS);
         s_vol_ramp_left--;
         g_ao_dac_ramp = s_vol_ramp_left;
+        if (s_vol_ramp_left == 0u)
+        {
+            g_ao_t_ramp_ms = HAL_GetTick() - g_ao_t_cstart_ms;  /* 补丁12：起播时序表 */
+        }
     }
 
     /* ---- 起播后「音量确认期」：逐拍确认音量真的落进芯片（2026-10-13 关键修复）----
@@ -1156,9 +1255,20 @@ void audio_out_tick(void)
     {
         uint32_t used = s_wr - s_rd;
 
+        /* 补丁12：记录播放期环占用的**最小值** —— 它就是"抗主循环卡顿的垫子"。
+         * 起播铺满整环 + DMA 拿 4096 后，这里应当稳定 ≥ 4096（42 ms）；
+         * 若掉到接近 0，说明某一拍被堵得太久，下一次半传中断就会填静音。 */
+        if (used < g_ao_ring_used_min)
+        {
+            g_ao_ring_used_min = used;
+        }
         if (used <= (RING_HALFWORDS / 2u))
         {
             pump_half();
+            if (g_ao_t_pump1_ms == 0u)
+            {
+                g_ao_t_pump1_ms = HAL_GetTick() - g_ao_t_cstart_ms;
+            }
         }
     }
 }

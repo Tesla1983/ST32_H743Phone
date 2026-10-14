@@ -104,7 +104,8 @@ extern volatile uint32_t g_ao_isr;       /* TIM6 中断次数 */
 extern volatile uint32_t g_ao_isr_dry;   /* ISR 进来却发现环形缓冲没数据的次数 */
 extern volatile uint32_t g_ao_txp_seen;  /* tick 里看到 TXP=1 的次数（时钟在不在跑）*/
 extern volatile uint32_t g_ao_stage;     /* 起播阶段进度（1..6，见 .c；不是错误码）*/
-extern volatile uint32_t g_ao_dbg[16];   /* 寄存器现场快照（索引表见 .c），probe 读不了外设 */
+extern volatile uint32_t g_ao_dbg[24];   /* 寄存器现场快照（索引表见 .c），probe 读不了外设。
+                                          * [16..23] = 欠载分类 + 起播时序（补丁12）*/
 
 /* ---- I2S TX DMA 开关与诊断（2026-10-13；**默认 1 = 走 DMA**）----
  * `g_ao_use_dma` 默认已置 1（用户复听确认 DMA 路径干净）；写 0 回退到 TIM6 滴灌。
@@ -122,9 +123,27 @@ extern volatile uint32_t g_ao_dma_cplt;  /* 全传中断次数 */
 extern volatile uint32_t g_ao_dma_err;   /* DMA 错误回调次数 */
 extern volatile uint32_t g_ao_dbg2[16];  /* DMA/SPI 现场快照（索引表见 .c）*/
 extern volatile uint32_t g_ao_ring_drop; /* 环形缓冲满被丢弃的半字数（应恒 0；>0 = 补数越界、会丢音）*/
-extern volatile uint32_t g_ao_dma_gap_max;/* 相邻两次 DMA 半传输中断的**最大间隔(µs)**：
-                                           * 正常 ≈ 21 000（1024 帧）；明显更大 ⇒ DMA 补数
-                                           * 被 DMA 端口仲裁/总线挡住过（咔哒根因线索）。*/
+extern volatile uint32_t g_ao_dma_gap_max;/* 相邻两次 **半传输(HT)** 中断的最大间隔(µs)。
+                                           * ⚠ 口径（2026-10-14 修正）：HT 每个完整 DMA 周期只来
+                                           * 一次（HT@21 ms、全传@42 ms）⇒ HT→HT 正常值就是
+                                           * **≈42 000**，不是 21 000（旧注释按"半缓冲时长"写，
+                                           * 曾把它误读成异常）。真异常判据 = 明显 > 42 000
+                                           * （=DMA 引擎被 SPI 的 UDR 压停过）。*/
+
+/* ---- 欠载**分类** + 起播窗口时序（2026-10-14 补丁12）----
+ * 【分类的意义】g_ao_underrun 把两条性质完全不同的路混成一个数：
+ *   ① dma_fill_half() 环里不够 ⇒ 该半缓冲尾部填**硬静音**直进 DAC ⇒ **听得到"咔/断"**；
+ *   ② pump_half() feeder 取不满（卡慢/短读/播到尾巴）⇒ 缺口通常极小，多数听不出来。
+ * 只报总数就分不清该修哪条。 */
+extern volatile uint32_t g_ao_under_dma;   /* ① 次数：DMA 半缓冲补不满（会听到）*/
+extern volatile uint32_t g_ao_under_feed;  /* ② 次数：feeder 取不满（多半无害）*/
+extern volatile uint32_t g_ao_under_short; /* 单次最大缺口（半字）；2048 = 整半缓冲全填零 = 21 ms 静音 */
+extern volatile uint32_t g_ao_under_first_ms;/* 起播后第一次 ① 距 CSTART 的 ms（0=从未发生）*/
+extern volatile uint32_t g_ao_t_cstart_ms; /* CSTART 时刻的 HAL_GetTick()（本次播放的时间原点）*/
+extern volatile uint32_t g_ao_t_pump1_ms;  /* 起播后第一次补满环的完成时刻（相对 CSTART）*/
+extern volatile uint32_t g_ao_t_dacwake_ms;/* DAC 通路唤醒完成时刻（相对 CSTART）*/
+extern volatile uint32_t g_ao_t_ramp_ms;   /* 起播音量 ramp 走完时刻（相对 CSTART）*/
+extern volatile uint32_t g_ao_ring_used_min;/* 播放期环形缓冲占用最小值（半字）= 抗卡顿垫子的下限 */
 
 /* ---- 起播"防咔哒"时序（2026-10-13）----
  * 起播那一声响来自"DAC 通路在 I2S 时钟还没建立时就上电，且音量一步到位"。
