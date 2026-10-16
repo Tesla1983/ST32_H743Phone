@@ -65,7 +65,8 @@ extern volatile uint32_t g_es_rb_mute;  /* REG31 回读值（补丁12）；bit6/
  *   掉电尾（D9）关掉的时钟（REG00.CSM_ON / REG01 各位使能）在起播时确实被写回来了"。
  *   尤其 g_es_rb_clk1 必须回到 0x3F（MCLK/BCLK/ADCCLK/DACCLK 全开），否则芯片无时钟、
  *   DAC 收不到数据 ⇒ 续播无声；而这件事**音量回读验不出来**（I2C 与音频时钟无关）。 */
-extern volatile uint32_t g_es_rb_clk1; /* REG01 回读（期望 0x3F）*/
+extern volatile uint32_t g_es_rb_clk1; /* REG01 回读（期望 0x3F）★ 补丁17 起纳入闭环：不对就补写 */
+extern volatile uint32_t g_es_rb_clk0; /* REG00 回读（期望 CSM_ON(bit7)=1）★ 补丁17 起纳入闭环 */
 extern volatile uint32_t g_es_rb_clk2; /* REG02 回读（期望 0x00）*/
 extern volatile uint32_t g_es_rb_clk6; /* REG06 回读（期望与起播前一致）*/
 /* ---- I2C 写失败现场（2026-10-13；暂停→续播"没声音/音量乱"排障）----
@@ -81,7 +82,22 @@ extern volatile uint32_t g_es_ng_head;
 extern volatile uint32_t g_es_ng_idr;  /* 失败瞬间 PB6/PB7 电平（IDR bit6/bit7）*/
 extern volatile uint32_t g_es_retry_ok;/* 第一次失败、重试成功 的次数 */
 extern volatile uint32_t g_es_probe_retry;/* probe 首试没探到、延时后探到的次数 */
-extern volatile uint32_t g_es_fail;    /* 重试 3 次仍失败 的次数（应恒 0）*/
+extern volatile uint32_t g_es_fail;    /* 重试穷尽仍失败 的次数（>0 = 有写没落进芯片）*/
+/* ★ 补丁17：把"哪一支寄存器穷尽了重试"变成可查的数字（旧 g_es_fail 只说笔数、不说对象，
+ *   而"丢 0x01/0x00 时钟使能 ⇒ 完全无声"与"丢 0x32 音量 ⇒ 只停在中档"的后果天差地别）。
+ *   编码：高 16 位 = 寄存器号；低 16 位 = 最后一次 HAL 状态（0xFF = 故障注入）。*/
+extern volatile uint32_t g_es_fail_reg;
+/* ★ 补丁17：故障注入 —— 让"对指定寄存器号的下一次写"整段重试全失败一次（默认 0=关）。
+ *   只让写返回失败、**不碰总线**；注入一次即自清。用途：证明"时钟寄存器丢写被回读闭环救回"
+ *   （验收 tools/es8311_clk_check.py 的 K7）。⚠ 排障用，出货保持 0。 */
+extern volatile uint32_t g_es_drop_wr_reg;
+/* ★ 补丁17：**状态注入** —— 写 1 ⇒ 主循环下一拍把 REG01 写成 0x00（时钟全关 ⇒ 无声）。
+ *   用来复现"起播恢复时钟那一笔写丢了"之后芯片的真实处境（状态级，比 g_es_drop_wr_reg 更贴近
+ *   后果）。配合 g_es_clk_loop_en 做 A/B。⚠ 排障用。 */
+extern volatile uint32_t g_es_clr_clk_req;
+/* ★ 补丁17：回读闭环开关（**默认 1=开**）。0 = 复现旧行为（REG00/REG01 只读不判不补），
+ *   仅用于 A/B 证明"把时钟寄存器纳入闭环"这条修法承重。⚠ 出货必须为 1。 */
+extern volatile uint32_t g_es_clk_loop_en;
 extern volatile uint32_t g_es_fix_wr;  /* 回读校验发现不对、补写 的次数 */
 extern volatile uint32_t g_es_recover_pe;/* 因 BUSY/TIMEOUT 做 I2C 软复位(PE 0→1)的次数 */
 extern volatile uint32_t g_es_readback; /* 回读体检执行次数（起播后那次 + 播放中每秒那次）*/

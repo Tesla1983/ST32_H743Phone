@@ -37,7 +37,34 @@ volatile uint32_t g_es_ng_ring[8];         /* 最近 8 次失败：高 8 位=寄
 volatile uint32_t g_es_ng_head = 0u;
 volatile uint32_t g_es_retry_ok = 0u;      /* 重试后成功（第一次失败过）的次数 */
 volatile uint32_t g_es_probe_retry = 0u;   /* probe 首试没探到、延时后探到的次数 */
-volatile uint32_t g_es_fail    = 0u;       /* 重试 3 次仍失败的次数（>0 = 真丢写）*/
+volatile uint32_t g_es_fail    = 0u;       /* 重试穷尽仍失败的次数（>0 = 有写没落进芯片）*/
+/* ★★ 补丁17（2026-10-16）：把"哪一笔写穷尽了重试"变成可查的数字。★★
+ * 【为什么需要】旧的 g_es_fail 只说"有几笔写没成功"，不说**是哪一支寄存器** ——
+ *   而"丢的是哪一支"决定了后果轻重（丢 0x32 只是音量停在中间档、有回读闭环兜着；
+ *   丢 0x01/0x00 是**完全没有时钟 ⇒ 无声**）。没有这个量就只能靠猜。
+ *   编码：高 16 位 = 寄存器号；低 16 位 = 最后一次的 HAL_StatusTypeDef。
+ *   0xFFFF 标记（低 16 位 = 0xFF）表示这是**故障注入**（见 g_es_drop_wr_reg）造成的。 */
+volatile uint32_t g_es_fail_reg = 0u;
+/* ★★ 补丁17：故障注入 —— 让"对指定寄存器号的下一次写"**整段重试全部失败一次**，随后自清。
+ * 【用途，别删】它是"回读闭环真的管用"的**唯一**直接证据：注入 REG01（时钟使能）那一笔，
+ *   再起播，如果闭环有效 ⇒ 芯片最终仍是 REG01=0x3F、而且仍然出声；
+ *   若把闭环去掉 ⇒ 同一注入会让芯片**无时钟 ⇒ 完全无声，而其它回读全都是对的**。
+ *   0 = 关（默认）。验收：tools/es8311_clk_check.py 的 K7。
+ * ⚠ 只让"写"失败，**不碰总线**（直接返回 -1）⇒ 纯软件、零电气风险。 */
+volatile uint32_t g_es_drop_wr_reg = 0u;
+/* ★★ 补丁17：**状态注入** —— 写 1 ⇒ 主循环下一拍把 REG01 写成 0x00（时钟全关）。
+ * 【为什么需要它（与 g_es_drop_wr_reg 的区别）】g_es_drop_wr_reg 只让"写"失败，**芯片里的旧值
+ *   不变**；而丢写的真实后果是"该写进去的值没进去 ⇒ 芯片停在一个错的值上"。本钩子直接制造
+ *   那个**错的状态**，才等价于"恢复时钟那一笔丢了之后芯片的真实处境"。
+ *   它是"REG01 丢写 ⇒ 无声"这条链路的**状态级**复现手段：配合 g_es_clk_loop_en 做 A/B。
+ * ⚠ 排障用；会让当前播放**静音**（时钟被关），只由 tools/es8311_clk_check.py 触发。 */
+volatile uint32_t g_es_clr_clk_req = 0u;
+/* ★★ 补丁17：回读闭环开关（**默认 1=开**）。
+ *   1 = REG00/REG01（时钟/CSM 使能）纳入终态判据 + 单笔补写（本轮修法）；
+ *   0 = **复现旧行为**（只读进诊断量、既不判也不补）—— 用来在同一固件上做 A/B，
+ *       证明"丢掉 REG01 之后，旧行为下它永远不会回来（⇒ 无声），新行为下会被补回"。
+ * ⚠ 出货必须为 1。 */
+volatile uint32_t g_es_clk_loop_en = 1u;
 volatile uint32_t g_es_fix_wr  = 0u;       /* "回读发现不对 → 补写"的次数 */
 volatile uint32_t g_es_recover_pe = 0u;    /* 因 BUSY/TIMEOUT 而做 I2C 软件复位(PE 0→1)的次数 */
 volatile uint32_t g_es_readback = 0u;      /* 回读体检执行次数（含起播后那次与每秒那次）*/
@@ -714,6 +741,17 @@ int es8311_write_reg(uint8_t reg, uint8_t val)
     buf[0] = reg;
     buf[1] = val;
 
+    /* ★ 补丁17 故障注入（默认关）：让"对这一支寄存器的下一次写"整段重试全部失败。
+     *   直接返回失败、**完全不碰总线** ⇒ 纯软件、零电气风险；注入一次即自清。 */
+    if ((g_es_drop_wr_reg != 0u) && (reg == (uint8_t)g_es_drop_wr_reg))
+    {
+        g_es_drop_wr_reg = 0u;
+        g_es_fail++;
+        g_es_fail_reg = ((uint32_t)reg << 16) | 0xFFu;   /* 0xFF = 注入（非真实 HAL 状态）*/
+        es8311_i2c_note(1);
+        return -1;
+    }
+
     /* 最多写 tries 次：失败后按类型处置再重试（理由见上）。
      * ⚠ 只在**第一次**失败时记账（否则重试会把失败现场冲掉，复盘时就看不到真因）。
      * ⚠ 失败**必须重试**：调用方（dac_path_regs / 音量 ramp）的历史写法是忽略返回值的，
@@ -791,6 +829,9 @@ int es8311_write_reg(uint8_t reg, uint8_t val)
     }
 
     g_es_fail++;
+    /* ★ 补丁17：记下"是哪一支寄存器穷尽了重试"+ 最后一次的 HAL 状态码（供复盘/验收）。
+     *   丢 0x01/0x00（时钟/CSM 使能）后果最重：无声，且其它回读全都正常。 */
+    g_es_fail_reg = ((uint32_t)reg << 16) | ((uint32_t)st & 0xFFFFu);
     es8311_i2c_note(1);
     return -1;
 }
@@ -1295,6 +1336,7 @@ volatile uint32_t g_es_rb_mute  = 0xFFFFu;   /* REG31 回读值（补丁12：bit
  *   0x3F（全时钟使能），否则芯片无时钟、DAC 收不到数据 ⇒ 续播无声。
  *   ⚠ 这件事**音量回读验不出来**（REG32/REG12 走 I2C，与音频时钟无关，照样可读），
  *     所以必须单独看这三个量。纯诊断、不参与控制流、失败即置 0xFFFF。 */
+volatile uint32_t g_es_rb_clk0 = 0xFFFFu;   /* ★ 补丁17 REG00：期望 CSM_ON(bit7)=1 */
 volatile uint32_t g_es_rb_clk1 = 0xFFFFu;   /* REG01：期望 0x3F（MCLK/BCLK/ADCCLK/DACCLK 全开）*/
 volatile uint32_t g_es_rb_clk2 = 0xFFFFu;   /* REG02：期望 0x00（本项目 48k 分频/倍频）*/
 volatile uint32_t g_es_rb_clk6 = 0xFFFFu;   /* REG06：期望与起播前一致（bclk_div=4、SCK 不反相）*/
@@ -1308,8 +1350,9 @@ int es8311_dac_readback(void)
     g_es_readback++;
 
     /* ★ 补丁11·D9 配套验证：先各回读一次时钟管理寄存器（纯诊断，见 g_es_rb_clk* 说明）。
-     *   若 stop_dac 的完整掉电尾把 REG01 清零、而起播没写回，这里会读到 0x00 ⇒ 一眼可见。 */
-    if (es8311_read_reg(0x01, &v) == 0) { g_es_rb_clk1 = v; } else { g_es_rb_clk1 = 0xFFFFu; }
+     *   若 stop_dac 的完整掉电尾把 REG01 清零、而起播没写回，这里会读到 0x00 ⇒ 一眼可见。
+     * ⚠ 补丁17：REG00/REG01 已**移入下面的闭环**（见那里的说明）—— 它们不再是"只读不修"的
+     *   诊断量，所以必须在"会用到它们的那一轮"里读。这里只保留 REG02/REG06 两条纯诊断。 */
     if (es8311_read_reg(0x02, &v) == 0) { g_es_rb_clk2 = v; } else { g_es_rb_clk2 = 0xFFFFu; }
     if (es8311_read_reg(0x06, &v) == 0) { g_es_rb_clk6 = v; } else { g_es_rb_clk6 = 0xFFFFu; }
 
@@ -1346,8 +1389,37 @@ int es8311_dac_readback(void)
             s_reg31 = (uint8_t)g_es_rb_mute;
         }
 
-        /* 终态判据：音量 == 目标、REG12 的 power-down 位(bit1)为 0、且 REG31 未静音。*/
-        if (vol_ok && pwr_ok && mute_ok && (g_es_rb_vol == target) && ((g_es_rb_pwr & 0x02u) == 0u))
+        /* ★★ 补丁17：**时钟/CSM 使能**必须进终态判据 —— 这是本轮修掉的"看不出来的坏状态"。★★
+         * 【旧实现的洞】REG01 只被读进 g_es_rb_clk1 **当诊断看**：既不进终态判据、也不补写。
+         *   而 REG00/REG01 恰恰是 `es8311_stop_dac()` 的"完整掉电尾"**关掉**、
+         *   起播 `dac_path_regs()` **开头**要写回来的那一对（补丁11·D9 的硬配对）。
+         *   ⇒ 若那一笔恢复写丢了（**实测会丢**，见 g_es_fail / g_es_fail_reg）：
+         *     芯片**没有 MCLK/BCLK/ADC/DAC 时钟 ⇒ 完全无声**；而 REG32（音量）、REG12（上电）、
+         *     REG31（静音）的回读**全都是对的** ⇒ 确认期判"通过"、每秒体检也判"通过"
+         *     ⇒ 用户看到"进度条在走但没声音"，工程师手上的所有指标却都是绿的。
+         *     这正是本项目最忌讳的一类故障（旧笔记里已写明"无时钟⇒无声，而音量回读验不出来"）。
+         * 【现在】两者都读回、都进判据、都能单笔补写：
+         *   REG01 期望 0x3F（MCLK/BCLK/ADCCLK/DACCLK/ANACLKx 全使能）；
+         *   REG00 期望 CSM_ON(bit7)=1（时钟状态机开）。
+         * ⚠ 只在"值不对 / 读失败"时才补写 ⇒ 正常态零额外写（读多 2 笔/次体检）。*/
+        uint8_t v1 = 0xFFu, v0 = 0xFFu;
+        int clk1_r = (es8311_read_reg(0x01, &v1) == 0);
+        int clk0_r = (es8311_read_reg(0x00, &v0) == 0);
+        g_es_rb_clk1 = (clk1_r != 0) ? (uint32_t)v1 : 0xFFFFu;
+        g_es_rb_clk0 = (clk0_r != 0) ? (uint32_t)v0 : 0xFFFFu;
+        int clk1_ok = (clk1_r != 0) && (v1 == 0x3Fu);
+        int clk0_ok = (clk0_r != 0) && ((v0 & 0x80u) != 0u);
+        /* ★ 开关：0 = 复现旧行为（只读不判不补），专供 A/B 证明本条修法承重。 */
+        if (g_es_clk_loop_en == 0u)
+        {
+            clk1_ok = 1;
+            clk0_ok = 1;
+        }
+
+        /* 终态判据：音量 == 目标、REG12 的 power-down 位(bit1)为 0、REG31 未静音、
+         *            且 REG00/REG01 的时钟/CSM 使能都在（补丁17）。*/
+        if (vol_ok && pwr_ok && mute_ok && clk1_ok && clk0_ok &&
+            (g_es_rb_vol == target) && ((g_es_rb_pwr & 0x02u) == 0u))
         {
             confirmed = 1;
             break;
@@ -1379,11 +1451,23 @@ int es8311_dac_readback(void)
             {
                 (void)es8311_set_mute(0);   /* 卡在静音：立刻补一次解静音 */
             }
+            /* ★ 补丁17：丢的是时钟/CSM 使能就当场补回来 —— 这两笔决定"有没有声音"，
+             *   而它们**不会**体现在音量/电源回读上（丢写后所有指标都像正常的）。
+             *   ⚠ 值写回的是 dac_path_regs() 里的权威终值（REG01=0x3F / REG00=0x80），
+             *     与起播路径完全一致；只在值不对时执行 ⇒ 正常态不多写一笔。 */
+            if (clk1_ok == 0)
+            {
+                (void)es8311_write_reg(0x01, 0x3Fu);
+            }
+            if (clk0_ok == 0)
+            {
+                (void)es8311_write_reg(0x00, 0x80u);
+            }
         }
         else
         {
-            /* 用"只补那两个寄存器"不够的情形：丢写随机落在 0x09/0x0A/0x0E/0x12/
-             * 0x14/0x17/0x32/0x37/0x45 各处，末轮整段重写才闭合得住（计数在
+            /* 用"只补那两个寄存器"不够的情形：丢写随机落在 0x00/0x01/0x09/0x0A/0x0E/
+             * 0x12/0x14/0x17/0x32/0x37/0x45 各处，末轮整段重写才闭合得住（计数在
              * es8311_dac_repair 里）。 */
             (void)es8311_dac_repair();
         }

@@ -1505,6 +1505,17 @@ void audio_out_tick(void)
         (void)es8311_stop_dac();
     }
 
+    /* ★ 补丁17 排障钩子：g_es_clr_clk_req=1 ⇒ 本拍把 REG01 写成 0x00（时钟全关）。
+     *   用途：**状态级**复现"起播时恢复时钟那一笔写丢了"之后芯片的真实处境
+     *   （REG01 停在 0x00 ⇒ 无 MCLK/BCLK/DACCLK ⇒ 无声，而音量/电源/静音回读全都是正常的）。
+     *   配合 g_es_clk_loop_en 做 A/B：闭环关掉 ⇒ 它永远不回来；闭环开着 ⇒ 下次回读体检补回。
+     *   由 tools/es8311_clk_check.py 的 K7 触发。 */
+    if (g_es_clr_clk_req != 0u)
+    {
+        g_es_clr_clk_req = 0u;
+        (void)es8311_write_reg(0x01u, 0x00u);
+    }
+
     /* dbg 无条件刷新：起播卡住时 playing 往往是 0，那时才最需要看现场
      * （上一版正是"dbg 因 playing=0 而全 0"，白白多烧了一遍固件）。 */
     if (g_ao_playing != 0u)
