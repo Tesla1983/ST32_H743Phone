@@ -171,6 +171,31 @@ volatile uint32_t g_ao_stop_done   = 0u;   /* ★ 补丁15：淡出走完、真�
  * ⇒ 用 `stop_calls − stop_done` 反推幂等分支对这条路径**恒为 0**（不是漏测就是误判）。
  * 直接在分支里 ++ 才是无歧义、无竞态的证据。 */
 volatile uint32_t g_ao_idem_cancel = 0u;
+/* ★★ 补丁16（2026-10-16）：起播安全栅 + 它的可测证据。★★
+ *
+ * 【为什么需要】（用户报障："点击播放、刚开始播放的瞬间有爆音/破音"）
+ *   "停止/暂停"路径**不给 codec 断电**：es8311_dac_become_silent() 只把 REG32 写成 0，
+ *   ao_pause_stop_transport() 只关传输。⇒ 停止之后芯片仍是"**通电 + REG31 未静音**"，
+ *   只差一个非零的 REG32 就能出声。
+ *   而 wav_play_start() / wav_play_resume() 在调 audio_out_start() **之前**就会调
+ *   audio_out_set_volume()（本意只是"把当前 UI 音量同步给 codec"）。旧实现里那句会
+ *   无条件写 REG32 ⇒ 在 CSTART 之前音量就已是**满值** ⇒ 一开时钟，DAC 立刻以满音量
+ *   把音乐前几毫秒送出来，直到下一拍 tick 的 dac_path_regs(0x00) 才把它拉回 0。
+ *   实测这段窗口 = g_ao_t_dacwake_ms ≈ 17~33 ms ⇒ 一声短促的爆音 + 一次"掉静音再升起"的顿挫。
+ *   ⚠ 首次开机后的第一次播放不受影响（那时 s_codec_ready==0 且通路未上电），
+ *     所以现象表现为"**之后每次**点播放都有"。
+ *
+ * 【两个量的分工】
+ *   g_ao_vol_at_cstart    —— CSTART 之前那一刻从芯片**回读**到的 REG32。
+ *                            0x00 = 安全；非 0 = 正带着音量开钟（爆音条件成立）。
+ *                            高字节置 0x01（值 0x01FF）= I2C 读失败，无法判定。
+ *                            这是**直接证据**，不是"我写了 0 所以应该没事"的推断。
+ *   g_ao_start_barrier_en —— 起播安全栅开关，**默认 1=开**。写 0 可在同一固件上做
+ *                            A/B：关掉它就能复现"带着满音量开钟"的旧行为，
+ *                            用来证明这个栅真的是承重的（而不是装饰）。
+ *                            ⚠ 仅供排障；出货默认必须是 1。 */
+volatile uint32_t g_ao_vol_at_cstart    = 0u;
+volatile uint32_t g_ao_start_barrier_en = 1u;
 volatile uint32_t g_ao_seam_max      = 0u;   /* DMA：跨半缓冲接缝的最大样本跳变（0~65535）*/
 volatile uint32_t g_ao_seam_n        = 0u;   /* DMA：上面这个跳变 > AO_SEAM_BIG 的次数 */
 volatile uint32_t g_ao_tz_run_max    = 0u;   /* TIM6：送进 TXDR 的最长连续零（半字）*/
@@ -1002,9 +1027,24 @@ void audio_out_set_feeder(audio_out_feeder cb)
 
 void audio_out_set_volume(uint8_t vol0_100)
 {
-    /* codec 没起来（没接模块 / 未播放）就只记录 —— g_audio_volume 是权威值，
-     * es8311_start_dac() 起播时会读它写一次 REG32。 */
-    (void)es8311_set_volume_ui((uint32_t)vol0_100);
+    /* ★★ 2026-10-16（补丁16）：只在**正在播放**时才把音量写进芯片。 ★★
+     *
+     * 【原实现与自己的注释不符 —— 这就是"刚开始播放那一下爆音"的根因】
+     *   原注释写的是"codec 没起来（没接模块 / **未播放**）就只记录"，但守卫只查了
+     *   `s_codec_ready`（= 跑过 init），**没有查"是否正在播放"**。
+     *   而 wav_play_start() / wav_play_resume() 恰恰在 audio_out_start() **之前**就调本函数
+     *   ⇒ 在"停止后芯片仍通电 + REG31 未静音、只差一个非零 REG32"的状态下，
+     *     REG32 被提前写成**满音量**；紧接着 audio_out_start() 置 CSTART 开时钟，
+     *     DAC 立刻以满音量输出音乐前几毫秒 ⇒ 那声爆音（详见 g_ao_vol_at_cstart 的注释）。
+     *
+     * 【修法】起播的音量一律交给 audio_out_tick 的 ramp（它从 0 起步、按 g_audio_volume 爬升，
+     *   见 s_vol_ramp_left 分支）⇒ 本函数不再需要"替起播预热音量"。
+     *   播放中拖着滑杆调音量仍会直写 REG32（即时可听），行为不变。
+     * ⚠ 不写 ≠ 丢掉：g_audio_volume 才是权威值，ramp 与 es8311_dac_readback() 都读它。 */
+    if (g_ao_playing != 0u)
+    {
+        (void)es8311_set_volume_ui((uint32_t)vol0_100);
+    }
 }
 
 /* ★ 2026-10-14（补丁15b）：把"本次播放"的计数器清零抽成一个函数。
@@ -1195,6 +1235,43 @@ int audio_out_start(void)
         pump_half();
     }
     g_ao_stage = 3u;
+
+    /* ★★ 2026-10-16（补丁16）：起播**安全栅** —— 先静音，再开时钟。 ★★
+     *
+     * 【不变量】任何一次起播，在 I2S 真正开始传输（CSTART）之前，芯片的 REG32 必须是 0
+     *   （-95.5 dB）。这是"起播不爆音"的必要条件：停止/暂停不断电 ⇒ 芯片可能处在
+     *   "通电 + REG31 未静音 + REG32 = 满音量"的状态（例如：用户在**停止态**拖过音量滑杆，
+     *   或历史版本里 wav_play_start() 提前写音量）—— 若就这么开时钟，音乐前几毫秒会以满音量
+     *   直冲喇叭。放这一笔之后，无论上游是谁把 REG32 弄成非 0，都不可能在开钟前"漏"过去。
+     *
+     * 【为什么放在这个位置】此刻环缓冲已铺满、DMA 还没跑、I2S 还没 CSTART ⇒ 写 I2C
+     *   **碰不到任何正在播的数据**，零副作用；而且只此一处，覆盖全部起播入口
+     *   （起播/续播/切歌/demo/停止态改过音量）。
+     *
+     * 【与下游的关系】下一拍 tick 的 es8311_dac_start_muted() 会把 REG32 再写一次 0（幂等），
+     *   然后**从 0 开始** ramp 到 g_audio_volume ⇒ 与本栅不冲突，且顺序上正好构成
+     *   "先静音 → 再开时钟 → 等数据稳定 → 再唤醒通路 → 从 0 爬音量"的完整链条。
+     *
+     * ⚠ g_ao_start_barrier_en 默认 1；写 0 可在同一固件上复现旧行为做 A/B（见其注释）。 */
+    if (g_ao_start_barrier_en != 0u)
+    {
+        (void)es8311_set_volume_ui(0u);
+    }
+
+    /* 把"开钟那一刻芯片里的真实 REG32"回读下来 —— 让不变量**可测**，而不是靠推断。
+     * （这是一笔读，发生在时钟启动之前 ⇒ 对出音零影响；读失败时高位置 1 标记。） */
+    {
+        uint8_t vb = 0xFFu;
+
+        if (es8311_read_reg(0x32u, &vb) == 0)
+        {
+            g_ao_vol_at_cstart = (uint32_t)vb;
+        }
+        else
+        {
+            g_ao_vol_at_cstart = 0x100u | 0xFFu;
+        }
+    }
 
     if (g_ao_use_dma != 0u)
     {

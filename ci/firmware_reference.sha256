@@ -1738,5 +1738,40 @@
 #     根治靠硬件加 4.7 k 外部上拉）。它**不影响"咔"**：`g_es_silent_ng` 在所有测试里恒 0
 #     ⇒ 静音那笔永远是被回读确认的。
 # ===========================================================================================
-06426945b421de0620dfdeef8ae5696695da04d1b5f9424857f715949685069f  ymgui-h743.bin
-666fe4752c370d93e06f753df90dd6a63ac77facf801586ac3def51376397abc  ymgui-h743.elf
+# 【已被补丁16 取代】06426945b421de0620dfdeef8ae5696695da04d1b5f9424857f715949685069f  ymgui-h743.bin
+# 【已被补丁16 取代】666fe4752c370d93e06f753df90dd6a63ac77facf801586ac3def51376397abc  ymgui-h743.elf
+
+# ===========================================================================================
+# 第三十六版 · 补丁 16（2026-10-16）——「点击播放、刚开始播放瞬间的爆音」：起播安全栅
+# -------------------------------------------------------------------------------------------
+# 根因（**可测**，不是推断）：**开 CSTART 那一刻，芯片音量已经是满值**。
+#   ① 停止/暂停**不给 codec 断电**：`es8311_dac_become_silent()` 只写 REG32=0，
+#      `ao_pause_stop_transport()` 只关传输 ⇒ 停完之后芯片是"通电 + REG31 未静音"，
+#      只差一个非零 REG32 就能出声。
+#   ② `wav_play_start()/wav_play_resume()` 在 `audio_out_start()` **之前**调
+#      `audio_out_set_volume()`；旧实现那句**无条件写 REG32**（它的注释写着"未播放就只记录"，
+#      但守卫只查了 `s_codec_ready`，**没查是否在播放** —— 注释与实现不符）。
+#   ③ ⇒ CSTART 一置位，DAC 立刻以**满音量**把音乐前几毫秒送出来，直到下一拍 tick 的
+#      `dac_path_regs(0x00)` 才把 REG32 拉回 0（随后再 ramp 上去）。
+#   ⚠ 复位后**第一次**播放不受影响（那时 s_codec_ready==0 且通路未上电）⇒ 现象是"之后每次都有"。
+# 修法：① `audio_out_set_volume()` 只在 `g_ao_playing != 0` 时直写（起播音量交给 ramp）；
+#   ② `audio_out_start()` 在开 CSTART **之前**加"起播安全栅"：写一笔记 REG32=0，
+#      并**回读**进 `g_ao_vol_at_cstart`（把不变量变成数字）。
+# 实测（tools/start_vol_barrier_check.py，同一固件 A/B，UI 音量 56 ⇒ 目标 REG32=0x6A）：
+#   B1 关栅（g_ao_start_barrier_en=0）+ 起播前把 REG32 弄满 ⇒ **vol_at_cstart=0x6A**，
+#      窗口 = g_ao_t_dacwake_ms = **17 ms** ⇒ 缺陷复现并被量化；
+#   B2 开栅（默认）同样前置，4/4 轮 **vol_at_cstart=0x00**；B3 ramp 后 REG32 回读=0x6A（音量没被吞）；
+#      另跑一轮 8/8 亦全 0x00。首次起播 dacwake=139~196 ms（含 AO_WAKE_SETTLE_FIRST_MS）。
+# 回归（build/_reg16.txt，每项前 reset）：start_vol_barrier 全 PASS；audio_start_ramp R1~R7 PASS；
+#   wav_pause_resume 3/3 PASS（续播后 REG32=0x6A 落进芯片）；audio_click_check C1~C11 全绿；
+#   rapid_stop_start 全 PASS；volume_check S1/S2/S3 PASS（**播放中**拖滑杆仍即时生效 56→32）；
+#   i2s_dma D1~D7 PASS；click_source_probe 两路径 × 7 相位全部干净。
+# 顺带修正一处**文档缺陷**：`es8311_init()` 里 `0x00=0x80` 的注释原写"复位数字/时钟管理"，
+#   与权威位定义（bit7=**CSM_ON**，Linux 内核 sound/soc/codecs/es8311.h）矛盾 ⇒ 已改正，
+#   并补注"首次 init 跑在 i2s_init 之前、此刻无 MCLK"这一时序事实。纯注释，二进制不变。
+# ⚠ 未影响"停止/暂停/续播/切歌/循环播放"的行为：这些路径不走本栅（它们各自先静音再停），
+#   且 volume_check / wav_pause_resume / rapid_stop_start 全部复测通过。
+# FLASH 1 667 012 → **1 667 156 B（79.50%）**（+144 B）；SRAM1 84 704 B 不变。
+# ===========================================================================================
+8821380dfa70c8ecd92793db3ffc8227b4e8260bbb60f1c1947ef1d698db0f88  ymgui-h743.bin
+9f537a42b5563de147a762abe9ebe6b1018ea8d30984027703d8b0e412b12026  ymgui-h743.elf

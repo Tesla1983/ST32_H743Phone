@@ -895,9 +895,19 @@ int es8311_init(void)
     rc |= es8311_write_reg(0x10, 0x1F);   /* SYSTEM_REG10 */
     rc |= es8311_write_reg(0x11, 0x7F);   /* SYSTEM_REG11 */
 
-    /* ---- 1b. 复位 + 主从选择 ----
-     * 0x00 = 0x80：复位数字/时钟管理；bit6(0x40)=0 ⇒ codec 作 I2S **从机**
-     *（本板 STM32 出 MCLK/SCK/LRCK）。esp-adf 是读-改-写，照做。 */
+    /* ---- 1b. 时钟状态机开 + 主从选择 ----
+     * 0x00 = 0x80：**bit7 = CSM_ON=1**（时钟状态机开）。
+     *   ⚠⚠ 本注释曾写作"复位数字/时钟管理"——**是错的**。位定义已按权威源
+     *   （Linux 内核 sound/soc/codecs/es8311.h）核对：bit7=CSM_ON、严格说 bits[4:0]
+     *   才是 RST 掩码，写 0x80 是"开 CSM"而不是"发复位脉冲"。见 docs/ES8311_LIB_COMPARE.md。
+     *   为什么必须纠正：若误以为它是"复位脉冲"，就会像历史版本那样在"停止"路径里
+     *   顺手写 0x00=0x1F 当成"复位一下"，实际却把 CSM 关掉了（掉电尾 D9 的由来）。
+     *   bit6(0x40)=0 ⇒ codec 作 I2S **从机**（本板 STM32 出 MCLK/SCK/LRCK）。
+     *   esp-adf 是读-改-写，照做。
+     * ⚠ 注意时序：本函数（首次起播）跑在 audio_out_start() 里 i2s_init() **之前**
+     *   ⇒ 此刻引脚上还没有 MCLK。寄存器写本身不依赖 MCLK，但 CSM 的时钟状态要到
+     *   MCLK 起来后才稳定 ⇒ 这也是首次起播必须"等复位窗口过去再唤醒 DAC"
+     *   （AO_WAKE_SETTLE_FIRST_MS，见 audio_out.c）的原因之一。 */
     rc |= es8311_write_reg(0x00, 0x80);
     if (es8311_read_reg(0x00, &v) == 0)
     {

@@ -3999,3 +3999,164 @@ if ((s_burst_stage == 1u) && ((int32_t)(HAL_GetTick() - s_burst_deadline) >= 0))
    电平自检的**误判**（该检查点在 `HAL_I2C_Init` 之后立刻读 `IDR`）。**新增待确认项**。
 
 
+
+---
+
+## 第三十六版 · 补丁 16（2026-10-16）——"点击播放、刚开始播放瞬间的爆音"：起播安全栅
+
+> 用户报障：「为什么在点击播放、音频刚开始播放的瞬间会出现爆音（杂音/破音）？」
+> 本轮按"音频初始化 / 采样数据处理 / 音量增益设置 / 播放器启动时序"四块逐段审查，
+> **只找到一处真缺陷**（其余三块结论见 §5），但它正好落在"音量增益设置 × 启动时序"的交界上。
+
+### 0. 一句话结论
+
+**开 CSTART 那一刻，芯片的音量寄存器 REG32 已经是满值** ⇒ DAC 一上电就把音乐前
+**17 ms**（实测 `g_ao_t_dacwake_ms`）以满音量直送喇叭，随后被下一拍的"静音唤醒"拉回 0
+再 ramp 上来 ⇒ 用户听到的就是起点那一声爆音 + 一次"掉静音再升起"的顿挫。
+
+### 1. 根因链（每一环都能在源码指认）
+
+1. **停止/暂停不给 codec 断电**：
+   * `es8311_dac_become_silent()` 只写 `REG32 = 0`（补丁15 起不再碰 REG31）；
+   * `ao_pause_stop_transport()`（audio_out.c）只 `tim6_stop / i2s_dma_stop / i2s_stop /
+     i2s_gpio_release` + 清状态位，**不碰 `REG0E/REG12/REG0D/REG09`**；
+   ⇒ 停完之后芯片处在"**通电 + REG31 未静音 + REG32=0**"—— 只差一个非零 REG32 就能出声。
+
+2. **`wav_play_start()` / `wav_play_resume()` 在 `audio_out_start()` 之前就先写了一次音量**：
+   `wav_play.c:360 / :414` 都是 `audio_out_set_volume((uint8_t)g_audio_volume);` 然后才
+   `audio_out_start()`。而 `audio_out_set_volume()` 的实现（audio_out.c）是：
+   ```c
+   /* 注释写的是："codec 没起来（没接模块 / **未播放**）就只记录" */
+   void audio_out_set_volume(uint8_t vol0_100) {
+       (void)es8311_set_volume_ui((uint32_t)vol0_100);   /* ← 无条件写！ */
+   }
+   ```
+   ⚠ **注释与实现不符**：唯一守卫在 `es8311_set_volume_ui()` 里，它只查 `s_codec_ready`
+   （= 跑过 init），**没查"是否正在播放"**。所以第二次及以后的每次起播，这一句都会把
+   REG32 直接写成**满音量**。
+
+3. **`audio_out_start()` 随即开时钟**：`__HAL_I2S_ENABLE` → 灌 FIFO → **CSTART**。
+   此刻 DAC 已是"通路通电 + 未静音 + REG32 满值 + MCLK/BCLK 刚跑起来 + DMA 数据在流"
+   ⇒ **满音量出音**。
+
+4. **直到下一拍 tick 才纠正**：`audio_out_tick()` 的 `s_dac_pending` 分支调
+   `es8311_dac_start_muted()` → `dac_path_regs(0x00)` 才把 REG32 拉回 0，然后从 0 开始 ramp。
+   实测这一拍 = `g_ao_t_dacwake_ms` = **16~17 ms**。
+
+### 2. 为什么"只有开机第一次播放是干净的"
+
+复位后第一次起播时 `s_codec_ready == 0` ⇒ `es8311_set_volume_ui()` 直接返回、不写总线；
+而且那一刻 DAC 通路**还没上电**（要等 tick 里的 `dac_path_regs()`）⇒ 没有可闻的窗口。
+⇒ 现象天然表现为"**开机第一次正常、之后每次点播放都有**"。这一点与用户描述吻合。
+
+### 3. 把"有没有带着音量开钟"变成**可测的数字**
+
+新增诊断量：
+
+| 量 | 含义 |
+|---|---|
+| `g_ao_vol_at_cstart`（audio_out.c） | CSTART **之前**从芯片**回读**的 REG32。`0x00` = 安全；非 0 = 带着音量开钟；高字节 `0x100` 置 1 = I2C 读失败 |
+| `g_ao_start_barrier_en`（audio_out.c） | 起播安全栅开关，**默认 1=开**。写 0 可在**同一固件**上复现旧行为，用于 A/B |
+| `g_wav_test = 6`（wav_play.c） | 在**停止态**把当前 UI 音量写进 REG32 —— 忠实模拟"用户没在播放时拖过音量滑杆"（`main.c::app_volume_persist` 是同一条调用），这是"起播前 REG32 非 0"的**唯一现实入口** |
+
+关键：`g_ao_vol_at_cstart` 是**回读值**，不是"我写了 0 所以应该没事"的推断。
+
+### 4. 修法（两处，互相补强）
+
+**① 根因修复 —— `audio_out_set_volume()` 只在播放中直写：**
+```c
+void audio_out_set_volume(uint8_t vol0_100)
+{
+    if (g_ao_playing != 0u) {                       /* ★ 补丁16：补上注释里早就写了的守卫 */
+        (void)es8311_set_volume_ui((uint32_t)vol0_100);
+    }
+}
+```
+起播的音量从此只由 tick 的 ramp 施加（从 0 起步、按 `g_audio_volume` 爬升）。
+播放中拖滑杆仍直写（即时可听，`volume_check` 已复测 56→32 生效）。
+⚠ 不写 ≠ 丢值：`g_audio_volume` 是权威值，ramp 与 `es8311_dac_readback()` 都读它。
+
+**② 不变量加固 —— `audio_out_start()` 里加"起播安全栅"（先静音、再开时钟）：**
+```c
+    /* 位置：环缓冲已铺满、DMA 还没跑、I2S 还没 CSTART ⇒ 写 I2C 碰不到任何正在播的数据 */
+    if (g_ao_start_barrier_en != 0u) { (void)es8311_set_volume_ui(0u); }
+    { /* 紧接着把芯片里的 REG32 回读进 g_ao_vol_at_cstart（读失败记 0x100|0xFF）*/ }
+```
+它让"起播不爆音"成为一个**与上游无关的硬不变量**：无论谁（UI 滑杆、demo、将来的调用方）
+把 REG32 弄成非 0，都不可能在开钟前漏过去。与下游 `dac_path_regs(0x00)` 构成完整链条：
+**先静音 → 开时钟 → 等数据稳定 → 唤醒通路 → 从 0 爬音量**。
+
+### 5. 其余三块的审查结论（**未发现缺陷**，如实记录）
+
+* **音频初始化**：`es8311_init()` 序列与官方 esp_codec_dev 逐条比对一致（0x44 双写、
+  0x00=0x80、0x01=0x3F、lrck=0xFF、bclk_div=4、末步 0x44=0x58）；`dac_path_regs()` 的次序
+  `先 mute(1) → 上电 → REG32=0 → 最后 mute(0)` 正确（解静音时音量在 -95.5 dB）。
+* **采样数据处理**：`feeder_cb()` 单声道按 `dst[2i]=dst[2i+1]=s_mono[i]` **展开成 L=R**（不是
+  错位交错），尾巴不足补 0；播放速率实测比值 **0.995**（见第三十五版 §8）⇒ 无采样/通道类缺陷。
+* **播放器启动时序**：I2S 的 `SPE → 灌满 FIFO → CSTART` 次序、`FTHLV=8`、DMA `VERY_HIGH`
+  优先级、起播铺满整环、`AO_WAKE_SETTLE_FIRST_MS` 落定窗口 —— 全部按既有实测结论执行，本轮未改动。
+
+### 6. 量 → 改 → 再量（同一固件 A/B，UI 音量 56 ⇒ 目标 REG32=0x6A）
+
+`python tools/start_vol_barrier_check.py`
+
+```
+预热起播:            vol_at_cstart=0x00 dacwake=139 ms rb_vol=0x6A playing=1
+【B1】关栅 + 起播前弄满音量 ⇒ vol_at_cstart=0x6A  dacwake=17 ms   ← 缺陷复现
+      ✅ 关栅时确实带着 REG32=0x6A 开时钟，窗口 = 17 ms
+【B2】开栅（默认）+ 同样前置：4/4 轮 vol_at_cstart=0x00；另跑 8 轮亦全 0x00
+【B3】ramp 走完 REG32 回读 = 0x6A（= 目标，音量没被吞）  【B4】收尾 playing=0
+⇒ 全部 PASS
+```
+
+**B1 是这轮最要紧的一步**：它证明这个栅是**承重的**（关掉它就能把缺陷复现出来），
+而不是事后加的一个装饰。
+
+### 7. 全量回归（`build/_reg16.txt`，每项前先 `probe-rs reset`）
+
+| 脚本 | 结果 |
+|---|---|
+| `start_vol_barrier_check.py` | 全 PASS（B1 复现 0x6A/17 ms；B2 4/4 + 8/8 = 0x00；B3/B4 OK） |
+| `audio_start_ramp_check.py` | R1~R7 全 PASS |
+| `wav_pause_resume_check.py` | 3/3 PASS，续播后 REG32=0x6A 落进芯片（**Fix A 没吞音量**） |
+| `audio_click_check.py` | C1~C11 全绿 |
+| `rapid_stop_start_check.py` | 全 PASS（幂等分支 6/6 命中） |
+| `volume_check.py` | S1/S2/S3 PASS —— **播放中**拖滑杆仍即时生效（56→32） |
+| `i2s_dma_check.py` | D1~D7 PASS |
+| `click_source_probe.py` | DMA / TIM6 两条路径 × 7 相位**全部干净** |
+
+### 8. 顺带纠正一处**文档缺陷**
+
+`es8311_init()` 里 `0x00 = 0x80` 的注释原写"**复位**数字/时钟管理"，与权威位定义
+（`REG00` bit7 = **CSM_ON**；Linux 内核 `sound/soc/codecs/es8311.h`，见
+`docs/ES8311_LIB_COMPARE.md`）矛盾。已改正，并补注一个时序事实：
+**首次 init 跑在 `i2s_init()` 之前，此刻引脚上还没有 MCLK**（CSM 的时钟状态要等 MCLK 起来
+才稳定 ⇒ 这也是"首次起播必须等复位窗口过去再唤醒 DAC"的原因之一）。
+⚠ 纯注释改动，**二进制不变**（重建后哈希与板上固件逐字节一致：`8821380d…` / `9f537a42…`）。
+
+### 9. 会影响其他播放场景吗（逐场景核对）
+
+| 场景 | 是否受影响 | 依据 |
+|---|---|---|
+| 首次起播 | 否 | 该路径本来 `s_codec_ready==0`、REG32 干净；栅写 0 后 ramp 照常升到目标（预热轮已验证） |
+| 停止后再播 | **正是被修的** | B1/B2 就是这条路径 |
+| 暂停 → 续播 | 否（且更稳） | `wav_pause_resume` 3/3 PASS，续播后 REG32=0x6A |
+| 快速连点 暂停→播放（幂等分支） | 否 | `rapid_stop_start` 6/6 命中、全 PASS |
+| 播放中拖音量滑杆 | 否 | `volume_check` S1 PASS（56→32 生效、三处一致、落盘） |
+| 停止态拖音量滑杆 | 行为**更正确** | 值仍记入 `g_audio_volume`/落盘；不再提前写进芯片；起播时由 ramp 施加 |
+| 切歌 / 播完自动停 | 否 | 走 `audio_out_stop()`（不受本改动影响）；`click_source_probe` 相位全干净 |
+| TIM6 路径 | 否 | 栅在两条路径共用之前，与 `g_ao_use_dma` 无关；TIM6 相位全干净 |
+| 自检 demo（`audio_out_demo_start`） | 否（且更稳） | 同样经 `audio_out_set_volume`（现在不提前写）+ 栅，随后 ramp |
+
+**副作用与代价**：每次起播多 1 写 + 1 读共 2 笔 I2C（都在 CSTART **之前**，不碰流数据；
+笔数计入 `g_es_wr_ok`/`g_es_rd_ok`，不影响出音）。FLASH +144 B。SRAM1 不变。
+
+### 10. 遗留（承接第三十五版 §8）
+
+1. **`g_es_silent_ng` 必须继续恒 0**：本轮的修法与"停止侧静音"是同一枚硬币的两面 ——
+   若将来有人把静音那笔去掉，起播侧就会重新可闻。已写进 `audio_out_set_volume()` 与
+   `g_ao_vol_at_cstart` 的注释里。
+2. `es8311_clk_check` 的 **K5**（I2C 真丢写，补丁9b 遗留）仍在，与"爆音"无关（见第三十五版 §7/§8）。
+3. **听感只能由耳朵判定**：本轮的"爆音"证据是"开钟时 REG32=0x6A + 通路通电 + 未静音 +
+   数据在流 ⇒ 必然以满音量输出约 17 ms"，再叠加关栅/开栅的 A/B。这是**充分条件**层面的
+   证据，但"听起来有多响"仍需人耳确认。

@@ -503,6 +503,18 @@ void wav_play_tick(void)
             s_burst_deadline = HAL_GetTick() + g_wav_burst_ms;
         }
     }
+    /* ★ 补丁16（2026-10-16）：g_wav_test = 6 —— 在**停止/暂停态**把当前 UI 音量写进芯片 REG32。
+     * 【用途】忠实模拟"用户在没有播放的时候拖过音量滑杆"：main.c 的 app_volume_persist()
+     *   正是直接调 es8311_set_volume_ui(g_audio_volume) —— 这是"起播前 REG32 非 0"的
+     *   **唯一现实入口**（也是旧版 wav_play_start() 提前写音量的等价场景）。
+     *   它让"起播安全栅（g_ao_start_barrier_en）"可以在同一固件上做 A/B：
+     *     关掉栅 ⇒ 起播时 g_ao_vol_at_cstart 读到满音量值（爆音条件成立）；
+     *     开着栅 ⇒ 读到 0x00。 */
+    else if (g_wav_test == 6u)
+    {
+        g_wav_test = 0u;
+        (void)es8311_set_volume_ui(g_audio_volume);
+    }
     if ((s_burst_stage == 1u) && ((int32_t)(HAL_GetTick() - s_burst_deadline) >= 0))
     {
         s_burst_stage = 0u;
