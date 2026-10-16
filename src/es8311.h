@@ -99,6 +99,43 @@ extern volatile uint32_t g_es_clr_clk_req;
  *   仅用于 A/B 证明"把时钟寄存器纳入闭环"这条修法承重。⚠ 出货必须为 1。 */
 extern volatile uint32_t g_es_clk_loop_en;
 extern volatile uint32_t g_es_fix_wr;  /* 回读校验发现不对、补写 的次数 */
+
+/* ---- 补丁18：录音（ADC / 麦克风）侧 ---- */
+extern volatile uint32_t g_es_adc_on;        /* 1 = ADC 通路已按录音配置开好（回读确认通过）*/
+extern volatile uint32_t g_es_adc_mic_gain;  /* 最近写入 REG16 的 PGA 增益 */
+extern volatile uint32_t g_es_rb_adc0a;      /* REG0A 回读：期望 bit6==0（ADC 通路开）*/
+extern volatile uint32_t g_es_rb_adc09;      /* REG09 回读：期望 bit6==1（录音时 DAC 通路关）*/
+extern volatile uint32_t g_es_rb_adc17;      /* REG17 回读：期望 0xBF（ADC 音量 0 dB）*/
+
+/**
+ * @brief  确保控制通道就绪（I2C1 初始化 + 从机地址探到）。**幂等**，可重复调。
+ *
+ * 【为什么必须显式调】补丁18 之前只有 audio_out_start() 会建 I2C 总线；而"录音"可能是
+ *   开机后第一个音频动作 ⇒ 若不先建通道，所有寄存器写都会 HAL_BUSY 失败。
+ * @return 0 = 就绪；-1 = I2C 总线起不来；-2 = 总线上没有 ES8311（没接模块/线错）
+ */
+int es8311_bus_ready(void);
+
+/**
+ * @brief  开 **ADC（麦克风）通路** —— 录音链路第一步（2026-10-16 补丁18）
+ *
+ * 【为什么必须单独一组】本项目此前只做放音：`dac_path_regs()` 是「DAC 通路开、
+ *   **ADC 通路关**（0x0A bit6=1）」+「0x17=0xBF（ADC 侧，本测试不用）」。录音要把这三处反过来，
+ *   并且 **ADC 数字音量 REG17 特别容易被静音路径带走**（`es8311_stop_dac()` 会写 0x17=0x00）
+ *   ⇒ 走过一次真·掉电后录音就是一片静音，而所有回读都正常 —— 所以这里显式写 0xBF 并回读确认。
+ *
+ * 【与放音互斥】I2S2 同一时刻只能 TX 或 RX（I2SCFG 二选一）⇒ 录音/放音不能同时进行。
+ *   音频侧 I2S 的切换见 src/audio_out.c 的 audio_out_capture_start()。
+ *
+ * @param  mic_gain_reg  REG16（模拟 PGA 增益）的值；0x24 与官方默认一致
+ * @return 0 = 写完且回读确认（g_es_adc_on=1）；<0 = 有写失败或回读值不对
+ */
+int es8311_adc_start(uint32_t mic_gain_reg);
+/**
+ * @brief  结束录音，把 codec 恢复成"DAC 静音起播"的干净状态（内部走 dac_path_regs(0x00)）
+ * @return 0=OK；<0=有写失败
+ */
+int es8311_adc_stop(void);
 extern volatile uint32_t g_es_recover_pe;/* 因 BUSY/TIMEOUT 做 I2C 软复位(PE 0→1)的次数 */
 extern volatile uint32_t g_es_readback; /* 回读体检执行次数（起播后那次 + 播放中每秒那次）*/
 

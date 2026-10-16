@@ -23,6 +23,8 @@ extern uint32_t _ssd_bss;  /* TF 卡数据缓冲段（.bss_sd → SRAM1）起始
 extern uint32_t _esd_bss;  /* 同上，结束 */
 extern uint32_t _saudio_bss; /* 音频缓冲段（.bss_audio → SRAM1）起始 */
 extern uint32_t _eaudio_bss; /* 同上，结束 */
+extern uint32_t _ssram2_bss; /* 录音等大 CPU 缓冲段（.bss_sram2 → SRAM2）起始（补丁18）*/
+extern uint32_t _esram2_bss; /* 同上，结束 */
 
 void board_init_memory(void)
 {
@@ -68,6 +70,14 @@ void board_init_memory(void)
      * ⚠ 这一条**必须清**：DMA 循环缓冲在没有喂数时会被直接送出去，
      *   上电随机值 = 一耳朵白噪声（而且响度不可控）。清零后是确定的静音。 */
     for (dst = &_saudio_bss; dst < &_eaudio_bss;)
+    {
+        *dst++ = 0u;
+    }
+
+    /* 7) 清"录音等大 CPU 缓冲"段（NOLOAD → SRAM2，2026-10-16 补丁18）。
+     * ⚠ 与第 6 条同理：录音 DMA 收方向的循环缓冲若不先清零，第一次录音文件的开头
+     *   会是上电随机值（一上来就是一段噪声）。 */
+    for (dst = &_ssram2_bss; dst < &_esram2_bss;)
     {
         *dst++ = 0u;
     }

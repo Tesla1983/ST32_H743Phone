@@ -1809,5 +1809,53 @@
 # FLASH 1 667 156 → **1 667 540 B（79.51%）**（+384 B）；SRAM1 84 704 B 不变。
 # ⚠ 遗留：自然丢写本身仍未根除（根因=电气边际，根治需硬件外部上拉）；闭环只在"播放中"跑。
 # ===========================================================================================
-34e6d2dc78ee7677f1bf839cc32b144e0250c0938f5f8181fb8740952aab74e6  ymgui-h743.bin
-8bceaa79dfaddd1f78ec67d7198d05c93e4c3f99c48defecfcf80892f41a95aa  ymgui-h743.elf
+# 【已被补丁18 取代】34e6d2dc78ee7677f1bf839cc32b144e0250c0938f5f8181fb8740952aab74e6  ymgui-h743.bin
+# 【已被补丁18 取代】8bceaa79dfaddd1f78ec67d7198d05c93e4c3f99c48defecfcf80892f41a95aa  ymgui-h743.elf
+
+# ===========================================================================================
+# 第三十八版 · 补丁 18（2026-10-16）—— 录音链路：**数字侧已打通并逐段验收；模拟侧未闭环**
+# -------------------------------------------------------------------------------------------
+# 前提变化：ES8311 模块的 **DOUT → 排针 P2-9（PC2 = I2S2_SDI, AF5）已接通**
+#   （原接线表里这行写的是"录音才接"，故 docs/TF_CARD_APP_INTEGRATION_FEASIBILITY.md
+#     §3.5「录音硬件上不成立」的结论前提已变，方案见新增的 docs/MIC_RECORD_DESIGN.md）。
+#
+# 新增/改动：
+#   · src/es8311.c：es8311_adc_start()/es8311_adc_stop()（ADC 通路开 REG0A bit6=0、录音时
+#     DAC 通路关 REG09 bit6=1、REG17=0xBF、REG16=PGA、非 DMIC、VREF、**回读确认**）；
+#     **新增幂等的 es8311_bus_ready()** —— 录音可能是开机后第一个音频动作，不先建 I2C1
+#     就会全部 HAL_BUSY 失败（实测 g_es_wr_ok=0、失败环全 0x02）。
+#   · src/audio_out.c：抽出 **i2s_apply(mode)**（放音主发 / 录音主收**共用**时钟与格式，
+#     防两份参数分叉）；新增 audio_out_capture_start/avail/read/stop（I2S2 主收 +
+#     **DMA1_Stream3，DMAMUX 请求 39 = SPI2_RX，CFG1.RXDMAEN(bit14)**，CIRCULAR，NDTR 轮询；
+#     与放音**互斥**，放音未淡出完返回 AUDIO_CAP_AGAIN(2)）。
+#   · src/audio_rec.c/.h（新）：录音引擎（状态机 / 取数 / WAV 头 + **停止时从卡上回读文件并
+#     逐项自检** → g_rec_hdr_ok）+ BoardRec_* 桥接 + 无信号如实判定（BoardRec_MicOk）。
+#   · apps/recorder.c：从"演示壳"改为真录音（计时=**已写进文件的帧数**折算、电平=真实采样峰值、
+#     开录 2 s 无信号就如实提示、退出即收尾）。
+#   · linker：新增 **.bss_sram2（→ SRAM2）**；board_startup.c 加对应清零。
+#   · main.c：主循环每拍调 audio_rec_poll()。
+#
+# ⚠⚠ 本轮修掉的两个真实缺陷（都与"看不出来的坏状态"有关，已写进 MEMORY 铁律 11~13）：
+#   ① **开机就 HardFault**：把 8 KB 暂存放进 DTCM ⇒ heap0 由 ~35.6 KB 掉到 26.6 KB
+#      ⇒ g_h0{total=used=peak=26560, free_head=NULL} 用满 ⇒ build_ui() 拿 NULL 写穿
+#      ⇒ CFSR=0x400(IMPRECISE)/HFSR=0x4000_0000(FORCED)、g_shell_rc 停在初值 99。
+#      ⇒ 大缓冲一律不进 DTCM（.bss_sram2/.bss_audio）。修后 heap0 35 424 B。
+#      ⚠ 遗留：heap0 峰值 34 248，只剩 ~1.2 KB 余量（补丁18 之前也只有 ~1.7 KB）。
+#   ② **采集进度反推会凭空造数**：NDTR 反推法在 DMA 被停/重配时看到任意跳变，旧写法
+#      adv≠0 就累加 ⇒ 实测造出 80 754 半字/s、写出 33.8 MB 零数据。⇒ 加两道闸
+#      （只认 DMA_SxCR.EN==1；单次推进 ≤ 半缓冲），被丢弃的跳变计入 g_cap_jump。
+#
+# 板上实测（本轮）：ADC 回读 REG0A=0x3C(通路开)/REG09=0x5C(DAC关)/REG17=0xBF ✓；
+#   SPI2 直读 I2SCFGR=0x02080407(主收/Philips/16bit-32slot/I2SDIV=8/MCKOE=1)、
+#   CFG1=0x000740EF(DSIZE=15/FTHLV=7/RXDMAEN=1)、CR1=0x201(SPE+CSTART) ✓；
+#   采集速率 91 166 半字/s（标称 97 656 的 93%）、g_cap_ovr=0、g_cap_lost=0；
+#   3 s 录 169 984 帧≈3.48 s；**g_rec_hdr_ok=1**（头 = RIFF/WAVE/fmt/16/{PCM,2ch}/48828/
+#   195312/{4,16}/data/974848，文件实长 = data+44）✓；放音无回归（dac_ready=1、
+#   REG32 回读=UI 音量、udr=0、underrun=0）。
+# ⚠ **未闭环**：g_cap_peak_l/r=0/0、g_cap_hist=[4096,0,…] ⇒ 采到的样本**全是 0**
+#   （模拟输入无信号）。诊断阶梯见 docs/MIC_RECORD_DESIGN.md §7（第一步：只读 PC2 的 IDR
+#   做"线活动度"采样，用它区分"线没通"与"有麦克风但无声"）。
+# FLASH 1 673 068 B（79.78%）；SRAM1 77.12% / SRAM2 54.06%；DTCM 46 500 B。
+# ===========================================================================================
+df501095264133a4608d6bcbc75cf1e672cbaa2aef151032a22abe88dde88caa  ymgui-h743.bin
+134889f6958c0b1c8f43e64b15bee06f4960f9f4c17ec10c0d2dc42d4036013a  ymgui-h743.elf

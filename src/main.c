@@ -64,6 +64,7 @@
 #include "es8311.h"
 #include "audio_out.h"
 #include "wav_play.h"
+#include "audio_rec.h"     /* 补丁18：录音链路（MIC → ES8311 ADC → I2S2 主收 → WAV）*/
 #if defined(YMGUI_AUDIO_TEST)
 /* ES8311 音频链路自检（方案 A 验收）：默认不编译，见 CMakeLists 的
  * YMGUI_AUDIO_TEST 与 src/audio_test.h 顶部的触发/判据说明。 */
@@ -1087,6 +1088,12 @@ int main(void)
         /* 音乐播放：驱动 I2S 的 DMA 补数（从 TF 卡读下一段）+ 播完自动收尾。
          * ⚠ 必须每拍调：半缓冲只有 42 ms，漏一拍以上就会听到卡顿。 */
         wav_play_tick();
+
+        /* 录音引擎（补丁18）：每拍取 DMA 采集的数据并写卡 + 消费 g_rec_test 排障钩子。
+         * ⚠ 必须每拍调：采集环只有 84 ms，漏拍就会 g_cap_lost 增长（丢样本）。
+         * 与 wav_play_tick 不冲突 —— 两者由 audio_out_capture_start() 统一仲裁
+         * （I2S2 主发/主收二选一），同一时刻只有一个在真正占用 SPI2。 */
+        (void)audio_rec_poll();
 
         /* 亮度 → 背光 PWM 桥（步骤 2a 硬件版）。
          *

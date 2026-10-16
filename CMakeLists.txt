@@ -263,6 +263,11 @@ set(APP_SRC
 	src/es8311.c
 	src/audio_out.c
 	src/wav_play.c
+	# 录音链路（2026-10-16 补丁18）：MIC → ES8311 ADC → I2S2 主收 → DMA → FatFs → WAV。
+	# 与上面三者同一个模块组（共用 SPI2/ES8311）。⚠ 与放音**互斥**：I2S2 的 I2SCFG
+	# 是"主发/主收"二选一，代码里由 audio_out_capture_start() 统一仲裁。
+	# ⚠ 硬件前提：模块 DOUT 必须接到排针 P2-9（PC2 = I2S2_SDI），否则录到的是悬空电平。
+	src/audio_rec.c
 	# QSPI 分块灌库（方案 B 配套）：源文件始终编入，但是**空壳** —— 真正的逻辑
 	# 由 option(YMGUI_QSPI_PROVISION) 里的宏决定编不编。这样 g_prov_enabled 这个
 	# 符号永远存在，tools/qspi_provision.py 能明确区分"没编进来" vs "编了但失败"。

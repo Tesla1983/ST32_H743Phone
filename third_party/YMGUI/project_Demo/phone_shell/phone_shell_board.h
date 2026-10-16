@@ -202,6 +202,34 @@ int         BoardMusic_Resume(void);                /* 从暂停处（或暂停�
 int         BoardMusic_Paused(void);                /* 1 = 有暂停会话（可续播），0 = 无 */
 int         BoardMusic_CurrentName(char* out, int n);/* 当前在播/暂停曲目名（停止返回 <0，out=""）*/
 
+/* ---- 录音机：MIC → ES8311 ADC → I2S2 主收 → WAV 落卡（2026-10-16 补丁18）----
+ * 与 BoardMusic_* / BoardPic_* 同一套分层：phone_shell 不认识 FatFs/I2S/ES8311，
+ * 实现在 src/audio_rec.c（引擎 + 文件）与 src/audio_out.c（I2S2 主收 + DMA）。
+ *
+ * ⚠⚠ 硬件前提：ES8311 模块的 **DOUT 必须接到排针 P2-9（PC2 = I2S2_SDI）**。
+ *   本工程放音只用模块 DIN（STM32 PB15 驱动），**DOUT 一直是空着的**（接线表里那行
+ *   写的就是"录音才接"）。没接时链路照常"跑通"、文件照常生成，但内容是悬空电平 ⇒
+ *   判据看 g_cap_peak_l/r 与 g_cap_dc_l/r（tools/rec_check.py 直接给结论）。
+ *
+ * ⚠ 与放音**互斥**：I2S2 同一时刻只能主发或主收（RM0433 §50.7.6）⇒ 录音前必须先停音乐。
+ *   BoardRec_Start() 会自己发起"停音乐"，并从**下一拍**开始录；这期间返回 2（准备中），
+ *   App 应当照常每拍调它、把按钮显示成"准备中…"，而不是把主循环阻塞住等。 */
+int         BoardRec_Start(void);      /* 0=已开始录音；2=准备中（下一拍再调）；<0=失败 */
+int         BoardRec_Stop(void);       /* 停止并把 WAV 头回填成真实长度；0=已停 */
+int         BoardRec_Active(void);     /* 1=正在录音 */
+int         BoardRec_Pending(void);    /* 1=正在准备（等放音停完）*/
+uint32_t    BoardRec_ElapsedMs(void);  /* 已录毫秒（按**帧数**折算，不是按 tick）*/
+uint32_t    BoardRec_Bytes(void);      /* 已写入文件的数据字节数 */
+const char* BoardRec_Name(void);       /* 落地文件名（不含目录）；无 = "" */
+const char* BoardRec_StatusText(void); /* 可直接画的一行中文状态 */
+int         BoardRec_LastRc(void);     /* 最近一次动作码：0=成功，<0=失败阶段（见 src/audio_rec.c）*/
+int         BoardRec_Scan(void);       /* 扫一次 /YMGUI/RECORD，返回其中的文件数 */
+int         BoardRec_Level(void);      /* 当前输入电平 0..100（取 L/R 采样峰值较大者）*/
+int         BoardRec_MicOk(void);      /* 1 = 本次录音采到过明显信号；0 = 一直很小
+                                        * ⇒ UI 应当如实提示"未检测到麦克风信号"而不是
+                                        * 继续显示"录音中"（假数据零容忍）*/
+uint32_t    BoardRec_PeakRaw(void);    /* 原始峰值 0..32767（排障/验收脚本用）*/
+
 /* ---- 输入法自测（SWD 触发，无需碰屏）----
  * 板上没有物理键盘也没有 stdio，"看着屏幕上有没有候选"不算可靠判据。
  * 这里把「打开笔记 → 聚焦输入框 → 逐字母敲软键盘」做成可由 SWD 触发的状态机，

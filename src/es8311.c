@@ -1139,6 +1139,152 @@ int es8311_dac_mute(void)
     return rc;
 }
 
+/* ★★ 补丁18：确保"控制通道就绪" —— I2C1 已初始化 + 从机地址已探到。**幂等**，可重复调。
+ *
+ * 【为什么必须有这个函数】在补丁18 之前，**只有 audio_out_start() 会建 I2C 总线**
+ *   （它调 es8311_bus_init() + 两个地址都探一次）。而"录音"完全可能在**开机之后第一个
+ *   音频动作**就发生 —— 用户开机直接打开录音机按录音，放音路径一次都没跑过
+ *   ⇒ I2C1 的时钟/GPIO/AF 都没配、HAL 句柄没初始化、s_addr7 还是 0
+ *   ⇒ 所有寄存器写都会失败。板上实测（2026-10-16）：g_es_wr_ok=0、g_es_wr_ng=12、
+ *     g_es_rd_ng=7、失败环里全是状态 0x02(**HAL_BUSY**)、回读全 0xFFFF，
+ *     表现为"录音起不来（g_rec_rc=-2）、却说不出为什么"。
+ *   ⇒ 谁先用到控制通道，谁就负责把通道建起来。 */
+int es8311_bus_ready(void)
+{
+    if (es8311_bus_init() != 0)
+    {
+        return -1;                      /* 总线本身起不来 */
+    }
+    /* CE 脚焊法未知 ⇒ 两个地址都探一次，探到哪个用哪个（与 audio_out_start 同款）。 */
+    if (es8311_probe(ES8311_I2C_ADDR_CE0) == 0)
+    {
+        es8311_set_addr(ES8311_I2C_ADDR_CE0);
+        return 0;
+    }
+    if (es8311_probe(ES8311_I2C_ADDR_CE1) == 0)
+    {
+        es8311_set_addr(ES8311_I2C_ADDR_CE1);
+        return 0;
+    }
+    return -2;                          /* 总线上没有 ES8311：没接模块或线错了 */
+}
+
+/* ★★ 2026-10-16（补丁18）：**ADC（麦克风）通路** —— 录音链路的第一步。★★
+ *
+ * 【背景】本项目此前只做放音：`dac_path_regs()` 里明确写着
+ *   「DAC 通路开（0x09 bit6=0），ADC 通路关（0x0A bit6=1）」+「0x17=0xBF（ADC 侧，本测试不用）」
+ *   ⇒ 录音要做的第一件事就是把这三处**反过来**。
+ *
+ * 【写哪几笔、为什么】（对照官方 esp_codec_dev 的 `es8311_start`，见 docs/ES8311_LIB_COMPARE.md §2）
+ *   0x00=0x80 / 0x01=0x3F   时钟状态机 + 全部时钟（ADC 没有 ADCCLK 就没有数据）
+ *   读0x0A，**清 bit6**       ADC 数字通路**开**（旧值是 |0x40 = 关）
+ *   读0x09，**置 bit6**       DAC 数字通路**关** —— 录音时不需要放音；而且 I2S2 转收以后
+ *                             STM32 的 SDO（PB15）不再驱动模块 DIN ⇒ 悬空输入；把 DAC 通路
+ *                             关掉才能保证喇叭绝对安静（否则可能听到串进来的噪声）。
+ *   0x32=0x00                DAC 音量归零（双保险，配合上面那条）
+ *   0x17=**0xBF**            ★ ADC 数字音量 = 0 dB。**这一笔最容易漏**：
+ *                             `es8311_dac_become_silent()` 不碰 0x17，但 `es8311_stop_dac()`
+ *                             会把它写成 0x00（"ADC 音量→0"）⇒ 走过一次真·掉电之后再录音
+ *                             就是**一片静音**，而所有回读看起来都正常。
+ *   0x16=mic_gain            模拟 PGA 增益（初值 0x24 与官方一致；可按现场调，见 g_rec_mic_gain）
+ *   0x0E=0x02 / 0x12=0x00    模拟侧 + 上电（0x12 bit1=PDN_DAC 清 0）
+ *   0x14=0x1A，清 bit6        非 DMIC（用模拟麦克风，**不是**数字 MEMS）
+ *   0x0D=0x01                VREF / VMIDSEL 开（ADC 基准）
+ *   0x15=0x40                ADC ramp rate
+ *   0x1B=0x0A / 0x1C=0x6A    ADC ALC/HPF（与 init 同值，幂等）
+ *   0x44=0x58                内部参考 ADCL 开（ADC 侧要用 ADCL）
+ *
+ * 【与放音的互斥】I2S2 同一时刻只能是 TX 或 RX（I2SCFG 是二选一）⇒ 录音与放音**不能同时**。
+ *   本函数只负责 codec 侧；I2S 侧的切换在 audio_out.c 的 audio_out_capture_start()。
+ *
+ * @param mic_gain_reg  REG16 的值（0x00~0x3F 区间常见；默认 0x24）
+ * @return 0 = 全部写成功且回读确认；<0 = 有写失败（看 g_es_fail / g_es_fail_reg） */
+int es8311_adc_start(uint32_t mic_gain_reg)
+{
+    uint8_t v;
+    int     rc = 0;
+
+    g_es_adc_on = 0u;
+
+    /* 0) ★ 先确保控制通道就绪（I2C1 + 从机地址）。录音可能是开机后第一个音频动作，
+     *      那时放音路径还没建过 I2C 总线 —— 若不补这一步，下面每一笔写都会 HAL_BUSY。 */
+    rc = es8311_bus_ready();
+    if (rc != 0)
+    {
+        g_es_rc = rc;
+        return (rc == -2) ? -3 : -4;    /* -3 = 总线上没有 ES8311；-4 = I2C 总线起不来 */
+    }
+
+    /* 1) 芯片时钟：CSM_ON + 从机 + 全时钟（含 CLKADC_ON/ANACLKADC_ON） */
+    rc |= es8311_write_reg(0x00, 0x80);
+    rc |= es8311_write_reg(0x01, 0x3F);
+
+    /* 2) 通路开关：ADC 开、DAC 关（理由见函数头） */
+    if (es8311_read_reg(0x0A, &v) == 0)
+    {
+        rc |= es8311_write_reg(0x0A, (uint8_t)(v & (uint8_t)~0x40u));   /* ADC 通路开 */
+    }
+    if (es8311_read_reg(0x09, &v) == 0)
+    {
+        rc |= es8311_write_reg(0x09, (uint8_t)(v | 0x40u));             /* DAC 通路关 */
+    }
+    rc |= es8311_write_reg(0x32, 0x00u);                                /* DAC 音量 0 */
+    rc |= es8311_write_reg(0x17, 0xBFu);                                /* ★ ADC 音量 0 dB */
+    rc |= es8311_write_reg(0x16, (uint8_t)(mic_gain_reg & 0xFFu));      /* PGA 增益 */
+
+    /* 3) 模拟侧上电（与 dac_path_regs 同序，只是不碰 DAC 音量） */
+    rc |= es8311_write_reg(0x0E, 0x02u);
+    if (es8311_read_reg(0x12, &v) == 0)
+    {
+        rc |= es8311_write_reg(0x12, (uint8_t)(v & (uint8_t)~0x02u));   /* PDN_DAC 清 0 = 上电 */
+    }
+    rc |= es8311_write_reg(0x1B, 0x0Au);
+    rc |= es8311_write_reg(0x1C, 0x6Au);
+    rc |= es8311_write_reg(0x14, 0x1Au);
+    if (es8311_read_reg(0x14, &v) == 0)
+    {
+        rc |= es8311_write_reg(0x14, (uint8_t)(v & (uint8_t)~0x40u));   /* 非 DMIC */
+    }
+    rc |= es8311_write_reg(0x0D, 0x01u);                                /* VREF/VMIDSEL */
+    rc |= es8311_write_reg(0x15, 0x40u);                                /* ADC ramp */
+    rc |= es8311_write_reg(0x44, 0x58u);                                /* 内部参考 ADCL */
+
+    /* 4) 回读确认（把"到底配没配上"变成一个数字，而不是"我写了所以应该行"）*/
+    g_es_adc_mic_gain = mic_gain_reg & 0xFFu;
+    {
+        uint8_t a = 0xFFu, c = 0xFFu, g = 0xFFu;
+
+        g_es_rb_adc0a = (es8311_read_reg(0x0A, &a) == 0) ? a : 0xFFFFu;
+        g_es_rb_adc09 = (es8311_read_reg(0x09, &c) == 0) ? c : 0xFFFFu;
+        g_es_rb_adc17 = (es8311_read_reg(0x17, &g) == 0) ? g : 0xFFFFu;
+        if ((a == 0xFFu) || (c == 0xFFu) || (g == 0xFFu))
+        {
+            rc |= -1;                       /* 没能确认（读失败）*/
+        }
+        else if (((a & 0x40u) != 0u) || ((c & 0x40u) == 0u) || (g == 0x00u))
+        {
+            rc |= -1;                       /* 值不对：ADC 通路没开 / DAC 没关 / ADC 音量为 0 */
+        }
+    }
+    if (rc == 0)
+    {
+        g_es_adc_on = 1u;
+    }
+    g_es_rc = rc;
+    return rc;
+}
+
+/* 录音结束：把 DAC 侧恢复成"静音起播"的干净状态（等价于下一次放音的前置条件）。
+ * 复用 dac_path_regs(0x00)：它会重写 0x09/0x0A/0x17/0x32 等，正好把 ADC 通路再关回去。 */
+int es8311_adc_stop(void)
+{
+    int rc = dac_path_regs(0x00u);
+
+    g_es_adc_on = 0u;
+    g_es_rc = rc;
+    return rc;
+}
+
 /* ★ 2026-10-14（补丁12）：REG31 的**专用数字静音位** —— 官方 esp_codec_dev /
  *   Linux 内核 es8311 驱动用来消上下电爆音的手段（本工程此前从不碰 0x31）。
  *
@@ -1340,6 +1486,18 @@ volatile uint32_t g_es_rb_clk0 = 0xFFFFu;   /* ★ 补丁17 REG00：期望 CSM_O
 volatile uint32_t g_es_rb_clk1 = 0xFFFFu;   /* REG01：期望 0x3F（MCLK/BCLK/ADCCLK/DACCLK 全开）*/
 volatile uint32_t g_es_rb_clk2 = 0xFFFFu;   /* REG02：期望 0x00（本项目 48k 分频/倍频）*/
 volatile uint32_t g_es_rb_clk6 = 0xFFFFu;   /* REG06：期望与起播前一致（bclk_div=4、SCK 不反相）*/
+/* ★★ 补丁18：录音（ADC/麦克风）侧的回读量 —— "麦克风到底通没通"要靠它们说话。★★
+ *   g_es_adc_on     1 = ADC 通路已按录音配置开好（es8311_adc_start 回读确认通过）
+ *   g_es_adc_mic_gain 最近一次写入 REG16 的 PGA 增益值
+ *   g_es_rb_adc0a   REG0A 回读：期望 **bit6 == 0**（ADC 数字通路开）
+ *   g_es_rb_adc09   REG09 回读：期望 **bit6 == 1**（录音时 DAC 通路关，防喇叭出噪声）
+ *   g_es_rb_adc17   REG17 回读：期望 **0xBF**（ADC 数字音量 0 dB；⚠ 被写成 0 就是"一片静音"）
+ *   ⚠ 这三个量是"录音无声"这类故障的第一分诊点：先看通路开没开、音量是不是 0。 */
+volatile uint32_t g_es_adc_on       = 0u;
+volatile uint32_t g_es_adc_mic_gain = 0x24u;
+volatile uint32_t g_es_rb_adc0a     = 0xFFFFu;
+volatile uint32_t g_es_rb_adc09     = 0xFFFFu;
+volatile uint32_t g_es_rb_adc17     = 0xFFFFu;
 
 int es8311_dac_readback(void)
 {

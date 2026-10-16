@@ -443,10 +443,14 @@ static void i2s_gpio_release(void)
     HAL_GPIO_Init(GPIOB, &g);
 }
 
-static int i2s_init(void)
+/* ★ 2026-10-16（补丁18）：同一个 SPI2 需要两套角色 —— 放音=**主发**、录音=**主收**。
+ *   共同部分（标准/数据格式/频率/极性 + I2SDIV/ODD + CFG1.DSIZE + 清挂起标志）抽成本函数，
+ *   保证两侧**逐位一致**：两份参数各自维护、慢慢分叉，就是"放音正常、录音变调/错位"这类
+ *   最难查的故障。⚠ 只有 Mode 由调用方给（TX/RX 唯一不同之处）。 */
+static int i2s_apply(uint32_t mode)
 {
     s_hi2s.Instance              = SPI2;
-    s_hi2s.Init.Mode             = I2S_MODE_MASTER_TX;
+    s_hi2s.Init.Mode             = mode;
     s_hi2s.Init.Standard         = I2S_STANDARD_PHILIPS;
     /* ⚠ 必须是 EXTENDED（16 位数据装 32 位时隙 ⇒ SCK = 64fs），
      *   ES8311 侧 esp-adf 系数表也是 bclk_div=4（64fs）。改成 16B 会错位。 */
@@ -489,9 +493,15 @@ static int i2s_init(void)
     MODIFY_REG(s_hi2s.Instance->CFG1, SPI_CFG1_DSIZE, (15u << SPI_CFG1_DSIZE_Pos));
 
     /* 清全部挂起标志（与 HAL_I2S_Init 的 WRITE_REG(IFCR, 0x0FF8) 同口径），
-     * 免得上一次残留的 UDR/SUSP 把 TXP 压在 0。 */
+     * 免得上一次残留的 UDR/SUSP 把 TXP 压在 0；收方向对应的是 OVR（bit3 也在 0x0FF8 里）。 */
     s_hi2s.Instance->IFCR = 0x0FF8u;
     return 0;
+}
+
+/* 放音用：主发（时钟/格式的全部说明在 i2s_apply 里）。 */
+static int i2s_init(void)
+{
+    return i2s_apply(I2S_MODE_MASTER_TX);
 }
 
 static void i2s_stop(void)
@@ -817,6 +827,319 @@ static void i2s_dma_stop(void)
 void DMA1_Stream4_IRQHandler(void)
 {
     HAL_DMA_IRQHandler(&s_hdma_tx);
+}
+
+/* ====================== 录音采集：I2S2 主收 + DMA1_Stream3（2026-10-16 补丁18）======================
+ *
+ * 【这条链路在整条录音路径里的位置】
+ *   麦克风 → ES8311(模拟 PGA → ADC → 芯片 ASDOUT) → **模块 DOUT 脚**
+ *          → 排针 **P2-9（PC2 = I2S2_SDI，AF5）** → I2S2 主收 → DMA1_Stream3
+ *          → s_cap_buf（环形）→ src/audio_rec.c 取走 → FatFs → WAV
+ *
+ * 【⚠⚠ 硬件前提（接线表里这一行写的是"录音才接"）】
+ *   模块 **DOUT 必须接到排针 P2-9（PC2）**。本工程放音只用模块 DIN（PB15 驱动），
+ *   所以 DOUT 一直是空着的。**没接这根线时**：本模块照常启动、DMA 照常搬数、文件照常生成，
+ *   但采到的只是 PC2 的悬空电平 ⇒ `g_cap_peak_l/r` 极小且 `g_cap_dc_*` 恒定 ——
+ *   这就是"线没接"的判据，不需要靠猜（tools/rec_check.py 会把它当结论打出来）。
+ *
+ * 【为什么必须独占 I2S2】I2SCFG 是"主发/主收"二选一（RM0433 §50.7.6）⇒ **录音与放音不能同时**。
+ *   所以本函数先要求放音停下：放音走的是**异步淡出**，本拍只能"发起停"，就返回 2
+ *   让调用方下一拍再来（见 audio_out_capture_start 的返回值约定）。放音侧下次起播会自动
+ *   调 i2s_init() 把同一个 SPI2 重新配回主发，不需要在这里做恢复动作。
+ *
+ * 【H7 收方向的三个坑（与发方向不同，逐个踩过）】
+ *   ① 使能同样是**两段式**：`__HAL_I2S_ENABLE`(SPE) 只配好外设，**还要置 CR1.CSTART** 才真收。
+ *   ② 收方向没有 UDR，取而代之的是 **OVR（SR bit6，FIFO 溢出）**——溢出后引擎同样停吃 FIFO，
+ *      必须写 **IFCR.OVRC(bit6)** 才恢复。本模块每拍查一次并累加 `g_cap_ovr`（不静默）。
+ *   ③ DMA 请求号与使能位都不同：**SPI2_RX = 39**（发方向 40）、**CFG1.RXDMAEN(bit14)**
+ *      （发方向 TXDMAEN bit15）。写错任一 ⇒ **NDTR 一动不动**（与当年发方向的症状一模一样）。
+ *
+ * 【进度从哪来】不用中断：DMA 配 CIRCULAR 后用 `HAL_DMA_Start()`（非 IT）后台跑，
+ *   位置由 **NDTR** 反推（`环内位置 = 缓冲大小 − NDTR`）并检测环绕。主循环 17 ms 一拍，
+ *   8 KB 缓冲 ≈84 ms ⇒ 5 倍余量；真追不上时 `g_cap_lost` 会涨（不静默丢数）。 */
+#define CAP_DMA_HALFWORDS 8192u    /* 8 KB：立体声 48.828 kHz 下 ≈84 ms 的进度垫子 */
+
+volatile uint32_t g_cap_on     = 0u;   /* 1 = 采集在跑 */
+volatile uint32_t g_cap_tot    = 0u;   /* DMA 已写入的半字数（单调）*/
+volatile uint32_t g_cap_lost   = 0u;   /* 主循环来不及取、被覆盖掉的半字数（0 = 没丢）*/
+volatile uint32_t g_cap_ovr    = 0u;   /* SPI RX FIFO 溢出次数（0 = 没溢出）*/
+volatile uint32_t g_cap_err    = 0u;   /* 启动/搬运错误位图：1=SPI配置 2=DMA_Init 4=DMA_Start 8=采集期DMA没在跑 */
+volatile uint32_t g_cap_jump   = 0u;   /* 被丢弃的"不合理 NDTR 跳变"次数（>0 = 反推不可信，见 cap_poll_hw）*/
+volatile uint32_t g_cap_peak_l = 0u;   /* 最近一个统计窗的 L 声道峰值（0..32767）*/
+volatile uint32_t g_cap_peak_r = 0u;   /* 同上，R 声道 */
+volatile int32_t  g_cap_dc_l   = 0;    /* L 声道直流偏置估计（#0     */
+volatile int32_t  g_cap_dc_r   = 0;    /* R 声道直流偏置估计（两者都有一个小而稳的值 = 有模拟源）*/
+volatile uint32_t g_cap_nz     = 0u;   /* 非零样本千分比（0 = 整段全 0）*/
+volatile uint32_t g_cap_hist[8];       /* |样本| 的 8 级直方图（看"像不像真的模拟信号"）*/
+volatile uint32_t g_cap_dbg[8];        /* 同一时刻现场：NDTR/CR/SR/CFG1/I2SCFGR/CR1/tot/lost */
+
+static uint16_t AUDIO_BUF_ATTR s_cap_buf[CAP_DMA_HALFWORDS];
+static DMA_HandleTypeDef s_hdma_rx;
+static uint32_t s_cap_ndtr_prev = CAP_DMA_HALFWORDS;  /* 上次 NDTR；初值=满 表示"环内位置 0" */
+static uint32_t s_cap_rd        = 0u;                 /* 读游标（单调半字数）*/
+static uint32_t s_cap_tot       = 0u;                 /* 写游标（单调半字数）*/
+static uint8_t  s_cap_ready     = 0u;
+
+static void cap_dbg_snapshot(void);   /* 前置声明：avail() 里要调它刷新寄存器现场 */
+
+/* 主循环每拍调一次：把 NDTR 反推出来的写入量累进单调计数，并清 OVR。
+ *
+ * ⚠⚠ 2026-10-16 实测教训（**这里曾经是个假数据源**）：NDTR 反推法在"DMA 被停/被重新
+ *   配置"时会看到**任意跳变**。原来的写法只要 adv≠0 就累加 ⇒ DMA 已经停住、NDTR 恒定不动，
+ *   而 `_s_cap_ndtr_prev` 因为某种重置被当成了 0 ⇒ 一次就凭空记进 8160 个半字；
+ *   实测 `g_cap_tot` 以 80 754 半字/秒增长（约 40 k 帧/秒），文件被写出 33.8 MB 的零数据。
+ *   ⇒ 现在两道闸：① 只有 `DMA_SxCR.EN==1` 才认推进；② 单次推进不得超过半个缓冲。
+ *   两道闸都不通过时把跳变**丢弃并计数**（`g_cap_jump`），既不造数也不静默。 */
+static void cap_poll_hw(void)
+{
+    uint32_t ndtr = DMA1_Stream3->NDTR;
+
+    if ((DMA1_Stream3->CR & DMA_SxCR_EN) != 0u)          /* ① 通道真在跑 */
+    {
+        uint32_t written = CAP_DMA_HALFWORDS - ndtr;     /* 环内位置 0..N-1 */
+        uint32_t prev    = CAP_DMA_HALFWORDS - s_cap_ndtr_prev;
+        uint32_t adv     = (written >= prev) ? (written - prev)
+                                             : (CAP_DMA_HALFWORDS - prev + written);
+
+        if (adv > (CAP_DMA_HALFWORDS / 2u))               /* ② 单次推进的合理性上限 */
+        {
+            g_cap_jump++;                                 /* 记一笔：不是正常推进 */
+            adv = 0u;
+        }
+        s_cap_tot += adv;
+    }
+    else
+    {
+        g_cap_err |= 8u;                                  /* bit3：采集期发现 DMA 没在跑 */
+    }
+    s_cap_ndtr_prev = ndtr;   /* ★ 无论哪种情况都更新基线，免得停住期间的跳变被记账 */
+
+    /* OVR：FIFO 溢出会让引擎停吃 FIFO ⇒ 必须清，否则后面全丢（发方向的 UDR 同款坑）。*/
+    if ((SPI2->SR & SPI_SR_OVR) != 0u)
+    {
+        SPI2->IFCR = SPI_IFCR_OVRC;
+        g_cap_ovr++;
+    }
+}
+
+uint32_t audio_out_capture_avail(void)
+{
+    if (s_cap_ready == 0u)
+    {
+        return 0u;
+    }
+    cap_poll_hw();
+    cap_dbg_snapshot();              /* 采集期每拍刷新寄存器现场（主机读不到外设寄存器）*/
+
+    /* 环被写满一圈还没被取走 ⇒ 最旧的数据已被覆盖。把读游标推到"最旧可用"处并计数，
+     * 而不是假装没发生（本项目铁律：宁可看见丢数，也不要看不见的坏状态）。 */
+    if ((s_cap_tot - s_cap_rd) > CAP_DMA_HALFWORDS)
+    {
+        uint32_t lost = (s_cap_tot - s_cap_rd) - CAP_DMA_HALFWORDS;
+
+        s_cap_rd  += lost;
+        g_cap_lost += lost;
+    }
+    g_cap_tot = s_cap_tot;
+    return s_cap_tot - s_cap_rd;
+}
+
+/* 取走已采集的数据，并顺手算"到底像不像有信号"的统计量：
+ *   峰值（每声道）、直流均值、非零千分比、|样本| 8 级直方图。
+ *   为什么要它：DOUT 没接线时数据不是"0"，而是"悬空电平被采成的近似常数"——
+ *   只有峰值/直流/直方图三者一起看才能把"线没接"与"接了但安静"区分开。 */
+uint32_t audio_out_capture_read(int16_t *dst, uint32_t halfwords)
+{
+    uint32_t n, i;
+    uint32_t pk_l = 0u, pk_r = 0u, nz = 0u, cnt = 0u;
+    int64_t  sum_l = 0, sum_r = 0;
+    uint32_t hist[8] = {0};
+
+    if ((s_cap_ready == 0u) || (dst == NULL))
+    {
+        return 0u;
+    }
+    n = audio_out_capture_avail();
+    if (halfwords < n) { n = halfwords; }
+    if (n == 0u)       { return 0u; }
+
+    for (i = 0u; i < n; ++i)
+    {
+        int16_t  s = (int16_t)s_cap_buf[(s_cap_rd + i) & (CAP_DMA_HALFWORDS - 1u)];
+        uint32_t a = (uint32_t)((s < 0) ? -(int32_t)s : (int32_t)s);
+        uint32_t b;
+
+        if (a == 0u)            { b = 0u; }
+        else if (a < 16u)       { b = 1u; }
+        else if (a < 128u)      { b = 2u; }
+        else if (a < 1024u)     { b = 3u; }
+        else if (a < 4096u)     { b = 4u; }
+        else if (a < 8192u)     { b = 5u; }
+        else if (a < 16384u)    { b = 6u; }
+        else                    { b = 7u; }
+        hist[b]++;
+        if (a != 0u) { nz++; }
+
+        if ((i & 1u) == 0u)
+        {
+            dst[i] = s;
+            sum_l += s;
+            if (a > pk_l) { pk_l = a; }
+        }
+        else
+        {
+            dst[i] = s;
+            sum_r += s;
+            if (a > pk_r) { pk_r = a; }
+        }
+        cnt++;
+    }
+    s_cap_rd += n;
+
+    if (cnt != 0u)
+    {
+        uint32_t cn = (cnt + 1u) / 2u;                 /* 每声道的样本数 */
+
+        g_cap_peak_l = pk_l;
+        g_cap_peak_r = pk_r;
+        g_cap_dc_l   = (int32_t)(sum_l / (int64_t)(cn ? cn : 1u));
+        g_cap_dc_r   = (int32_t)(sum_r / (int64_t)(cn ? cn : 1u));
+        g_cap_nz     = (uint32_t)((nz * 1000u) / cnt);
+        for (i = 0u; i < 8u; ++i) { g_cap_hist[i] = hist[i]; }
+    }
+    return n;
+}
+
+int audio_out_capture_start(void)
+{
+    if (s_cap_ready != 0u)
+    {
+        return 0;                       /* 已在采集：幂等 */
+    }
+    if (g_ao_playing != 0u)
+    {
+        /* 放音还没停完（停是异步淡出）。发起一次"停"并让调用方下一拍再来 ——
+         * 不在这里忙等，免得把主循环单拍拖长（本项目对单拍的判据是 ≤60 ms）。*/
+        audio_out_stop();
+        return 2;                       /* 2 = 稍后重试（约定见 audio_out.h）*/
+    }
+    if ((s_dma_ready != 0u) || (s_tim_pending != 0u))
+    {
+        return 2;                       /* 发方向的 DMA/心跳还占着 SPI2 */
+    }
+
+    i2s_gpio_init();                    /* 同一组脚；其中 PC2 = I2S2_SDI 本来就是给录音留的 */
+    if (i2s_apply(I2S_MODE_MASTER_RX) != 0)
+    {
+        g_cap_err |= 1u;
+        return -1;
+    }
+
+    __HAL_RCC_DMA1_CLK_ENABLE();
+    s_hdma_rx.Instance                 = DMA1_Stream3;
+    s_hdma_rx.Init.Request             = DMA_REQUEST_SPI2_RX;       /* ★ 39（发方向是 40）*/
+    s_hdma_rx.Init.Direction           = DMA_PERIPH_TO_MEMORY;
+    s_hdma_rx.Init.PeriphInc           = DMA_PINC_DISABLE;
+    s_hdma_rx.Init.MemInc              = DMA_MINC_ENABLE;
+    s_hdma_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;
+    s_hdma_rx.Init.MemDataAlignment    = DMA_MDATAALIGN_HALFWORD;
+    s_hdma_rx.Init.Mode                = DMA_CIRCULAR;
+    s_hdma_rx.Init.Priority            = DMA_PRIORITY_VERY_HIGH;    /* 录音不许丢样本 */
+    s_hdma_rx.Init.FIFOMode            = DMA_FIFOMODE_DISABLE;
+    s_hdma_rx.Init.FIFOThreshold       = DMA_FIFO_THRESHOLD_FULL;
+    s_hdma_rx.Init.MemBurst            = DMA_MBURST_SINGLE;
+    s_hdma_rx.Init.PeriphBurst         = DMA_PBURST_SINGLE;
+    if (HAL_DMA_Init(&s_hdma_rx) != HAL_OK)
+    {
+        g_cap_err |= 2u;
+        return -1;
+    }
+
+    /* **非 IT** 启动：收方向靠 NDTR 轮询就够，少一个 ISR、少一处竞态。*/
+    if (HAL_DMA_Start(&s_hdma_rx, (uint32_t)(uintptr_t)&SPI2->RXDR,
+                      (uint32_t)(uintptr_t)s_cap_buf, CAP_DMA_HALFWORDS) != HAL_OK)
+    {
+        g_cap_err |= 4u;
+        return -1;
+    }
+
+    /* 清挂起标志，并**排空 RX FIFO** 里可能残留的旧数据 ——
+     * 否则文件最前面几帧是上一段的尾巴（"开头有个怪响"的一种来源）。*/
+    SPI2->IFCR = 0x0FF8u;
+    for (uint32_t i = 0u; i < 64u; ++i)
+    {
+        if ((SPI2->SR & SPI_SR_RXP) == 0u) { break; }
+        (void)SPI2->RXDR;
+    }
+
+    SET_BIT(SPI2->CFG1, SPI_CFG1_RXDMAEN);                        /* ★ 不置它 DMA 不会被叫 */
+    MODIFY_REG(SPI2->CFG1, SPI_CFG1_FTHLV, (7u << SPI_CFG1_FTHLV_Pos));
+
+    s_cap_tot       = 0u;
+    s_cap_rd        = 0u;
+    s_cap_ndtr_prev = CAP_DMA_HALFWORDS;
+    g_cap_tot       = 0u;
+    g_cap_lost      = 0u;
+    g_cap_ovr       = 0u;
+    g_cap_err       = 0u;
+    g_cap_peak_l    = 0u;
+    g_cap_peak_r    = 0u;
+    g_cap_dc_l      = 0;
+    g_cap_dc_r      = 0;
+    g_cap_nz        = 0u;
+    for (uint32_t i = 0u; i < 8u; ++i) { g_cap_hist[i] = 0u; }
+
+    __HAL_I2S_ENABLE(&s_hi2s);
+    SET_BIT(s_hi2s.Instance->CR1, SPI_CR1_CSTART);                /* ★ 两段式：还要 CSTART */
+
+    s_cap_ready = 1u;
+    g_cap_on    = 1u;
+    return 0;
+}
+
+void audio_out_capture_stop(void)
+{
+    if (s_cap_ready == 0u)
+    {
+        return;
+    }
+    /* 关闭顺序与发方向一致：先摘请求源，再让传输自然收尾（CSUSP），最后拆 DMA。 */
+    CLEAR_BIT(SPI2->CFG1, SPI_CFG1_RXDMAEN);
+    if (READ_BIT(s_hi2s.Instance->CR1, SPI_CR1_CSTART) != 0UL)
+    {
+        uint32_t t0 = HAL_GetTick();
+
+        SET_BIT(s_hi2s.Instance->CR1, SPI_CR1_CSUSP);
+        while (READ_BIT(s_hi2s.Instance->CR1, SPI_CR1_CSTART) != 0UL)
+        {
+            if (HAL_GetTick() - t0 > 100u) { g_ao_csusp_tmo++; break; }
+        }
+    }
+    __HAL_I2S_DISABLE(&s_hi2s);
+    (void)HAL_DMA_Abort(&s_hdma_rx);
+    HAL_DMA_DeInit(&s_hdma_rx);
+
+    /* 把 CFG1 还原成"发方向"的样子（FTHLV 复位值 + RXDMAEN 已清）：
+     * 放音下一次起播本来就会走 i2s_init() 重配，这里显式还原是为了"离开采集态就干净"。 */
+    MODIFY_REG(SPI2->CFG1, SPI_CFG1_FTHLV, 0u);
+    SPI2->IFCR = 0x0FF8u;
+    i2s_gpio_release();                 /* PB9 还给 UART4 */
+
+    s_cap_ready = 0u;
+    g_cap_on    = 0u;
+}
+
+/* 采集侧的寄存器现场（主机读不到外设寄存器，必须拷进 RAM）。 */
+static void cap_dbg_snapshot(void)
+{
+    g_cap_dbg[0] = DMA1_Stream3->NDTR;
+    g_cap_dbg[1] = DMA1_Stream3->CR;
+    g_cap_dbg[2] = SPI2->SR;
+    g_cap_dbg[3] = SPI2->CFG1;
+    g_cap_dbg[4] = SPI2->I2SCFGR;
+    g_cap_dbg[5] = SPI2->CR1;
+    g_cap_dbg[6] = s_cap_tot;
+    g_cap_dbg[7] = g_cap_lost;
 }
 
 /* ⚠ 这个 handler 定义在**本文件**而不是 stm32h7xx_it.c：让模块自带 handler，

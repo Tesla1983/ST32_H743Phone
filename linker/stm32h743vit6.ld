@@ -138,6 +138,26 @@ SECTIONS
     _edma_bss = .;
   } > SRAM1
 
+  /* ---- 录音等"大的 CPU 专用"缓冲（2026-10-16 补丁18）----
+   * 【为什么必须单独一段】DTCM 的 .bss 与 **heap0 抢同一块内存**：
+   *   `_heap0_start = _sbrk_end`（= DTCM .bss 之后）、`_heap0_end = _estack − 32 KB`。
+   *   2026-10-16 实测教训：把录音的 8 KB 暂存放进 DTCM，heap0 从 ~35.6 KB 掉到 26.6 KB，
+   *   而 YMGUI 建整个界面需要 >26.6 KB ⇒ `g_h0` 记到 `used == peak == total`、free_head=NULL，
+   *   `build_ui()` 拿到 NULL 后写穿 ⇒ **CFSR=0x400（IMPRECISE bus error）/HFSR=0x40000000（FORCED）**，
+   *   表现为"开机就 HardFault、g_shell_rc 停在初值 99"。⇒ 大缓冲一律走本段。
+   * 放 **SRAM2**（与 .bss_ime 同区：CPU 可访问、DMA1/2 也可访问，且不占 heap1/DTCM）。
+   * 源码侧用 REC_BUF_ATTR（section(".bss_sram2")）。本段 NOLOAD ⇒ 需在 board_startup.c 里清零
+   * （⚠ 位置陷阱同 .bss_ime/.bss_dma：必须在 `.bss` 输出段**之前**，否则被 *(.bss*) 吃掉）。 */
+  .bss_sram2 (NOLOAD) :
+  {
+    . = ALIGN(8);
+    _ssram2_bss = .;
+    *(.bss_sram2)
+    *(.bss_sram2.*)
+    . = ALIGN(8);
+    _esram2_bss = .;
+  } > SRAM2
+
   /* ---- QSPI 灌库暂存区（2026-10-07，方案 B 配套）----
    * 词组词典 1.27 MB 装不进内部 flash，只能由 host 经 SWD **分块**送进来
    * （见 src/qspi_provision.h 的长注释）。暂存区 16 KB。

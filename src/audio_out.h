@@ -178,4 +178,43 @@ extern volatile uint32_t g_ao_resume_calls; /* 起播/续播动作真正执行�
  *   `(s_wr - s_rd) & RING_MASK` 占用式在"环满"时读成 0（与"环空"同形），
  *   DMA 路径下会越界补数、覆盖未读数据（实测音源被多吃 1.62 倍）。 */
 
+/* ====================== 录音采集（I2S2 主收 + DMA1_Stream3）—— 2026-10-16 补丁18 ======================
+ *
+ * 【为什么放在 audio_out 里】I2S2 这一个外设同时承载"放音（主发）"与"录音（主收）"，
+ *   I2SCFG 二选一 ⇒ 必须由同一个模块独占管理（GPIO/DMA/寄存器现场都在这里）。
+ *   录音链路的**文件与状态机**在 src/audio_rec.c，它通过下面这三个函数取数据。
+ *
+ * ⚠⚠ 硬件前提：ES8311 模块的 **DOUT 必须接到排针 P2-9（PC2 = I2S2_SDI）**。
+ *   没接时链路照常"跑通"，但采到的是悬空电平 ⇒ 看 g_cap_peak_* / g_cap_dc_* 即可判定
+ *   （tools/rec_check.py 会把结论直接打出来）。 */
+#define AUDIO_CAP_AGAIN  2      /* audio_out_capture_start 的返回值：放音还在淡出，下一拍重试 */
+
+extern volatile uint32_t g_cap_on;     /* 1 = 采集在跑 */
+extern volatile uint32_t g_cap_tot;    /* DMA 已写入的半字数（单调）*/
+extern volatile uint32_t g_cap_lost;   /* 主循环来不及取而被覆盖的半字数（0 = 没丢）*/
+extern volatile uint32_t g_cap_ovr;    /* SPI RX FIFO 溢出次数（0 = 没溢出）*/
+extern volatile uint32_t g_cap_err;    /* 启动/搬运错误位图（1=SPI配置 2=DMA_Init 4=DMA_Start 8=采集期DMA没在跑）*/
+extern volatile uint32_t g_cap_jump;   /* 被丢弃的"不合理 NDTR 跳变"次数（>0 = 反推不可信）*/
+extern volatile uint32_t g_cap_peak_l; /* 最近统计窗内 L 声道峰值（0..32767）*/
+extern volatile uint32_t g_cap_peak_r; /* 同上，R 声道 */
+extern volatile int32_t  g_cap_dc_l;   /* L 声道直流偏置估计 */
+extern volatile int32_t  g_cap_dc_r;   /* R 声道直流偏置估计 */
+extern volatile uint32_t g_cap_nz;     /* 非零样本千分比 */
+extern volatile uint32_t g_cap_hist[8];/* |样本| 8 级直方图 */
+extern volatile uint32_t g_cap_dbg[8]; /* NDTR/CR/SR/CFG1/I2SCFGR/CR1/tot/lost */
+
+/**
+ * @brief  启动采集（把 I2S2 从主发切成主收并起 DMA）
+ * @return 0 = 已开始；AUDIO_CAP_AGAIN(2) = 放音还在淡出/发方向还占着 SPI2 ⇒ **下一拍再调**；
+ *         <0 = 失败（看 g_cap_err）
+ * @note   与放音互斥；结束务必调 audio_out_capture_stop()，否则 SPI2 留在收方向。
+ */
+int      audio_out_capture_start(void);
+/** @brief 可取的半字数（内部会清 OVR、检测环绕；返回 0 = 暂无新数据）*/
+uint32_t audio_out_capture_avail(void);
+/** @brief 取走最多 halfwords 个半字（L/R 交错）并更新峰值/直流/非零率/直方图；返回实取个数 */
+uint32_t audio_out_capture_read(int16_t *dst, uint32_t halfwords);
+/** @brief 停止采集并把 SPI2 / GPIO 恢复成"可以放音"的干净状态 */
+void     audio_out_capture_stop(void);
+
 #endif /* AUDIO_OUT_H */
