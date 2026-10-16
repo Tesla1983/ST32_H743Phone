@@ -19,6 +19,7 @@
 #include "audio_out.h"
 #include "es8311.h"
 #include "fatfs_port.h"
+#include "wav_play.h"      /* 试听：复用现成的 WAV 播放链路（wav_play_start/stop/busy）*/
 
 #include "ff.h"
 #include "stm32h7xx_hal.h"
@@ -57,6 +58,14 @@ volatile uint32_t g_rec_hdr[11];
 volatile uint32_t g_rec_hdr_ok  = 0u;          /* 1 = 头自检通过 */
 volatile uint32_t g_rec_fsize   = 0u;          /* 卡上文件的真实字节数（f_size）*/
 volatile uint32_t g_rec_hdr_bad = 0u;          /* 自检失败时：哪一项不符（位图，便于定位）*/
+/* ★ 补丁18b：**试听**（把刚录的那段用同一块板、同一只喇叭放出来）。
+ *   为什么要它：主机读不到 TF 卡，而"录到的到底是不是声音、有多大、有没有爆音"
+ *   只能靠**耳朵**在这块板上判 —— 拔卡拷到电脑再听是最慢的一条路。
+ *   实现上不做新播放器：直接复用 wav_play（它本来就吃任意路径的 16 bit PCM WAV），
+ *   所以播放行为（音量 ramp、起播安全栅、DMA/TIM6 路径）与音乐 App 完全一致。 */
+volatile uint32_t g_rec_play_req = 0u;         /* 排障钩子：1=试听最新录音 2=停（主循环消费一次）*/
+volatile int32_t  g_rec_play_rc  = 0;          /* 最近一次试听的返回码（取 wav_play_start 的口径）*/
+volatile uint32_t g_rec_play_n   = 0u;         /* 试听成功起播的次数（单调）*/
 
 /* ---- 内部状态 ---- */
 /* ★★ 这个段属性是**必须的**，不是优化（2026-10-16 踩过并记档）：
@@ -406,6 +415,69 @@ void audio_rec_stop(void)
     }
 }
 
+/* ★ 补丁18b：试听 —— 把**最近录的那一段**从 TF 卡放出来。
+ *
+ * 【为什么"最近一段"是目录里编号最大的】文件名是 `REC_%04u.WAV`，编号单调递增 ⇒
+ *   编号最大 == 最后录的。用扫描（而不是记在 RAM 里的名字）的好处是**复位后也成立**，
+ *   而复位是排查时的常态。
+ *
+ * 【与录音互斥】I2S2 的 I2SCFG 是主发/主收二选一，所以：
+ *   · 正在录音 ⇒ 先走完整的 audio_rec_stop()（含回填 WAV 头），否则文件会缺尾巴；
+ *   · 放音起不来（<0）时**不改动任何录音状态**，如实把码返回给 UI。
+ *
+ * 【返回值】就是 wav_play_start() 的码（见 wav_play.h：-1 空路径 / -2 卡没挂载 /
+ *   -3 打不开 / -11..-20 WAV 头解析失败 / -21 定位 data 失败 / -22 音频输出起不来）；
+ *   另加 -1 = 目录里没有录音且本会话也没录过。同时写进 g_rec_play_rc。 */
+int audio_rec_play_last(void)
+{
+    char     path[48];
+    uint32_t idx;
+    int      rc;
+
+    /* ① 先收尾（若在录）：这一步会把 WAV 头回填好，之后放的才是完整文件 */
+    if (g_rec_state != 0u)
+    {
+        audio_rec_stop();
+    }
+
+    /* ② 选目标文件 */
+    idx = rec_scan_max_index();                    /* 顺带刷新 g_rec_files */
+    if (idx != 0u)
+    {
+        (void)snprintf(path, sizeof(path), "%s/REC_%04u.WAV", REC_DIR, (unsigned)idx);
+    }
+    else if (s_path[0] != 0)                       /* 目录空了但本会话录过：试那条 */
+    {
+        (void)snprintf(path, sizeof(path), "%s", s_path);
+    }
+    else
+    {
+        g_rec_play_rc = -1;                        /* 没有可试听的文件 */
+        return -1;
+    }
+
+    /* ③ 交给现成的播放链路（内部会 audio_out_start：起播安全栅 / 音量 ramp 全都有） */
+    rc = wav_play_start(path);
+    g_rec_play_rc = rc;
+    if (rc == 0)
+    {
+        g_rec_play_n++;
+    }
+    return rc;
+}
+
+/* 停止试听（等于停掉共享播放器；不影响已落地的文件）。 */
+void audio_rec_play_stop(void)
+{
+    wav_play_stop();
+}
+
+/* 1 = 正在试听出声（暂停/停止都算 0 —— 与 wav_play_busy 同口径）。 */
+int audio_rec_playing(void)
+{
+    return wav_play_busy();
+}
+
 int audio_rec_poll(void)
 {
     g_rec_poll++;
@@ -418,6 +490,17 @@ int audio_rec_poll(void)
         g_rec_test = 0u;
         if (t == 1u)      { (void)audio_rec_start(); }
         else if (t == 2u) { audio_rec_stop(); }
+    }
+
+    /* 排障钩子（补丁18b）：SWD 写 g_rec_play_req=1/2 就能放/停"最近一段录音"。
+     * 用途：让"录到的到底有没有声音"当场用耳朵判，不必拔卡。 */
+    if (g_rec_play_req != 0u)
+    {
+        uint32_t t = g_rec_play_req;
+
+        g_rec_play_req = 0u;
+        if (t == 1u)      { (void)audio_rec_play_last(); }
+        else if (t == 2u) { audio_rec_play_stop(); }
     }
 
     if (g_rec_state != 1u)
@@ -451,6 +534,12 @@ int BoardRec_Active(void)       { return (g_rec_state == 1u) ? 1 : 0; }
 int BoardRec_Pending(void)      { return (g_rec_pending != 0u) ? 1 : 0; }
 uint32_t BoardRec_Bytes(void)   { return g_rec_bytes; }
 int BoardRec_LastRc(void)       { return (int)g_rec_rc; }
+/* ---- 补丁18b：试听（把最近一段录音放出来听）---- */
+int BoardRec_PlayLast(void)     { return audio_rec_play_last(); }
+void BoardRec_StopPlay(void)    { audio_rec_play_stop(); }
+int BoardRec_Playing(void)      { return audio_rec_playing(); }
+int BoardRec_PlayRc(void)       { return (int)g_rec_play_rc; }
+int BoardRec_PlayName(char* out, int n) { return wav_play_current_name(out, n); }
 
 uint32_t BoardRec_ElapsedMs(void)
 {

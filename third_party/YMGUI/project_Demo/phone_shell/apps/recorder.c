@@ -22,14 +22,24 @@
  *
  * 【与音乐播放互斥】I2S2 同一时刻只能主发或主收（I2SCFG 二选一）⇒ 录音前必须停音乐。
  *   BoardRec_Start() 会自己发起"停音乐"，并从**下一拍**才真正开始录；这期间返回 2，
- *   本 app 把它显示成"准备中…"并**每拍重试**（不阻塞主循环，也就不会卡界面）。 */
+ *   本 app 把它显示成"准备中…"并**每拍重试**（不阻塞主循环，也就不会卡界面）。
+ *
+ * 【试听（2026-10-16 补丁18b）】录完不必拔卡拷到电脑：右下的"试听"按钮把**最近一段**
+ *   录音（/YMGUI/RECORD 里编号最大的 REC_xxxx.WAV）用同一块板、同一只喇叭放出来。
+ *   它**复用音乐播放链路**（wav_play）⇒ 起播安全栅 / 音量 ramp / DMA 路径与音乐 App
+ *   完全一致，所以"试听有没有爆音"等价于"播放有没有爆音"，不是另一条待验证的路径。
+ *   录音中点"试听"会先让引擎**正常收尾**（回填 WAV 头）再放，不会留下半个文件。
+ *   ⚠ 退出 app 只停**本 app 发起**的那次试听，不碰音乐 App 正在放的歌。 */
 
 typedef struct
 {
 	GYOBJ record_time, record_button, record_status, record_meter;
+	GYOBJ play_button;      /* ★ 补丁18b：试听最近一段录音 */
 	int   pending;          /* 1 = 正在等放音停完，还在重试 BoardRec_Start() */
 	int   active;           /* 1 = 正在录音 */
+	int   playing;          /* 1 = 本 app 发起的试听正在出声（由 BoardRec_Playing() 收尾）*/
 	int   last_rc;          /* 最近一次动作码（<0 = 失败阶段）*/
+	int   play_rc;          /* 最近一次试听的返回码 */
 	int   elapsed_ms;       /* 已录毫秒（来自引擎，按帧数折算）*/
 	int   level;            /* 当前电平 0..100（来自引擎的采样峰值）*/
 	int   meter;            /* 电平条的显示值（做了下落平滑）*/
@@ -45,6 +55,7 @@ static void app_tick(uint32 elapsed);
 static void app_close(void);
 static int app_query(const char* name);
 static void record_toggle(GYOBJ obj);
+static void play_toggle(GYOBJ obj);
 
 /* 把状态行刷成"可直接画的一句中文"。用**静态字面量分支**而不是拼缓冲：
  * 本工程的 UI 文案要能被 phone_lang.c 的翻译表按字符串匹配到（中/英）。 */
@@ -55,6 +66,17 @@ static void show_status(const char* s)
 
 static void app_tick(uint32 elapsed)
 {
+	/* ---- 试听收尾：**由引擎状态判定**，不是 app 自己计时 ----
+	 * 文件放完了 wav_play_busy() 会自己变 0；app 只是跟着把按钮复位。
+	 * ⚠ 只做"1 → 0"的复位，不主动把 playing 置 1（否则音乐 App 在播时
+	 *   进本 app 会误显示成"我在试听"）。 */
+	if (state.playing && !BoardRec_Playing())
+	{
+		state.playing = 0;
+		PhoneUI_button_set(state.play_button, "试听");
+		show_status("试听结束 · 可再录一段或再试听");
+	}
+
 	/* ---- 准备中：等放音淡出结束，每拍重试（不阻塞）---- */
 	if (state.pending)
 	{
@@ -133,6 +155,12 @@ static void app_close(void)
 		(void)BoardRec_Name();
 		snprintf(state.last_name, sizeof(state.last_name), "%s", BoardRec_Name());
 		state.last_bytes = (int)BoardRec_Bytes();
+	}
+	/* 试听也要收（只停**本 app 发起**的那次，别把音乐 App 正在放的歌停掉）*/
+	if (state.playing)
+	{
+		BoardRec_StopPlay();
+		state.playing = 0;
 	}
 }
 
@@ -213,6 +241,61 @@ static void record_toggle(GYOBJ obj)
 	}
 }
 
+/* ★ 补丁18b：试听 —— 把**最近一段**录音（/YMGUI/RECORD 里编号最大的那条）放出来听。
+ * 这样"录到的到底是不是声音、有多大、有没有爆音"当场就能用耳朵判，不必拔卡拷到电脑。
+ * 复用音乐播放链路 ⇒ 起播安全栅 / 音量 ramp / DMA 路径与音乐 App 完全一致。 */
+static void play_toggle(GYOBJ obj)
+{
+	(void)obj;
+
+	/* ---- 正在试听 ⇒ 停 ---- */
+	if (state.playing || BoardRec_Playing())
+	{
+		BoardRec_StopPlay();
+		state.playing = 0;
+		PhoneUI_button_set(state.play_button, "试听");
+		show_status("已停止试听");
+		return;
+	}
+
+	/* ---- 录音中让路：引擎会先把录音**正常收尾**（回填 WAV 头）再放 ---- */
+	if (state.active || state.pending)
+	{
+		state.active = 0;
+		state.pending = 0;
+		PhoneUI_button_set(state.record_button, "开始录音");
+		state.meter = 0;
+		YMGUI_Bar_SetValue(state.record_meter, 0);
+		++state.recording_count;
+	}
+
+	{
+		int rc = BoardRec_PlayLast();
+		state.play_rc = rc;
+
+		if (rc == 0)
+		{
+			char name[24];
+			char text[96];
+			name[0] = 0;
+			(void)BoardRec_PlayName(name, (int)sizeof(name));
+			snprintf(text, sizeof(text), "正在试听 %s",
+			         (name[0] != 0) ? name : "最近一段录音");
+			show_status(text);
+			state.playing = 1;
+			PhoneUI_button_set(state.play_button, "停止试听");
+		}
+		else
+		{
+			state.playing = 0;
+			PhoneUI_button_set(state.play_button, "试听");
+			/* 失败要**分清**：没录过 vs 录了但放不出来 —— 两者的下一步完全不同 */
+			show_status((rc == -1) ? "还没有录音可试听 · 先录一段"
+			                       : "试听失败 · 检查 TF 卡与音频输出");
+		}
+	}
+}
+
 static void app_create(GYOBJ view)
 {
 	state = (AppState){0};
@@ -225,13 +308,18 @@ static void app_create(GYOBJ view)
 	YMGUI_Bar_SetRange(state.record_meter, 0, 100);
 	YMGUI_Bar_SetColors(state.record_meter, RGB(230, 219, 222), PhoneApps_Get(RECORDER)->color);
 	state.record_status = PhoneUI_label_ex(view, 12, 286, 296, "点击开始录音", MUTED, 2);
-	state.record_button = PhoneUI_button(view, 24, 351, 272, 43, "开始录音", record_toggle, PhoneApps_Get(RECORDER)->color);
+	/* 两个并排按钮：左 = 录音，右 = 试听（把最近一段放出来听，见 play_toggle）。
+	 * 右侧用 ACCENT 色与录音键区分开。 */
+	state.record_button = PhoneUI_button(view, 16, 351, 140, 43, "开始录音", record_toggle, PhoneApps_Get(RECORDER)->color);
+	state.play_button   = PhoneUI_button(view, 164, 351, 140, 43, "试听", play_toggle, ACCENT);
 }
 
 static void app_destroy(void)
 {
 	if (state.active || state.pending)
 		(void)BoardRec_Stop();
+	if (state.playing)
+		BoardRec_StopPlay();
 	memset(&state, 0, sizeof(state));
 }
 static intptr_t app_inspect(const char* name, int index)
@@ -266,6 +354,13 @@ static intptr_t app_inspect(const char* name, int index)
 	/* 引擎侧的权威状态（与 app 自己的状态可能不同步时，以这两个为准）*/
 	if (!strcmp(name, "rec_active_hw"))
 		return (intptr_t)BoardRec_Active();
+	/* 试听（补丁18b）：这两个也是**引擎**的事实，不是 app 的记忆 */
+	if (!strcmp(name, "rec_playing"))
+		return (intptr_t)BoardRec_Playing();
+	if (!strcmp(name, "rec_play_rc"))
+		return (intptr_t)state.play_rc;
+	if (!strcmp(name, "rec_play_hwrc"))
+		return (intptr_t)BoardRec_PlayRc();
 	return 0;
 }
 

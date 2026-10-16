@@ -1857,5 +1857,23 @@
 #   做"线活动度"采样，用它区分"线没通"与"有麦克风但无声"）。
 # FLASH 1 673 068 B（79.78%）；SRAM1 77.12% / SRAM2 54.06%；DTCM 46 500 B。
 # ===========================================================================================
-df501095264133a4608d6bcbc75cf1e672cbaa2aef151032a22abe88dde88caa  ymgui-h743.bin
-134889f6958c0b1c8f43e64b15bee06f4960f9f4c17ec10c0d2dc42d4036013a  ymgui-h743.elf
+# 【已被补丁18b 取代】df501095264133a4608d6bcbc75cf1e672cbaa2aef151032a22abe88dde88caa  ymgui-h743.bin
+# 【已被补丁18b 取代】134889f6958c0b1c8f43e64b15bee06f4960f9f4c17ec10c0d2dc42d4036013a  ymgui-h743.elf
+# ===========================================================================================
+# 补丁18b（2026-10-16）：录音**试听** —— 录完不必拔卡拷到电脑听
+#   · 复用音乐播放链路（wav_play_start 本就吃任意路径的 16 bit PCM WAV）⇒ 起播安全栅 /
+#     音量 ramp / DMA 路径与音乐 App 完全一致，"试听有没有爆音" ⇔ "播放有没有爆音"。
+#   · App：录音机右下新增"试听"按钮（左键收窄为 140 px，并排）；录音中点它会先**正常收尾**
+#     （回填 WAV 头）再放；退出只停本 app 发起的那次，不碰音乐 App 的歌。
+#   · 引擎：audio_rec_play_last/stop/playing + BoardRec_PlayLast/StopPlay/Playing/PlayRc/PlayName；
+#     钩子 g_rec_play_req（1=放最新 2=停）、g_rec_play_rc、g_rec_play_n。
+#   · 实测（REC 目录里编号最大那条，1 417 216 B / 7.256 s / 48 828 Hz / 立体声）：
+#     两遍均 play_rc=0、wav_state 放完自行归 0、seam_n=0（全程无可闻跳变）、
+#     vol_at_cstart=0x00（安全栅有效）、dacwake=123~149 ms、ramp=228~253 ms、g_wav_read_ms=1 ms。
+#     ⚠ under_dma/under_short 的增量**全部落在文件尾部**：under_first_ms=7235 而文件长 7254 ms
+#     ⇒ 是"文件读完后环里还剩 ~168 ms 音频要放、feeder 已无数据"的必然过程（被判为缺口并
+#       按"冻结"处理 ⇒ 连续静音），**不是**稳态供给不足。
+# FLASH 1 674 004 B（79.82%）；DTCM 46 516 B（heap0 = 35 400 B，峰值 34 320 ⇒ 余 ~1.08 KB）。
+# ===========================================================================================
+7e4a965b0e5a2037f9eca14adb3d8e05eb8fbf3fa8ac497578d36ebf3e00bbb1  ymgui-h743.bin
+ddbc0c02b7ddba364cf3109babdaf09e9b0668063a346addf7e94aea060e2af1  ymgui-h743.elf

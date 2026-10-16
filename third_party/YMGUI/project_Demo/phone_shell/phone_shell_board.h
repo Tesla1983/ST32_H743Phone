@@ -229,6 +229,16 @@ int         BoardRec_MicOk(void);      /* 1 = 本次录音采到过明显信号�
                                         * ⇒ UI 应当如实提示"未检测到麦克风信号"而不是
                                         * 继续显示"录音中"（假数据零容忍）*/
 uint32_t    BoardRec_PeakRaw(void);    /* 原始峰值 0..32767（排障/验收脚本用）*/
+/* ---- 试听（2026-10-16 补丁18b）----
+ * 把**最近一段**录音（目录里编号最大的 REC_xxxx.WAV）用同一块板、同一只喇叭放出来。
+ * 复用音乐播放链路（wav_play）⇒ 起播安全栅/音量 ramp/DMA 路径与音乐 App 完全一致，
+ * 所以"试听有没有爆音"等价于"播放有没有爆音"，不是另一条待验证的路径。
+ * ⚠ 与录音互斥（I2S2 主发/主收二选一）：录音中调 PlayLast() 会先**正常收尾**再放。 */
+int         BoardRec_PlayLast(void);   /* 0=已起播；-1 没有录音；<0 其它（同 wav_play_start）*/
+void        BoardRec_StopPlay(void);   /* 停止试听（不动文件）*/
+int         BoardRec_Playing(void);    /* 1 = 正在试听出声 */
+int         BoardRec_PlayRc(void);     /* 最近一次试听的返回码（映射失败文案用）*/
+int         BoardRec_PlayName(char* out, int n); /* 正在试听的文件名；<0 = 没有 */
 
 /* ---- 输入法自测（SWD 触发，无需碰屏）----
  * 板上没有物理键盘也没有 stdio，"看着屏幕上有没有候选"不算可靠判据。

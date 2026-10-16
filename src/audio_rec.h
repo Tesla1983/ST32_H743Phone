@@ -50,11 +50,22 @@ extern volatile uint32_t g_rec_hdr_bad;    /* 失败项位图（bit1=RIFF bit2=W
                                             * bit4=PCM bit5=声道 bit6=采样率 bit7=位深
                                             * bit8=data 长度 bit9=RIFF 长度 bit10=文件实长）*/
 extern volatile uint32_t g_rec_fsize;      /* 卡上文件真实字节数 */
+/* ★ 补丁18b：试听（放出最近录的那一段） —— 见 audio_rec.c 里的说明 */
+extern volatile uint32_t g_rec_play_req;   /* 排障钩子：1=试听最新录音 2=停（主循环消费一次）*/
+extern volatile int32_t  g_rec_play_rc;    /* 最近一次试听的返回码（同 wav_play_start）*/
+extern volatile uint32_t g_rec_play_n;     /* 试听成功起播的次数（单调）*/
 
 /* ---- 引擎（供 main.c 每拍调用与排障钩子使用）---- */
 int         audio_rec_start(void);   /* 0=已开始；REC_AGAIN(2)=准备中；<0=失败 */
 void        audio_rec_stop(void);
-int         audio_rec_poll(void);    /* ★ 每拍调：取数据 + 写卡 + 消费 g_rec_test */
+int         audio_rec_poll(void);    /* ★ 每拍调：取数据 + 写卡 + 消费 g_rec_test/g_rec_play_req */
+
+/* ★ 补丁18b：试听 —— 播放目录里编号最大的那条录音（= 最近一段）。
+ *   返回码同 wav_play_start（0=成功 / -2 卡 -3 打不开 / -22 音频输出起不来 …）；
+ *   另加 -1 = 目录里没有录音且本会话也没录过。若正在录音会**先正常收尾**（回填 WAV 头）。 */
+int         audio_rec_play_last(void);
+void        audio_rec_play_stop(void);
+int         audio_rec_playing(void); /* 1 = 正在试听出声（暂停/停止都算 0）*/
 
 #define REC_AGAIN 2
 
@@ -73,5 +84,13 @@ int         BoardRec_Scan(void);        /* 扫一次 /YMGUI/RECORD，返回文�
 int         BoardRec_Level(void);       /* 当前输入电平 0..100（取 L/R 采样峰值较大者）*/
 int         BoardRec_MicOk(void);       /* 1 = 本次录音采到过明显信号；0 = 一直很小 */
 uint32_t    BoardRec_PeakRaw(void);     /* 原始峰值 0..32767（排障/验收用）*/
+/* ★ 补丁18b：试听（把最近一段录音放出来听，不用拔卡）。
+ *   PlayLast() 的返回码可直接映射文案：0 成功 / -1 没有录音 / -2 卡没挂载 /
+ *   -3 打不开文件 / -22 音频输出起不来；其余 <0 = WAV 头有问题。 */
+int         BoardRec_PlayLast(void);
+void        BoardRec_StopPlay(void);
+int         BoardRec_Playing(void);
+int         BoardRec_PlayRc(void);
+int         BoardRec_PlayName(char* out, int n);
 
 #endif /* AUDIO_REC_H */
