@@ -239,6 +239,11 @@ void        BoardRec_StopPlay(void);   /* 停止试听（不动文件）*/
 int         BoardRec_Playing(void);    /* 1 = 正在试听出声 */
 int         BoardRec_PlayRc(void);     /* 最近一次试听的返回码（映射失败文案用）*/
 int         BoardRec_PlayName(char* out, int n); /* 正在试听的文件名；<0 = 没有 */
+/* ★ 补丁18c：录音起不来时，**为什么**起不来（旧实现只给一个 -2，用户无从判断）：
+ *   0 = 正常 / -1 = ES8311 回读不符（I2C 丢写，已自动重试）/
+ *  -3 = 总线上找不到 ES8311（模块没接好或接线松）/ -4 = I2C 总线本身起不来。 */
+int         BoardRec_EsRc(void);
+int         BoardRec_AdcRetry(void);   /* ADC 配置"整段重试"的累计次数（排障用）*/
 
 /* ---- 输入法自测（SWD 触发，无需碰屏）----
  * 板上没有物理键盘也没有 stdio，"看着屏幕上有没有候选"不算可靠判据。

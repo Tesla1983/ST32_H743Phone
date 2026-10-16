@@ -71,6 +71,18 @@ volatile uint32_t g_es_readback = 0u;      /* 回读体检执行次数（含起�
 /* ★ 2026-10-13：UI 卡死修复新增的两个计数（见 g_es_ng_idr 下方的长说明）*/
 volatile uint32_t g_es_bus_clear = 0u;     /* I2C bus clear（9 时钟 + STOP）真正执行过的次数 */
 volatile uint32_t g_es_breaker_trip = 0u;  /* I2C 熔断触发次数（连续硬失败过多 ⇒ 快速失败）*/
+/* ★ 补丁18c：调用方（用户主动动作）请求"放宽一次容错状态"、且**确实放宽了**的次数
+ *   （见 es8311_i2c_relax；判据是当时真的处在降级态）。>0 说明降级锁确实发生过。 */
+volatile uint32_t g_es_relax_n = 0u;
+/* ★ 补丁18c：用户主动动作**开始时**就发现"SDA 被从机钳住"的次数。
+ *   它是"总线卡死态有多频繁"的直接统计 —— 用来回答"到底该重试还是该查线"。 */
+volatile uint32_t g_es_relax_bus = 0u;
+/* ★ 补丁18c：因"两个地址都探不到"而**强制做总线恢复**的次数（见 es8311_bus_ready）。
+ *   >0 ⇒ 补丁9 那个盲区真实发生过（总线电气空闲但从机卡住），且被这一条救过。 */
+volatile uint32_t g_es_bc_after_probe = 0u;
+/* ★ 补丁18c：SWD 排障钩子 —— 写 1 ⇒ 主循环立刻做一次强制总线恢复（不依赖任何业务路径）。 */
+volatile uint32_t g_es_force_bc = 0u;
+volatile uint32_t g_es_force_bc_n = 0u;   /* 上面这个钩子真正执行的次数 */
 volatile uint32_t g_es_i2c_req = 0u;       /* 排障钩子：写 1 ⇒ 主循环按 g_es_i2c_hz 重定时 */
 volatile uint32_t g_es_i2c_timingr = 0u;   /* 最近一次生效的 I2C1 TIMINGR（重定时诊断）*/
 volatile uint32_t g_es_busclear_en = 1u;   /* ★排障开关：1=允许自动 bus clear（默认）；
@@ -725,6 +737,54 @@ static void es8311_i2c_note(int failed)
     }
 }
 
+/* ★ 补丁18c：**为用户主动动作放宽一次容错状态**（不是全局放宽）。
+ *
+ * 【为什么需要它 —— 以及为什么不能改 retry_budget 的判据】
+ *   本轮最初想让"降级态自己退出"，判据取 `GPIOB->IDR` 的 SDA 位是否为高（= 总线空闲）。
+ *   **实测直接证伪**（`build/_reg18c.txt`）：那个判据**几乎恒真** —— 每笔事务**开始前**
+ *   总线本来就是空闲的 ⇒ 每一笔都能拿满 5 次重试 ⇒ **等于把补丁13 的降级保护整个废掉**，
+ *   单笔阻塞回到最坏 35 ms × 多笔 ⇒ 播放期间的 I2C 体检拍被拖长 ⇒
+ *   `es8311_clk_check` K2/K7b 与 `wav_pause_resume_check` P1/P6/**P8（静音未确认 =
+ *   爆音风险）** 全部 FAIL。⇒ **降级保护必须保留**，它是"UI 不卡 + 不爆音"的基石。
+ *
+ * 【正确做法】只在**用户主动触发的一次性动作**（录音起播）开始前，把"降级"这一个标志
+ *   清掉一次，让这一次序列能拿满重试（扛过本模块固有的 ~30% 首试 NACK）。
+ *   · 稳态路径（播放中的逐拍回读体检）**照旧受降级保护** ⇒ 单拍阻塞上限不变；
+ *   · **不碰熔断**（`s_es_consec_fail`/冷却）—— 那是对付"总线真坏"的保护，保留它的语义，
+ *     否则用户连点就会把熔断废掉（补丁13 记录过这个坑：在 bus_clear 里清计数 ⇒ 熔断永不触发）；
+ *   · **不碰任何超时上限**（单笔仍是 5 ms / 降级 1 ms 两档）。
+ *   ⚠ 熔断冷却（250 ms）由调用方**隔拍重试**跨过（见 apps/recorder.c 的 REC_UI_RETRY），
+ *     而不是在这里阻塞等待。 */
+/* ★ 补丁18c：**强制**做一次总线恢复（9 个 SCL 脉冲 + STOP），不依赖任何电平判据。
+ *   用途：① bus_ready 在"探不到器件"时调用（见上）；② SWD 钩子 g_es_force_bc 现场验证。 */
+void es8311_force_bus_clear(void)
+{
+    if (g_es_bus_rc != 0u)
+    {
+        return;                       /* I2C 还没初始化：碰寄存器会 BusFault */
+    }
+    es8311_bus_clear();
+}
+
+void es8311_i2c_relax(void)
+{
+    /* ① 若 **SDA 被从机钳住**（总线卡死态），先清障再往下走。
+     *   这是"用户动作开始时"最好的介入时机：等二十来笔全失败再靠笔级自愈去救，
+     *   代价是几百毫秒的等待 + 一串噪声计数；在这里先看一眼几乎不花钱。
+     *   ⚠ 前置条件 g_es_bus_rc==0（I2C 已初始化）由 es8311_bus_clear 自己检查。 */
+    if ((g_es_bus_rc == 0u) && ((GPIOB->IDR & GPIO_PIN_7) == 0u))
+    {
+        g_es_relax_bus++;
+        es8311_bus_clear();
+    }
+    /* ② 清"降级快速失败"（只清这一个标志，不碰熔断、不改超时上限） */
+    if (s_es_fast_fail != 0u)
+    {
+        g_es_relax_n++;          /* 只统计"真的放宽了"的次数，便于事后判读 */
+        s_es_fast_fail = 0u;
+    }
+}
+
 /* 重试次数与间隔定义已上移到 es8311_probe_to 之前（probe/write/read 共用）。 */
 
 int es8311_write_reg(uint8_t reg, uint8_t val)
@@ -1166,7 +1226,32 @@ int es8311_bus_ready(void)
         es8311_set_addr(ES8311_I2C_ADDR_CE1);
         return 0;
     }
-    return -2;                          /* 总线上没有 ES8311：没接模块或线错了 */
+
+    /* ★★ 补丁18c：两个地址都探不到 ⇒ **强制做一次总线恢复，再探一轮**。 ★★
+     * 【为什么不能只看"SDA 是否被钳"】2026-10-16 实测到的现场：
+     *   `GPIOB IDR = 0xC0`（两线都是高，**电气上完全空闲**）、I2C1 配置全对、
+     *   `g_es_wr_ng = g_es_rd_ng = 0`（没有一次读写失败）、**`g_es_bus_clear = 0`
+     *   （总线恢复从未被调用）**，而 probe 两个地址全灭、`g_rec_es_rc=-3`
+     *   （"总线上没有 ES8311"），**连 MCU 复位都救不回来**。
+     *   ⇒ 从机可以卡在"**内部状态机停在传输中、而两线电气都是高**"的状态：
+     *     此时 `bus_init()` 末尾那条"SDA 为低才 bus_clear"的自检**不会触发**，
+     *     于是每一轮都只是无用地重试 probe。这正是补丁9 留下的盲区。
+     * 【正确判据】"**探不到器件**"这个**功能性事实**，而不是电平读数。
+     *   9 个 SCL 脉冲 + STOP 正是把这种从机推出中间态的标准手段（I2C 规范 NXP AN10216）。
+     * ⚠ 只做一次（不循环），避免在最坏情况下把单拍拖长；调用方的整段重试会再来。 */
+    es8311_bus_clear();
+    g_es_bc_after_probe++;
+    if (es8311_probe(ES8311_I2C_ADDR_CE0) == 0)
+    {
+        es8311_set_addr(ES8311_I2C_ADDR_CE0);
+        return 0;
+    }
+    if (es8311_probe(ES8311_I2C_ADDR_CE1) == 0)
+    {
+        es8311_set_addr(ES8311_I2C_ADDR_CE1);
+        return 0;
+    }
+    return -2;                          /* 总线恢复后仍没有 ES8311：没接模块 / 线错了 / 器件坏了 */
 }
 
 /* ★★ 2026-10-16（补丁18）：**ADC（麦克风）通路** —— 录音链路的第一步。★★

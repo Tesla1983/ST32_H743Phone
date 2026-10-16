@@ -31,6 +31,13 @@
  *   录音中点"试听"会先让引擎**正常收尾**（回填 WAV 头）再放，不会留下半个文件。
  *   ⚠ 退出 app 只停**本 app 发起**的那次试听，不碰音乐 App 正在放的歌。 */
 
+/* ★ 补丁18c：ES8311 起不来时 App 侧"隔拍重试"的额度。
+ *   为什么不靠引擎那 3 次：引擎是背靠背（间隔 2 ms），跨不过 es8311 的 **250 ms 熔断冷却**；
+ *   App 每拍一次（≈17 ms/拍）能把冷却等过去，且不阻塞主循环。
+ *   20 拍 × ~17 ms ≈ 340 ms > 250 ms ⇒ 足够跨过一次完整冷却（用户感觉不到，
+ *   比"点了没反应"好得多）。 */
+#define REC_UI_RETRY 20
+
 typedef struct
 {
 	GYOBJ record_time, record_button, record_status, record_meter;
@@ -45,6 +52,7 @@ typedef struct
 	int   meter;            /* 电平条的显示值（做了下落平滑）*/
 	int   warn_ms;          /* "未检测到信号"累计时长：超过阈值才提示，避免刚开录就报 */
 	int   shown_warn;       /* 已经提示过"没信号"了 */
+	int   adc_retry;        /* ★ 补丁18c：还剩几次"隔拍重试"（跨过 es8311 的 250 ms 熔断冷却）*/
 	int   recording_count;  /* 本次进入 app 以来成功录过几段 */
 	int   last_bytes;       /* 上一段写进卡的字节数 */
 	char  last_name[20];    /* 上一段落地的文件名 */
@@ -56,12 +64,47 @@ static void app_close(void);
 static int app_query(const char* name);
 static void record_toggle(GYOBJ obj);
 static void play_toggle(GYOBJ obj);
+static void rec_show_fail(int rc);
+
 
 /* 把状态行刷成"可直接画的一句中文"。用**静态字面量分支**而不是拼缓冲：
  * 本工程的 UI 文案要能被 phone_lang.c 的翻译表按字符串匹配到（中/英）。 */
 static void show_status(const char* s)
 {
 	PhoneUI_text_set(state.record_status, s);
+}
+
+/* ★ 补丁18c：录音起不来时，按**细分码**告诉用户下一步做什么。
+ * 旧文案只有一句"录音失败 · 检查 TF 卡与麦克风接线"，把五种完全不同的原因混成一句 ——
+ * 用户报障时最需要的恰恰是"我该查线，还是再点一次"。 */
+static void rec_show_fail(int rc)
+{
+	switch (rc)
+	{
+	case -1:
+		show_status("起不来：I2S 收方向没起来（音频通道异常）");
+		break;
+	case -2:                                  /* ES8311 那一步：细分看 BoardRec_EsRc() */
+		if (BoardRec_EsRc() == -3)
+			show_status("起不来：找不到 ES8311 · 请查模块 I2C 接线（PB6/PB7）");
+		else if (BoardRec_EsRc() == -4)
+			show_status("起不来：I2C 总线本身没起来");
+		else
+			show_status("起不来：ES8311 丢写 · 请再点一次");
+		break;
+	case -3:
+		show_status("起不来：TF 卡没挂载 · 插好卡再试");
+		break;
+	case -4:
+		show_status("起不来：建不了录音文件（卡满或写保护）");
+		break;
+	case -5:
+		show_status("起不来：写不进录音文件 · 检查 TF 卡");
+		break;
+	default:
+		show_status("录音起不来 · 请再点一次");
+		break;
+	}
 }
 
 static void app_tick(uint32 elapsed)
@@ -86,6 +129,7 @@ static void app_tick(uint32 elapsed)
 		if (rc == 0)
 		{
 			state.pending = 0;
+			state.adc_retry = 0;
 			state.active = 1;
 			state.warn_ms = 0;
 			state.shown_warn = 0;
@@ -93,11 +137,21 @@ static void app_tick(uint32 elapsed)
 			show_status("录音中 · 正在写入 TF 卡");
 			return;
 		}
-		/* 失败：如实退出准备态 */
+		/* ★ 补丁18c：**失败也先重试几次再报错**。
+		 *   为什么需要 App 侧再试：引擎内部是"背靠背 3 次、间隔 2 ms"，跨不过 es8311 的
+		 *   250 ms 熔断冷却；而这里**每拍一次**（≈17 ms 一拍）能把冷却等过去。
+		 *   实测（2026-10-16）本板 I2C 首试 NACK ≈30% 且成簇 ⇒ 一次失败并不代表坏了。 */
+		if (state.adc_retry > 0)
+		{
+			state.adc_retry--;
+			state.last_rc = rc;
+			show_status("正在重试…（I2C 偶发丢写）");
+			return;                            /* 保留 pending，下一拍再调 */
+		}
 		state.pending = 0;
 		state.last_rc = rc;
 		PhoneUI_button_set(state.record_button, "开始录音");
-		show_status("录音失败 · 检查 TF 卡与麦克风接线");
+		rec_show_fail(rc);
 		return;
 	}
 	if (!state.active)
@@ -220,6 +274,7 @@ static void record_toggle(GYOBJ obj)
 		{
 			state.active = 1;
 			state.pending = 0;
+			state.adc_retry = 0;
 			PhoneUI_button_set(state.record_button, "停止录音");
 			show_status("录音中 · 正在写入 TF 卡");
 		}
@@ -231,12 +286,23 @@ static void record_toggle(GYOBJ obj)
 			PhoneUI_button_set(state.record_button, "准备中…（先停止播放）");
 			show_status("准备中 · 正在停止音乐播放，稍后自动开始录音");
 		}
+		else if (rc == -2)
+		{
+			/* ★ 补丁18c：ES8311 那一步失败 ⇒ **不当场判死**，交给 tick 隔拍重试。
+			 *   本板 I2C 首试 NACK ≈30% 且成簇（板上无外部上拉、仅 MCU 内部 ~40 kΩ），
+			 *   "点了没反应"比"多等两拍"差得多。 */
+			state.pending = 1;
+			state.active = 0;
+			state.adc_retry = REC_UI_RETRY;
+			PhoneUI_button_set(state.record_button, "重试中…");
+			show_status("起不来 · 正在重试（I2C 偶发丢写）");
+		}
 		else
 		{
 			state.pending = 0;
 			state.active = 0;
 			PhoneUI_button_set(state.record_button, "开始录音");
-			show_status("录音起不来 · TF 卡或 ES8311 状态异常");
+			rec_show_fail(rc);                 /* 卡/文件类失败：重试无意义，直接说实话 */
 		}
 	}
 }
@@ -361,6 +427,13 @@ static intptr_t app_inspect(const char* name, int index)
 		return (intptr_t)state.play_rc;
 	if (!strcmp(name, "rec_play_hwrc"))
 		return (intptr_t)BoardRec_PlayRc();
+	/* 补丁18c：ES8311 那一步的细分码 + 重试额度（排障/验收脚本读这两个）*/
+	if (!strcmp(name, "rec_es_rc"))
+		return (intptr_t)BoardRec_EsRc();
+	if (!strcmp(name, "rec_adc_retry"))
+		return (intptr_t)BoardRec_AdcRetry();
+	if (!strcmp(name, "rec_ui_retry"))
+		return (intptr_t)state.adc_retry;
 	return 0;
 }
 

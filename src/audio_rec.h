@@ -54,6 +54,9 @@ extern volatile uint32_t g_rec_fsize;      /* 卡上文件真实字节数 */
 extern volatile uint32_t g_rec_play_req;   /* 排障钩子：1=试听最新录音 2=停（主循环消费一次）*/
 extern volatile int32_t  g_rec_play_rc;    /* 最近一次试听的返回码（同 wav_play_start）*/
 extern volatile uint32_t g_rec_play_n;     /* 试听成功起播的次数（单调）*/
+/* ★ 补丁18c：ES8311 那一步的**可区分**诊断（旧实现把所有失败压成 g_rec_rc=-2）*/
+extern volatile uint32_t g_rec_adc_retry;  /* ADC 配置整段重试的累计次数 */
+extern volatile int32_t  g_rec_es_rc;      /* ADC 配置原始码：0 / -1 回读不符 / -3 无器件 / -4 I2C 起不来 */
 
 /* ---- 引擎（供 main.c 每拍调用与排障钩子使用）---- */
 int         audio_rec_start(void);   /* 0=已开始；REC_AGAIN(2)=准备中；<0=失败 */
@@ -92,5 +95,8 @@ void        BoardRec_StopPlay(void);
 int         BoardRec_Playing(void);
 int         BoardRec_PlayRc(void);
 int         BoardRec_PlayName(char* out, int n);
+/* ★ 补丁18c：给 UI 的"失败原因"细分码（-1 回读不符 / -3 无器件 / -4 I2C 起不来 / 0 正常）*/
+int         BoardRec_EsRc(void);
+int         BoardRec_AdcRetry(void);
 
 #endif /* AUDIO_REC_H */

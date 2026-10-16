@@ -31,6 +31,20 @@
  * 与音乐播放的半缓冲同量级（那边也是 42 ms），写卡粒度与读卡粒度一致，行为好对照。 */
 #define REC_CHUNK_HW 4096u
 
+/* ★ 补丁18c：「ES8311 ADC 通路」这一整段的重试次数与间隔（2026-10-16）。
+ * 【为什么必须有】本板 I2C 首试 NACK ≈30% 且**成簇**（补丁15d 实测一次涨 2~5 笔；根因=
+ *   板上没有外部上拉、只有 MCU 内部 ~40 kΩ，100 kHz 下是电气边际），而这一段要写二十来笔：
+ *   "整整一段一笔都不丢"并非必然。**放音路径**（audio_out_start → es8311_dac_start_muted）
+ *   早就用"失败就整段重来"扛过去了，**录音路径此前没有** ⇒ 一次偶发丢写就会让用户看到
+ *   "录音起不来"（2026-10-16 用户报障即此）。
+ * 【为什么是 6 次、而且必须**隔拍**】录音起播是用户主动触发的一次性动作，多试几次的代价
+ *   只是几百毫秒；而失败一次就是"点了没反应"。**必须隔拍（≈17 ms/次）而不是背靠背**：
+ *   实测第 3 轮出现 `g_es_fail Δ=12`（连续 12 笔真丢写），而当时 3 次背靠背（间隔 2 ms）
+ *   全部落空 —— 失败是**成簇**的，且 es8311 还有 250 ms 熔断冷却，2 ms 的间隔跨不过它。
+ *   每次尝试都会重跑 es8311_adc_start() 开头的 es8311_bus_ready()（含总线电平自检 +
+ *   必要时 bus_clear + 重新探址），所以重试顺带把"从机把 SDA 钳住"这类坏状态再收敛一次。 */
+#define REC_ADC_TRIES    6u
+
 /* ---- 诊断量 ---- */
 volatile uint32_t g_rec_state      = 0u;
 volatile int32_t  g_rec_rc         = 0;
@@ -66,6 +80,14 @@ volatile uint32_t g_rec_hdr_bad = 0u;          /* 自检失败时：哪一项不
 volatile uint32_t g_rec_play_req = 0u;         /* 排障钩子：1=试听最新录音 2=停（主循环消费一次）*/
 volatile int32_t  g_rec_play_rc  = 0;          /* 最近一次试听的返回码（取 wav_play_start 的口径）*/
 volatile uint32_t g_rec_play_n   = 0u;         /* 试听成功起播的次数（单调）*/
+/* ★ 补丁18c：把"ES8311 那一步为什么失败"变成能区分的数字。
+ *   旧实现把 es8311_adc_start() 的**所有**失败都压成 g_rec_rc=-2 ⇒ App 只能说
+ *   "ES8311 状态异常"，用户无从判断该查线还是该重试。 */
+volatile uint32_t g_rec_adc_retry = 0u;        /* ADC 配置**整段重试**的累计次数 */
+volatile int32_t  g_rec_es_rc     = 0;         /* ADC 配置的**原始**返回码：
+                                                *   0 成功 / -1 回读不符（I2C 丢写）/
+                                                *  -3 总线上没有 ES8311（没接/线松）/
+                                                *  -4 I2C 总线本身起不来 */
 
 /* ---- 内部状态 ---- */
 /* ★★ 这个段属性是**必须的**，不是优化（2026-10-16 踩过并记档）：
@@ -88,6 +110,14 @@ static char     REC_BUF_ATTR s_name[20];
 static char     s_status[64] = "未开始";              /* 带初值 ⇒ 必须在 DTCM */
 static uint32_t s_start_tick = 0u;
 static uint32_t s_data_bytes = 0u;
+/* ★ 补丁18c：本次动作还剩几次"ES8311 ADC 配置"尝试（0 = 额度未初始化/已用完）。
+ *   用 static 而不是局部变量，是为了让重试能**跨调用**（隔拍）而不是在函数里忙等。 */
+static uint32_t s_adc_left  = 0u;
+/* ★ 补丁18c：1 = 这次启动是 **SWD 钩子**发起的（g_rec_test=1）。
+ *   为什么要它：App 路径有 app_tick 每拍重试，而钩子是一次性消费 ——
+ *   返回 REC_AGAIN 之后就没人再调 audio_rec_start() 了，隔拍重试会断链。
+ *   有它，主循环就能替钩子把重试驱动完（判据用 g_rec_pending，重试自然结束）。 */
+static uint8_t  s_auto_retry = 0u;
 static uint8_t  s_opened   = 0u;
 
 /* ====================== 纯函数：WAV 头 ======================
@@ -255,14 +285,54 @@ int audio_rec_start(void)
     }
     g_rec_pending = 0u;
 
-    /* ---- ② codec：ADC/麦克风通路（ADC 开、DAC 关、REG17=0xBF）---- */
-    if (es8311_adc_start(g_rec_mic_gain) != 0)
+    /* ---- ② codec：ADC/麦克风通路（ADC 开、DAC 关、REG17=0xBF）----
+     * ★ 补丁18c：**隔拍整段重试**（不是背靠背）。
+     *   【为什么不背靠背】本轮实测（build/_reg18c.txt 的 4 轮）里第 3 轮出现
+     *   `g_es_fail Δ=12`（**连续 12 笔真丢写**），而当时的 3 次背靠背重试（间隔 2 ms）
+     *   全部落空 —— 失败是**成簇**的（同一窗口内连灭），且 es8311 还有 250 ms 熔断冷却，
+     *   间隔 2 ms 的重试跨不过它，等于白试。
+     *   【隔拍 = 主循环 ≈17 ms/拍】既让开窗口、又不阻塞主循环；更关键的是
+     *   **两条调用路径**（App 点击 / SWD 钩子）都自动受益，而不是只在 App 里加重试。
+     *   【降级放宽】es8311_i2c_relax() 只清"降级快速失败"、不碰熔断；录音期间必然没有
+     *   播放（I2S2 主发/主收互斥），所以放宽它不会影响播放体验。
+     *   ⚠ 返回 REC_AGAIN(2) 时**采集通道已经收回**（audio_out_capture_stop），
+     *     下一次调用会从头走一遍，因此重试是幂等的。 */
+    if (s_adc_left == 0u)
     {
-        audio_out_capture_stop();
-        g_rec_rc = -2;
-        rec_set_status("失败：ES8311 ADC 通路没配上");
+        s_adc_left = REC_ADC_TRIES;          /* 新一次动作开始 */
+    }
+    es8311_i2c_relax();
+    g_rec_es_rc = es8311_adc_start(g_rec_mic_gain);
+    if (g_rec_es_rc != 0)
+    {
+        s_adc_left--;
+        audio_out_capture_stop();            /* 让下一拍从干净状态重来 */
+        if (s_adc_left > 0u)
+        {
+            g_rec_adc_retry++;
+            g_rec_pending = 1u;
+            g_rec_rc      = REC_AGAIN;
+            rec_set_status("准备中：ES8311 未就绪，正在重试…");
+            return REC_AGAIN;                /* 不阻塞：下一次调用再来 */
+        }
+        g_rec_pending = 0u;
+        g_rec_rc      = -2;                  /* 码表不变：-2 = ES8311 那一步没过 */
+        if (g_rec_es_rc == -3)
+        {
+            rec_set_status("失败：总线上找不到 ES8311（模块没接好/接线松）");
+        }
+        else if (g_rec_es_rc == -4)
+        {
+            rec_set_status("失败：I2C 总线起不来（PB6/PB7）");
+        }
+        else
+        {
+            rec_set_status("失败：ES8311 回读不符（I2C 丢写，已重试）");
+        }
         return -2;
     }
+    s_adc_left    = 0u;                      /* 成功 ⇒ 额度清零 */
+    g_rec_pending = 0u;
 
     /* ---- ③ 文件：目录 + 命名 + 占位 WAV 头 ---- */
     if (fatfs_ensure_mounted() != 0)
@@ -321,6 +391,11 @@ void audio_rec_stop(void)
 
     if (g_rec_state != 1u)
     {
+        /* ★ 补丁18c：即使没在录，也要把"等 ES8311 就绪"的重试状态收干净 ——
+         *   否则残留的 g_rec_pending/s_adc_left 会让下一次调用以为还在重试中。 */
+        g_rec_pending = 0u;
+        s_adc_left    = 0u;
+        s_auto_retry  = 0u;
         return;
     }
     g_rec_state = 2u;                        /* 收尾中：这期间再点"停"不会重入 */
@@ -488,8 +563,30 @@ int audio_rec_poll(void)
         uint32_t t = g_rec_test;
 
         g_rec_test = 0u;
-        if (t == 1u)      { (void)audio_rec_start(); }
-        else if (t == 2u) { audio_rec_stop(); }
+        if (t == 1u)      { s_auto_retry = 1u; (void)audio_rec_start(); }
+        else if (t == 2u) { s_auto_retry = 0u; audio_rec_stop(); }
+    }
+
+    /* ★ 补丁18c：替钩子把"隔拍重试"驱动完（App 路径由 app_tick 驱动，钩子路径没有调用方）。
+     *   判据用 g_rec_pending —— 它同时覆盖"等放音淡出"与"等 ES8311 就绪"两种准备态；
+     *   一旦不再是准备态（成功或额度用尽）就停手。 */
+    if ((s_auto_retry != 0u) && (g_rec_pending != 0u))
+    {
+        if (audio_rec_start() != REC_AGAIN)
+        {
+            s_auto_retry = 0u;
+        }
+    }
+
+    /* 排障钩子（补丁18c）：SWD 写 g_es_force_bc=1 ⇒ 立刻做一次**强制总线恢复**。
+     *   为什么要有它：补丁9 的总线恢复判据是"SDA 被钳低"，而实测存在"电气空闲但
+     *   从机卡在传输中"的状态（IDR=0xC0、probe 全灭、连复位都不恢复）。
+     *   用它可以在**不依赖任何业务路径**的前提下验证"9 脉冲 + STOP 能否救回"。 */
+    if (g_es_force_bc != 0u)
+    {
+        g_es_force_bc = 0u;
+        es8311_force_bus_clear();
+        g_es_force_bc_n++;
     }
 
     /* 排障钩子（补丁18b）：SWD 写 g_rec_play_req=1/2 就能放/停"最近一段录音"。
@@ -540,6 +637,9 @@ void BoardRec_StopPlay(void)    { audio_rec_play_stop(); }
 int BoardRec_Playing(void)      { return audio_rec_playing(); }
 int BoardRec_PlayRc(void)       { return (int)g_rec_play_rc; }
 int BoardRec_PlayName(char* out, int n) { return wav_play_current_name(out, n); }
+/* 补丁18c：ES8311 那一步的细分码与重试次数（UI 用来给出"该查线还是该重试"的提示）*/
+int BoardRec_EsRc(void)         { return (int)g_rec_es_rc; }
+int BoardRec_AdcRetry(void)     { return (int)g_rec_adc_retry; }
 
 uint32_t BoardRec_ElapsedMs(void)
 {

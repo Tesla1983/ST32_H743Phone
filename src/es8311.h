@@ -186,6 +186,30 @@ extern volatile uint32_t g_es_nack_sim;  /* 0=正常；1=每笔事务直接判�
  *   放大约 13 倍 ⇒ 音频偶发丢写。UI 卡死真因是单笔超时（已 50→5 ms），与重试数无关。 */
 extern volatile uint32_t g_es_bus_clear;   /* bus clear 真正执行过的次数（>0 = 发生过总线卡死）*/
 extern volatile uint32_t g_es_breaker_trip;/* I2C 熔断触发次数（连续硬失败过多 ⇒ 快速失败）*/
+/* ★ 补丁18c：为用户主动动作"放宽一次降级"且真的放宽了的次数（见 es8311_i2c_relax）*/
+extern volatile uint32_t g_es_relax_n;
+/* ★ 补丁18c：用户动作**开始时**就发现"SDA 被钳住"的次数（总线卡死态的频次统计）*/
+extern volatile uint32_t g_es_relax_bus;
+/* ★ 补丁18c：因"探不到器件"而强制做总线恢复的次数（补丁9 盲区是否真实发生过）*/
+extern volatile uint32_t g_es_bc_after_probe;
+extern volatile uint32_t g_es_force_bc;     /* SWD 钩子：写 1 ⇒ 主循环做一次强制总线恢复 */
+extern volatile uint32_t g_es_force_bc_n;   /* 上面这个钩子真正执行的次数 */
+void es8311_force_bus_clear(void);
+
+/**
+ * @brief  为**用户主动触发的一次性动作**放宽一次容错状态（补丁18c，2026-10-16）
+ *
+ * 只清"降级快速失败"标志（`s_es_fast_fail`），让接下来的这一整段寄存器序列能拿满
+ * 5 次重试（扛过本模块固有的 ~30% 首试 NACK）；**不碰熔断**、**不改任何超时上限**。
+ * 另外：若此刻 **SDA 被从机钳住**（总线卡死态），会先做一次 `es8311_bus_clear()`
+ * 清障（计入 `g_es_relax_bus`）—— 提前介入比"等整段失败后再自愈"便宜得多。
+ * 稳态路径（播放中的逐拍回读体检）不受影响 ⇒ 单拍 I2C 阻塞上限不变（UI 不卡、不爆音）。
+ *
+ * ⚠ 必须**只在用户主动动作的开始**调用（例如录音起播）。若放进逐笔路径或 bus_clear，
+ *   等于把降级保护废掉 —— 本轮已用实测证伪过这种写法（见 src/es8311.c 里的说明）。
+ * ⚠ 熔断冷却（250 ms）请由调用方**隔拍重试**跨过，不要在这里阻塞等待。
+ */
+void es8311_i2c_relax(void);
 /* ★ 2026-10-13：SCL 频率现场可调（验证"降频消除 ~30% 首试 NACK"的电气边际假设）
  *   写 g_es_i2c_hz=<Hz>（10k~400k）→ 写 g_es_i2c_req=1 → 主循环调 es8311_i2c_retiming()。
  *   一次烧录即可扫多个频率，无需反复 download（每次 ~200 s）。 */
