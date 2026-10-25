@@ -1,5 +1,7 @@
 # ymgui-h743 —— YMGUI 在 STM32H743VIT6 上的手机原型
 
+> 本仓库以**中文版 README 为主**（GitHub 首页默认展示）。English version: [README_EN.md](README_EN.md)。
+
 将国产 GUI 库 [YMGUI](https://github.com/Yao-Mi/YMGUI) 移植到一块 STM32H743VIT6 小系统板，运行其自带的中文手机 Shell（`project_Demo/phone_shell`）：320×480 并口屏 + 电容触摸 + 16 MB QSPI Flash + 外挂 **ES8311 音频编解码器** + 外挂 **ESP32 网络/蓝牙协处理器**，裸机（无 RTOS），CMake + GCC 构建，全部资源上板实测。
 
 项目详情见 [`docs/`](docs/)（排针对照 `docs/HEADER_PINOUT.md`、硬件图 `docs/hw_ref/`）；开发过程叙事见 [`docs/DEVELOPMENT_LOG.md`](docs/DEVELOPMENT_LOG.md)。
