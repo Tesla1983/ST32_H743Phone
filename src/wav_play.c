@@ -70,7 +70,8 @@ volatile uint32_t g_wav_test = 0;
 /* ★ 补丁15d：板上执行的「暂停 → N ms → 续播」突发，专门用来测**快速连点**那条幂等分支。
  *
  * 【为什么必须放板上】`probe-rs write` 每次都要 spawn 一个进程，实测单次 ≈ 400 ms；
- *   而暂停淡出只有 AO_PAUSE_FADE_TICKS(12) 拍 × 主循环 16.98 ms ≈ **204 ms**
+ *   而暂停淡出窗口（静音确认后 ≥ AO_PAUSE_MIN_RAMP_MS = 300 ms）比主机两次写之间的
+ *   真实间隔更短/相当 ⇒ 主机侧难以稳定落入 `audio_out_start()` 的幂等分支
  *   ⇒ 主机两次写之间的真实间隔**必然**大于淡出窗口 ⇒ 永远落不进 `audio_out_start()`
  *   的幂等分支（`tools/rapid_stop_start_check.py` 实测 5/5 轮"空测"就是这个原因，
  *   不是固件缺陷）。把整段交给板子做，间隔才真的可控。
@@ -357,7 +358,7 @@ int wav_play_start(const char *path)
         return -21;
     }
 
-    audio_out_set_volume((uint8_t)g_audio_volume);
+    audio_out_set_volume((uint8_t)es8311_ui_volume_effective());
     audio_out_set_feeder(feeder_cb);
     if (audio_out_start() != 0)
     {
@@ -411,7 +412,7 @@ int wav_play_resume(void)
     {
         return -1;
     }
-    audio_out_set_volume((uint8_t)g_audio_volume);
+    audio_out_set_volume((uint8_t)es8311_ui_volume_effective());
     audio_out_set_feeder(feeder_cb);   /* 保险：确认喂的仍是本文件 */
     if (audio_out_start() != 0)
     {
@@ -513,7 +514,7 @@ void wav_play_tick(void)
     else if (g_wav_test == 6u)
     {
         g_wav_test = 0u;
-        (void)es8311_set_volume_ui(g_audio_volume);
+        (void)es8311_set_volume_ui(es8311_ui_volume_effective());
     }
     if ((s_burst_stage == 1u) && ((int32_t)(HAL_GetTick() - s_burst_deadline) >= 0))
     {
@@ -631,11 +632,53 @@ int BoardMusic_Size(int i, uint32_t *size)
     return img_scan_size(i, size);
 }
 
+/* 第 i 首的完整路径（补丁30）：文件管理器「音乐」分类里点一下就交给音乐 App 播，
+ * 需要的是绝对路径。UI 不许自己拼 "/YMGUI/MUSIC/"（分层：目录常量只在 src 里）。 */
+int BoardMusic_Path(int i, char *out, int n)
+{
+    return img_scan_path(i, IMG_MUSIC_DIR, out, n);
+}
+
+/* 删除第 i 首（补丁30，与 BoardNote_Delete 同一套：真删 + 立刻重扫）。
+ * 返回：0=成功 2=下标无效 -1=卡未挂载 -3=路径拼接失败 -4=f_unlink 失败。 */
+int BoardMusic_Delete(int i)
+{
+    char    full[IMG_PATH_MAX];
+    FRESULT fr;
+
+    if (i < 0 || i >= img_scan_count()) { return 2; }
+    if (fatfs_ensure_mounted() != 0)    { return -1; }
+    if (img_scan_path(i, IMG_MUSIC_DIR, full, (int)sizeof(full)) != 0) { return -3; }
+
+    fr = f_unlink(full);
+    if (fr != FR_OK) { return -4; }
+
+    (void)BoardMusic_Scan();        /* 重建扫描表（下标会变，UI 必须重新取值）*/
+    return 0;
+}
+
 int BoardMusic_Play(int i)
 {
     char path[IMG_PATH_MAX];
 
     if (img_scan_path(i, IMG_MUSIC_DIR, path, (int)sizeof(path)) != 0)
+    {
+        return -1;
+    }
+    if (wav_play_start(path) != 0)
+    {
+        return -1;
+    }
+    return 0;
+}
+
+/* 播放**任意路径**的 WAV（补丁29）：音乐 App 被文件管理器用"播这段录音"唤起时用。
+ * 与 BoardMusic_Play(i) 的唯一区别是**不经过 /YMGUI/MUSIC 的扫描表** ——
+ * 录音在 /YMGUI/RECORD，索引语义完全不同，硬套下标只会播错文件。
+ * 播放链路完全一致（同一个 wav_play_start ⇒ 起播安全栅 / 音量 ramp / DMA 路径都复用）。 */
+int BoardMusic_PlayFile(const char *path)
+{
+    if (path == NULL || path[0] == 0)
     {
         return -1;
     }

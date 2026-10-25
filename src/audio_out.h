@@ -173,6 +173,15 @@ extern volatile uint32_t g_ao_probe_n;   /* 排障钩子：写 N ⇒ 接下来 N
 extern volatile uint32_t g_ao_pause_calls;  /* audio_out_pause() 真正执行次数 */
 extern volatile uint32_t g_ao_pause_volwr;  /* 暂停动作里对 REG32 的写笔数（应 = pause_calls）*/
 extern volatile uint32_t g_ao_resume_calls; /* 起播/续播动作真正执行次数 */
+/* ★ 补丁21：淡出收尾分支的可直接计数（铁律10）。 */
+extern volatile uint32_t g_ao_mute_retry;   /* 静音未在暂停/停止时落地、改由 tick 内重试才确认的次数 */
+extern volatile uint32_t g_ao_fade_min;     /* 静音确认后等满 MIN_RAMP_MS 才切钟（正常路径）*/
+extern volatile uint32_t g_ao_fade_hardcap; /* 静音始终未确认、靠硬上限到点才切钟（I2C 死锁兜底，有爆音风险）*/
+/* ★ 补丁22：淡出期间写音量这条危险路径的直接计数 + A/B 开关。 */
+extern volatile uint32_t g_ao_vol_during_fade;     /* 淡出期间 audio_out_set_volume() 被调到的次数 */
+extern volatile uint32_t g_ao_vol_fade_wrote;      /* 其中真的写了 REG32 的次数（>0 = 满音量爆音风险）*/
+extern volatile uint32_t g_ao_vol_during_fade_val; /* 那次要写的 UI 音量 */
+extern volatile uint32_t g_ao_vol_guard_en;        /* 1 = 淡出期间禁写（修法）；0 = 复现旧行为 */
 /* ⚠ 2026-10-13 环形缓冲的一次语义修正（影响两条出音路径）：
  *   s_wr/s_rd 改为**单调计数器**（只在取索引时 & RING_MASK）。旧的
  *   `(s_wr - s_rd) & RING_MASK` 占用式在"环满"时读成 0（与"环空"同形），
@@ -202,6 +211,13 @@ extern volatile int32_t  g_cap_dc_r;   /* R 声道直流偏置估计 */
 extern volatile uint32_t g_cap_nz;     /* 非零样本千分比 */
 extern volatile uint32_t g_cap_hist[8];/* |样本| 8 级直方图 */
 extern volatile uint32_t g_cap_dbg[8]; /* NDTR/CR/SR/CFG1/I2SCFGR/CR1/tot/lost */
+/** 见 .c：连续采样 PC2(Dout) 电平与翻转（只读 IDR，零风险）。录音中调用才有意义。 */
+void audio_out_capture_probe_line(uint32_t n);
+/* ★ 麦克风硬件诊断：PC2(DOUT) 线活动度采样（纯读 IDR，零风险）*/
+extern volatile uint32_t g_cap_line_req;   /* 写 N ⇒ 下一拍录音时连续采样 N 次 */
+extern volatile uint32_t g_cap_line_n;     /* 已采样次数 */
+extern volatile uint32_t g_cap_line_hi;    /* 读到 1 的次数 */
+extern volatile uint32_t g_cap_line_flips; /* 0↔1 翻转次数（≈0 = 线上没信号）*/
 
 /**
  * @brief  启动采集（把 I2S2 从主发切成主收并起 DMA）

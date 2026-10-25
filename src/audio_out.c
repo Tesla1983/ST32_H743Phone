@@ -139,6 +139,26 @@ volatile uint32_t g_ao_silent_fail = 0u;   /* ★ 补丁13：**静音未能确�
                                             * >0 = 那一刻切时钟时 DAC 可能还挂在有效音量上
                                             * ⇒ 有爆音风险。这是把"听不见的坏状态"变成
                                             * 可读计数的关键量（与 g_es_silent_ng 同源）。*/
+/* ★ 补丁21：淡出收尾分支的可直接计数（铁律10：分支只能直接计数）。
+ *   - g_ao_mute_retry：暂停/停止时静音未落地、改由 tick 内每拍重试直到确认的次数
+ *     （证明"静音晚落地"这条新路径被走到，正是"某一次爆音"的旧根因入口）；
+ *   - g_ao_fade_min：静音确认后等满 AO_PAUSE_MIN_RAMP_MS 才切钟的次数（正常路径）；
+ *   - g_ao_fade_hardcap：静音始终没确认、靠硬上限 AO_PAUSE_HARD_CAP_MS 到点才切钟的次数
+ *     （I2C 死锁兜底，此时有爆音风险，量化不掩盖）。*/
+volatile uint32_t g_ao_mute_retry   = 0u;
+volatile uint32_t g_ao_fade_min     = 0u;
+volatile uint32_t g_ao_fade_hardcap = 0u;
+/* ★ 补丁22：淡出期间"写音量"这条危险路径的可直接计数（铁律10）。
+ *   - g_ao_vol_during_fade    ：audio_out_set_volume() 在**暂停淡出期间**被调到的次数
+ *     （证明"点播放落在淡出窗口内"这种情况真实发生）；
+ *   - g_ao_vol_fade_wrote     ：其中**真的把 REG32 写进芯片**的次数
+ *     （>0 = 满音量被硬写到仍在跑的传输上 = 用户那声"突然很大声"；修好后应恒 0）；
+ *   - g_ao_vol_during_fade_val：那次要写的 UI 音量值。
+ *   - g_ao_vol_guard_en       ：A/B 开关。1 = 守卫开（淡出期间不写，修法）；0 = 复现旧行为。*/
+volatile uint32_t g_ao_vol_during_fade     = 0u;
+volatile uint32_t g_ao_vol_fade_wrote      = 0u;
+volatile uint32_t g_ao_vol_during_fade_val = 0u;
+volatile uint32_t g_ao_vol_guard_en        = 1u;
 volatile uint32_t g_ao_csusp_ms_max = 0u;  /* ★ 补丁13：i2s_stop() 里"等先挂起生效"的**最长耗时(ms)**。
                                             * 正常 0~1；若出现几十 ms ⇒ 主循环单拍被它拖长。*/
 volatile uint32_t g_ao_csusp_tmo = 0u;     /* ★ 补丁13：上面那段等满 100 ms 兜底才 break 的次数 */
@@ -211,14 +231,20 @@ volatile uint32_t g_ao_dbg3[16];             /* 上面几个量的"同一时刻"
  * （实测窗口持续到数十毫秒），给足余量又不至于长期占用 I2C 影响播放。 */
 #define AO_RB_CONFIRM_TRIES 12u
 
-/* 暂停淡出等待拍数（2026-10-14 修"播放/暂停咔嗒声"）：
- * 暂停时先把 REG32 写成 0（ES8311 硬件软 ramp：REG37=0x48 = 0.25 dB / 32 LRCK，
- * ≈ 0.655 ms / 0.25 dB）。DAC 音量被硬件平滑降向 -95.5 dB。从 0 dB 降到听感静音
- * （~-60 dB）约需 240 步 ≈ 157 ms ⇒ 取 12 拍（≈192 ms）再停 I2S 传输，此时已基本
- * 无声，切断时钟不再可闻。
+/* 暂停/停止淡出的"切钟"时机（2026-10-14 修"播放/暂停咔嗒声"，2026-10-16 补丁21 改为时间基准）：
+ * 暂停/停止时先把 REG32 写成 0（ES8311 硬件软 ramp：REG37=0x48 = 0.25 dB / 32 LRCK，
+ * ≈ 0.655 ms / 0.25 dB）。DAC 音量被硬件平滑降向 -95.5 dB，从 0 dB 降到不可闻约 250~300 ms。
+ * ⚠ 旧实现用固定的 12 拍（≈192 ms）倒计时，且从"暂停调用时刻"起算 —— 一旦那笔静音 REG32=0
+ *   因 I2C 首试 NACK（实测 5%~30%、风暴下整段唤醒可长达 143 ms）晚落地，HW 软 ramp 没跑满
+ *   就被切钟 ⇒ DAC 还挂在可闻音量 ⇒ "多次里某一次"的偶发 pop。
+ * ⇒ 补丁21 改为**时间基准、且从"静音真正落地"起算**：
+ *   · AO_PAUSE_MIN_RAMP_MS：静音确认后至少再等这么久才切 I2S 时钟（≥ 软 ramp 全程 + 余量）；
+ *   · AO_PAUSE_HARD_CAP_MS：静音始终没确认时，最多等这么久也必须切钟，防 I2C 死锁（此时有爆音风险，
+ *     但比永远不切钟、链路卡死好 —— 用 g_ao_fade_hardcap 量化）。
  * ⚠ 为什么必须"先静音、后停时钟"：原来 audio_out_pause 先 i2s_stop() 掐时钟、再
  *   es8311_dac_mute()，时钟断的瞬间 DAC 还满音量 ⇒ 输出电平瞬跳 ⇒ 那声"咔嗒"。 */
-#define AO_PAUSE_FADE_TICKS 12u
+#define AO_PAUSE_MIN_RAMP_MS 300u   /* 静音确认后至少再等 300 ms 才切钟（软 ramp 到 -95.5 dB ≈ 250 ms，留余量）*/
+#define AO_PAUSE_HARD_CAP_MS 900u   /* 静音始终没确认时，最多等 900 ms 也必须切钟（I2C 死锁兜底）*/
 
 /* ★ 补丁15c：**首次起播**时把"DAC 通路唤醒"推迟这么多毫秒（相对 CSTART）。
  * 理由（板上实测，见 audio_out_start 里 s_wake_settle_ms 的注释）：首次起播刚做过
@@ -266,7 +292,11 @@ static volatile uint8_t  s_dac_pending = 0u;   /* 起播后延到下一拍再唤
 static volatile uint8_t  s_vol_ramp_left = 0u; /* 音量 ramp 剩余步数（0 = 不动）*/
 static volatile uint8_t  s_dac_rb_pending = 0u;/* "确认期"剩余尝试次数（见 tick；0 = 不在确认期）*/
 static volatile uint32_t s_rb_tick = 0u;       /* 播放中定期回读体检的节流计数（~1 s 一次）*/
-static volatile uint8_t  s_pause_fade_ticks = 0u;  /* 暂停淡出：写完 REG32=0 后，延几拍等 HW 软 ramp 落静音再停传输（0 = 不在淡出）*/
+static volatile uint8_t  s_pause_fade_ticks = 0u;  /* 暂停/停止淡出态标志（0 = 不在淡出；非 0 = 正在淡出）。
+                                          * ★ 补丁21：语义由"12 拍倒计时"改为"态标志"，
+                                          *   真正的延时收尾改由下方时间基准判定（见 tick）。*/
+static uint32_t          s_mute_t0 = 0u;   /* 淡出：REG32=0 真正落进芯片的时刻（0 = 尚未确认）*/
+static uint32_t          s_pause_start_t0 = 0u; /* 淡出：暂停/停止发起时刻（硬上限起点）*/
 static int32_t           s_dma_last = 0;      /* 补丁15：上一个半缓冲的末样本（接缝检测的前驱）*/
 static uint32_t          s_dma_wr_seq = 0u;   /* 补丁15：已写过的半缓冲个数（第 1 个没有前驱，不计接缝）*/
 static uint32_t          s_tz_run = 0u;       /* 补丁15：TIM6 当前连续零的个数（半字）*/
@@ -872,6 +902,18 @@ volatile int32_t  g_cap_dc_r   = 0;    /* R 声道直流偏置估计（两者都
 volatile uint32_t g_cap_nz     = 0u;   /* 非零样本千分比（0 = 整段全 0）*/
 volatile uint32_t g_cap_hist[8];       /* |样本| 的 8 级直方图（看"像不像真的模拟信号"）*/
 volatile uint32_t g_cap_dbg[8];        /* 同一时刻现场：NDTR/CR/SR/CFG1/I2SCFGR/CR1/tot/lost */
+/* ---- 麦克风硬件诊断（docs/MIC_RECORD_DESIGN.md §7 阶梯第 1 步）：PC2 线活动度 ----
+ * 【为什么必须有它】"采到的样本全 0"这一个特征**无法区分**：
+ *   ① DOUT 线没通 / 接错脚（PC2 上没有任何东西在驱动）
+ *   ② 模块确实在发数据，但模拟侧没信号（模块没有麦克风 / 偏置没起来 / PGA 没开）
+ * ⇒ 直接看 PC2 这根线本身在不在翻转，就能一刀切开：
+ *   · flips ≈ 0 且 hi/lo 一边倒 ⇒ 线上没人驱动 ⇒ 查接线/接脚（硬件问题）
+ *   · flips 大量、0/1 都有      ⇒ 模块在发 ⇒ 问题在模拟侧（麦克风/偏置/PGA）
+ * ⚠ 硬件红线：只**读** GPIOC->IDR，绝不驱动/强灌/改 PC2 的电气。 */
+volatile uint32_t g_cap_line_req   = 0u;  /* 写 N ⇒ 下一拍录音时连续采样 N 次 IDR（一次性）*/
+volatile uint32_t g_cap_line_n     = 0u;  /* 已采样次数（累计）*/
+volatile uint32_t g_cap_line_hi    = 0u;  /* 其中读到"1"的次数（0 = 线被恒低，=n = 恒高）*/
+volatile uint32_t g_cap_line_flips = 0u;  /* 0↔1 翻转次数（≈0 = 线上没信号在动）*/
 
 static uint16_t AUDIO_BUF_ATTR s_cap_buf[CAP_DMA_HALFWORDS];
 static DMA_HandleTypeDef s_hdma_rx;
@@ -1008,6 +1050,28 @@ uint32_t audio_out_capture_read(int16_t *dst, uint32_t halfwords)
         for (i = 0u; i < 8u; ++i) { g_cap_hist[i] = hist[i]; }
     }
     return n;
+}
+
+/* ★ 麦克风硬件诊断：连续采样 PC2（模块 DOUT → P2-9）的电平与翻转。
+ * ⚠⚠ 硬件红线：**只读** GPIOC->IDR，绝不驱动/强灌/改 PC2 的电气（本函数不碰 MODER/OTYPER）。
+ * 必须在**录音中**（I2S2 主收已起、模块正在发数据）调用，否则采到的是静态电平、没有意义。
+ * 用途见 docs/MIC_RECORD_DESIGN.md §7 诊断阶梯第 1 步：
+ *   flips ≈ 0 ⇒ 线上没人驱动（查接线）；flips 大量 ⇒ 模块在发，问题在模拟侧（麦克风/偏置）。*/
+void audio_out_capture_probe_line(uint32_t n)
+{
+    uint32_t hi = 0u, flips = 0u, prev = 2u;   /* prev=2 = "尚无前值" */
+
+    for (uint32_t i = 0u; i < n; ++i)
+    {
+        uint32_t b = (GPIOC->IDR >> 2u) & 1u;
+
+        if (b != 0u) { hi++; }
+        if ((prev <= 1u) && (b != prev)) { flips++; }
+        prev = b;
+    }
+    g_cap_line_n     += n;
+    g_cap_line_hi    += hi;
+    g_cap_line_flips += flips;
 }
 
 int audio_out_capture_start(void)
@@ -1337,7 +1401,7 @@ int audio_out_demo_start(void)
     s_demo_acc  = 0u;
     s_demo_done = 0u;
     audio_out_set_feeder(demo_feeder);
-    audio_out_set_volume((uint8_t)g_audio_volume);
+    audio_out_set_volume((uint8_t)es8311_ui_volume_effective());
     return audio_out_start();
 }
 
@@ -1364,9 +1428,42 @@ void audio_out_set_volume(uint8_t vol0_100)
      *   见 s_vol_ramp_left 分支）⇒ 本函数不再需要"替起播预热音量"。
      *   播放中拖着滑杆调音量仍会直写 REG32（即时可听），行为不变。
      * ⚠ 不写 ≠ 丢掉：g_audio_volume 才是权威值，ramp 与 es8311_dac_readback() 都读它。 */
+    /* ★★ 2026-10-17（补丁22）：**暂停淡出期间绝不写 REG32**。★★
+     *
+     * 【这就是用户报的"点暂停/播放偶发突然变得很大声"的根因】
+     *   补丁15 起 audio_out_pause() 是**异步淡出**：函数返回时 `g_ao_playing` **仍是 1**，
+     *   要等 ≥ AO_PAUSE_MIN_RAMP_MS(300 ms)、由 tick 收尾后才归零。
+     *   而 wav_play_resume() 在 audio_out_start() **之前**就先调本函数（wav_play.c），
+     *   补丁16 的守卫只查 `g_ao_playing != 0` ⇒ **淡出期间它仍然为真** ⇒ 这一笔把 REG32
+     *   **一步写成满音量**（UI 51 ⇒ 0x61），而此刻 I2S 传输还在跑、DAC 还在出声
+     *   ⇒ 喇叭立刻以满音量出声，直到下一拍 ramp 把它拉回 target/8 ⇒ 一声响亮的突兀爆音
+     *   （先炸一下、再轻、再爬升 —— 正是"音量不正确，突然变得很大声"）。
+     *   ⚠ 补丁21 把淡出窗口从 192 ms 拉长到 ≥300 ms，**正好把"下一次点击落在淡出窗口内"
+     *     的概率放大** ⇒ 用户觉得"还是有、更频繁了"。这不是补丁21 引入的新 bug，
+     *     而是它把原本 192 ms 的既有窗口变宽、让既有缺陷更容易被踩到。
+     *
+     * 【修法】淡出期间音量一律交给 tick 的 ramp：续播走幂等分支时会重挂
+     *   `s_vol_ramp_left = AO_VOL_RAMP_STEPS`，从当前低音量**平滑**爬升到 g_audio_volume。
+     *   ⇒ 本函数在淡出期间直接返回，一笔都不写。
+     *   淡出期间拖滑杆同样应被忽略（那时正在往静音走，且续播 ramp 会按最新值爬升）。
+     * ⚠ 不写 ≠ 丢掉：g_audio_volume 仍是权威值，ramp 与 readback 都读它。 */
+    if (s_pause_fade_ticks != 0u)
+    {
+        g_ao_vol_during_fade++;             /* 铁律10：这条分支被走到的直接证据 */
+        g_ao_vol_during_fade_val = (uint32_t)vol0_100;
+        if (g_ao_vol_guard_en != 0u)
+        {
+            return;                         /* 守卫开：淡出期间不写，交给 ramp 平滑处理 */
+        }
+        /* 守卫关（A/B 复现旧行为）：继续往下写，用 g_ao_vol_fade_wrote 量化后果。 */
+    }
     if (g_ao_playing != 0u)
     {
         (void)es8311_set_volume_ui((uint32_t)vol0_100);
+        if (s_pause_fade_ticks != 0u)
+        {
+            g_ao_vol_fade_wrote++;          /* 真的在淡出期间写了满音量 ⇒ 爆音风险成立 */
+        }
     }
 }
 
@@ -1671,7 +1768,7 @@ void audio_out_stop(void)
      *     的即时硬切 —— 见 es8311_dac_become_silent() 的函数头。）
      *   ⇒ 若在这里同步 `HAL_Delay(160)`：UI 会冻住 160 ms（用户直接摸到"卡"）。
      *   ⇒ 与「暂停」共用同一套延时收尾：本函数只负责**发起淡出**，真正停传输交给
-     *     audio_out_tick 在 AO_PAUSE_FADE_TICKS(12) 拍（≈192 ms）后做。
+     *     audio_out_tick：待静音确认后 ≥ AO_PAUSE_MIN_RAMP_MS(300 ms) 才切钟（见 tick 淡出分支）。
      *
      * 【对外语义的两点变化（已逐点核对影响面）】
      *   · 本函数返回时 `g_ao_playing` 仍为 1，约 192 ms 后才变 0。
@@ -1690,8 +1787,17 @@ void audio_out_stop(void)
     g_ao_dac_ramp     = 0u;
     g_ao_stop_calls++;
 
-    (void)es8311_dac_become_silent();   /* 平滑淡出的第一步：REG32 → 0（不写 REG31）*/
-    s_pause_fade_ticks = (uint8_t)AO_PAUSE_FADE_TICKS;
+    /* 平滑淡出的第一步：REG32 → 0（不写 REG31）。★ 补丁21：捕获返回值，把静音落地
+     * 时刻记进 s_mute_t0；没确认就留 0，tick 里继续重试（见 tick 淡出分支）。
+     * ⚠ 不再用固定 12 拍倒计时 —— 时间基准从"静音真正落地"起算并带余量，否则 I2C
+     * 首试 NACK 把静音那笔推后几十~一百多 ms 时，HW 软 ramp 没跑满就被切钟 ⇒ 偶发爆音。 */
+    {
+        int rc = es8311_dac_become_silent();
+        if (rc != 0) g_ao_silent_fail++;
+        s_mute_t0 = (rc == 0) ? HAL_GetTick() : 0u;
+    }
+    s_pause_start_t0   = HAL_GetTick();
+    s_pause_fade_ticks = 1u;            /* 进入淡出态（取代原 12 拍倒计时）*/
 
     /* ⚠ 这里**不做**任何"立刻停"的动作：传输/A 时钟/GPIO 的收尾全部在 tick 里
      *   （ao_pause_stop_transport）。也**不调** es8311_stop_dac()：理由见下方注释。 */
@@ -1769,6 +1875,12 @@ void audio_out_pause(void)
     }
     g_ao_pause_calls++;                 /* ★ 动作级计数：本次暂停真的执行了 */
 
+    /* ★ 补丁21·Fix2：取消任何进行中的音量上 ramp。否则"淡出中途又点播放"留下的
+     *   s_vol_ramp_left>0 会在 tick 里把音量重新 ramp 回高音量，之后切钟时音量根本没静
+     *   ⇒ 一声 pop（确定性竞态，快速连点时必现）。 */
+    s_vol_ramp_left = 0u;
+    g_ao_dac_ramp   = 0u;
+
     /* ★ 修"暂停咔嗒"：先静音（REG32=0），此刻 I2S 传输**仍在跑**、数据**仍在流** ——
      *   ES8311 硬件软 ramp（REG37=0x48）会把音量平滑降向 -95.5 dB（≈0.655 ms/0.25 dB），
      *   不会爆音。等 HW 软 ramp 落静音后，再由 audio_out_tick 的 s_pause_fade_ticks
@@ -1786,15 +1898,22 @@ void audio_out_pause(void)
      *     窗口完全落在本次动作里，不受播放期后台流量影响）。 */
     {
         uint32_t n0 = g_es_reg32_n;
+        int      rc = es8311_dac_become_silent();
 
-        if (es8311_dac_become_silent() != 0)
+        if (rc != 0)
         {
             g_ao_silent_fail++;         /* 未能确认静音：这一刻有爆音风险（量化，不掩盖）*/
         }
         g_ao_pause_volwr += (g_es_reg32_n - n0);
+        /* ★ 补丁21·Fix1：把静音落地的时刻记进 s_mute_t0；没确认就留 0，tick 的淡出分支
+         *   会从此刻起算 ≥ AO_PAUSE_MIN_RAMP_MS 才切钟，而不是从"暂停调用时刻"算固定的
+         *   12 拍 —— 这样无论静音那笔因 I2C 重试晚落地多少，HW 软 ramp 都跑满，杜绝
+         *   "某一次"的偶发 pop。 */
+        s_mute_t0 = (rc == 0) ? HAL_GetTick() : 0u;
     }
-    s_dac_rb_pending = 0u;              /* 取消起播后的"音量确认期"，别回头把音量写回去 */
-    s_pause_fade_ticks = (uint8_t)AO_PAUSE_FADE_TICKS;  /* 延几拍再停传输 */
+    s_dac_rb_pending  = 0u;             /* 取消起播后的"音量确认期"，别回头把音量写回去 */
+    s_pause_start_t0  = HAL_GetTick();  /* 暂停发起时刻（硬上限起点）*/
+    s_pause_fade_ticks = 1u;            /* 进入淡出态（取代原 12 拍倒计时）*/
 }
 
 int audio_out_playing(void)
@@ -1872,13 +1991,41 @@ void audio_out_tick(void)
     }
 
     /* ---- 暂停淡出：REG32 已被写成 0（HW 软 ramp 正在把音量降向 -95.5 dB），
-     *   等 AO_PAUSE_FADE_TICKS 拍、音量基本落静音后再停传输 —— 切断 I2S 时钟时 DAC
+     *   等 ≥ AO_PAUSE_MIN_RAMP_MS(300 ms)（自静音确认起算）、音量基本落静音后再停传输 —— 切断 I2S 时钟时 DAC
      *   已静音，不会爆音（见 audio_out_pause 顶部说明）。
      *   ⚠ 淡出期间**不 return**：仍让下方逻辑照常补数、DAC 继续出（渐弱）的声音，
      *   直到淡出走完才真正停传输。 */
     if (s_pause_fade_ticks != 0u)
     {
-        if (--s_pause_fade_ticks == 0u)
+        uint32_t now = HAL_GetTick();
+
+        /* ★ 补丁21·Fix1：淡出计时从"静音真正落地"起算，而不是从暂停/停止发起起算。
+         *   - 静音尚未确认（s_mute_t0==0）：每拍继续重试静音，直到落地（g_ao_mute_retry++）；
+         *   - 静音已确认：从确认时刻起 ≥ AO_PAUSE_MIN_RAMP_MS 才切 I2S 时钟，确保 HW 软 ramp
+         *     把音量降到听感静音，不会爆音；
+         *   - 静音始终没确认：硬上限 AO_PAUSE_HARD_CAP_MS 到点也必须切，防 I2C 死锁
+         *     （此时有爆音风险，但比永远不切钟、链路卡死好；用 g_ao_fade_hardcap 量化）。 */
+        if (s_mute_t0 == 0u)
+        {
+            if (es8311_dac_become_silent() == 0)
+            {
+                s_mute_t0 = now;
+                g_ao_mute_retry++;
+            }
+        }
+        int cut = 0;
+        if ((s_mute_t0 != 0u) && ((now - s_mute_t0) >= AO_PAUSE_MIN_RAMP_MS))
+        {
+            cut = 1;
+            g_ao_fade_min++;
+        }
+        else if ((now - s_pause_start_t0) >= AO_PAUSE_HARD_CAP_MS)
+        {
+            cut = 1;
+            g_ao_fade_hardcap++;
+        }
+
+        if (cut != 0)
         {
             uint8_t was_stop = s_stop_after_fade;
 
@@ -1900,6 +2047,7 @@ void audio_out_tick(void)
             dbg_snapshot();
             return;                     /* 本拍不再喂数据 / 做别的事 */
         }
+        /* 淡出期间不 return：仍照常补数、DAC 继续出（渐弱）的声音 */
     }
 
     /* ---- ★ 补丁15：**补数块搬到这里（原来是本函数最后一步）** ----
@@ -2007,7 +2155,7 @@ void audio_out_tick(void)
     if (s_vol_ramp_left > 0u)
     {
         uint32_t step   = (uint32_t)(AO_VOL_RAMP_STEPS - s_vol_ramp_left) + 1u;
-        uint32_t target = g_audio_volume;
+        uint32_t target = es8311_ui_volume_effective();
 
         if (target > 100u)
         {

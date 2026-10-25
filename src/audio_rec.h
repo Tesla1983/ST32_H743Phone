@@ -42,6 +42,20 @@ extern volatile uint32_t g_rec_mic_gain;   /* REG16 模拟 PGA 增益（默认 0
 extern volatile uint32_t g_rec_max_ms;     /* 最长录音时长（默认 300000 = 5 分钟）*/
 extern volatile uint32_t g_rec_files;      /* 目录里已有的录音文件数（扫描结果）*/
 extern volatile uint32_t g_rec_peak_max;   /* 本次录音见过的最大峰值（0..32767）*/
+extern volatile uint32_t g_rec_level;      /* ★ 电平条输入值 0..100（dB 刻度，= BoardRec_Level()）*/
+extern volatile uint32_t g_rec_gain_req;   /* 写 1 ⇒ 录音中直接改 REG16 为 g_rec_gain_val（扫增益用）*/
+extern volatile uint32_t g_rec_gain_val;   /* 要写入 REG16 的值（本板：越小增益越大）*/
+/* ★ 补丁27：录音目录扫描的过程量（区分"没扫到"与"扫到了没显示"，SWD 直接读）*/
+extern volatile uint32_t g_rec_scan_req;      /* 写 1 ⇒ 主循环跑一次真实扫描（跑完清 0）*/
+extern volatile uint32_t g_rec_scan_mount_rc; /* fatfs_ensure_mounted() 返回（0 = 卷可用）*/
+extern volatile uint32_t g_rec_scan_rc;       /* 0 = f_opendir 成功，否则 0xFFFFFFFF */
+extern volatile uint32_t g_rec_scan_entries;  /* 目录条目数（含子目录）*/
+extern volatile uint32_t g_rec_scan_wav;      /* 认成 .WAV 的条目数 */
+extern volatile uint32_t g_rec_scan_bad;      /* WAV 头解析失败的条目数 */
+extern volatile uint32_t g_rec_scan_n;        /* 入表（卡片）数量 */
+extern volatile char     g_rec_scan_name[6][20]; /* 过滤前的头 6 个目录项名字 */
+extern volatile uint32_t g_rec_scan_attrib[6];   /* 同序 FAT 属性 */
+void audio_rec_scan_poll(void);               /* 主循环里调用：消费 g_rec_scan_req */
 extern volatile uint32_t g_rec_mic_thresh; /* 判"有麦克风信号"的峰值阈值（默认 128）*/
 /* ★ 停止时从**卡上文件**回读的 WAV 头 + 自检结果 —— "真的录成了一个能播的 WAV"的板上证据 */
 extern volatile uint32_t g_rec_hdr[11];    /* 前 44 字节（32 位小端；[0] 应为 0x46464952 = "RIFF"）*/
@@ -98,5 +112,29 @@ int         BoardRec_PlayName(char* out, int n);
 /* ★ 补丁18c：给 UI 的"失败原因"细分码（-1 回读不符 / -3 无器件 / -4 I2C 起不来 / 0 正常）*/
 int         BoardRec_EsRc(void);
 int         BoardRec_AdcRetry(void);
+
+/* ---- 文件管理器录音卡片（2026-10-16 补丁19）----
+ * 在 BoardRec_* 基础上再开一组"按索引枚举 / 播放 / 删除 / 重命名 / 分享"的接口，
+ * 让文件管理器把 /YMGUI/RECORD 里的录音当成卡片列出。
+ * ⚠ 与 BoardRec_PlayLast() 复用**同一个** wav_play 会话（一次只能放一个）。 */
+int         BoardRec_Count(void);                  /* 枚举到的录音条数 */
+int         BoardRec_ListName(int i, char* out, int n);  /* 第 i 条文件名（不含目录）*/
+int         BoardRec_ListPath(int i, char* out, int n);  /* 第 i 条完整路径（补丁29）*/
+int         BoardRec_ListSize(int i, uint32_t* size);    /* 字节数 */
+uint32_t    BoardRec_DurationMs(int i);             /* 时长（按 WAV 头 data 区折算；损坏=0）*/
+int         BoardRec_DateText(int i, char* out, int n);  /* "YYYY-MM-DD HH:MM"；无日期="无日期" */
+int         BoardRec_IsValid(int i);                /* 1 = WAV 头可解析（可播放）；0 = 损坏 */
+int         BoardRec_PlayIndex(void);               /* 当前在放/暂停的卡片下标；-1 = 无 */
+int         BoardRec_PlayList(int i);               /* 播放第 i 条；返回码同 wav_play_start */
+void        BoardRec_PlayStop(void);                /* 停当前播放 */
+int         BoardRec_PlayPause(void);
+int         BoardRec_PlayResume(void);
+int         BoardRec_PlayPaused(void);
+uint32_t    BoardRec_PlayElapsedMs(void);
+uint32_t    BoardRec_PlayTotalMs(void);
+int         BoardRec_PlaySeek(uint32_t ms);
+int         BoardRec_Delete(int i, int* next_valid);     /* 删第 i 条；成功写回 next_valid(-1=空) */
+int         BoardRec_Rename(int i, const char* newname);  /* 重命名；返回新下标 / <0 失败 */
+int         BoardRec_Share(int i);                      /* 复制到 /YMGUI/SHARE；0 = 成功 */
 
 #endif /* AUDIO_REC_H */

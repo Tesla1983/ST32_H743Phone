@@ -118,7 +118,7 @@ PHASE_NAME = {
 def snapshot():
     keys = ["g_cmd_tx", "g_cmd_rx", "g_cmd_xor_fail", "g_cmd_ping_ok",
             "g_cmd_weather_req", "g_cmd_weather_ack", "g_cmd_weather_ok",
-            "g_cmd_phase", "g_cmd_bd_pkts", "g_cmd_bd_len", "g_cmd_bd_crc_bad",
+            "g_cmd_phase", "g_cmd_reconn", "g_cmd_bd_pkts", "g_cmd_bd_len", "g_cmd_bd_crc_bad",
             "g_cmd_bd_timeout", "g_cmd_bd_toobig",
             "g_cmd_bd_want", "g_cmd_bd_got",
             "g_uart_rx_bytes", "g_net_wd_pkts"]
@@ -132,6 +132,7 @@ def show(tag, s):
     print("  g_cmd_tx       %-6d  已发出的命令帧" % s["g_cmd_tx"])
     print("  g_cmd_rx       %-6d  已收到的 $! 响应" % s["g_cmd_rx"])
     print("  g_cmd_ping_ok  %-6d  PING 握手成功" % s["g_cmd_ping_ok"])
+    print("  g_cmd_reconn   %-6d  30s 冻结超时→重连 IDLE 次数（补丁20）" % s["g_cmd_reconn"])
     print("  天气 req/ack/ok %d / %d / %d" % (s["g_cmd_weather_req"],
                                               s["g_cmd_weather_ack"],
                                               s["g_cmd_weather_ok"]))

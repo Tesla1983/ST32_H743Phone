@@ -133,6 +133,7 @@ volatile int      g_uart_st_temp, g_uart_st_code;
 /* ---- 命令通道诊断量（2026-10-09）---- */
 volatile uint32_t g_cmd_tx;
 volatile uint32_t g_cmd_rx;
+volatile uint32_t g_cmd_reconn;  /* 30 s 冻结超时后自动退回 IDLE 的次数（补丁20 重连锁存） */
 volatile uint32_t g_cmd_xor_fail;
 volatile uint32_t g_cmd_ping_ok;
 volatile uint32_t g_cmd_weather_req;
@@ -249,6 +250,7 @@ static uint32_t s_cmd_try;     /* 本阶段已尝试次数 */
 static uint32_t s_cmd_wd0;     /* 发 WEA 时的 $WD 计数，用来判断"真的等到了" */
 static uint32_t s_cmd_rd0;     /* 发 ?RD 时的 $RD 计数（无线电状态的同类判据） */
 static uint32_t s_radio_t0;    /* 上一次周期性重查 $?RD 的时基 */
+static uint32_t s_cmd_done_t0; /* CMD_PH_DONE 冻结（g_cmd_rx==0）时基，用于 30 s 自动重连 */
 
 /* ---- 无线电命令重试（2026-10-10）----
  *
@@ -1086,10 +1088,22 @@ static void cmd_tick(uint32_t now_ms)
 
     case CMD_PH_DONE:
         /* 空闲态：只负责"到点重扫一次逐城天气"。
-         * ⚠ g_cmd_rx == 0 说明**发送方向根本不通**（线没接/对端没在听），
-         *   这时还去问只会每 8 s 往线上吐一帧，既没用又占主循环 —— 直接不动。 */
+         * ⚠ g_cmd_rx == 0 说明**发送方向根本不通**（线没接/对端没在听/对端崩了）。
+         *   旧实现直接 break 永久冻结：对端恢复后本板也不重连，表现为"连不上就永远连不上"。
+         *   ⇒ 冻结满 30 s 自动退回 IDLE 重走握手（对端回来即自愈）。 */
         if (g_cmd_rx == 0u)
+        {
+            if (s_cmd_done_t0 == 0u)
+                s_cmd_done_t0 = now_ms;          /* 首次进入冻结态：起计时 */
+            else if (now_ms - s_cmd_done_t0 > 30000u)
+            {
+                s_cmd_done_t0 = 0u;
+                s_cmd_phase   = CMD_PH_IDLE;      /* 重走 IDLE→LINK→PING…（IDLE 会再等 2 s 让对端 ROM 乱码过去） */
+                g_cmd_reconn++;                  /* 落盘计数：证明"冻结→重连"分支真的被走到 */
+            }
             break;
+        }
+        s_cmd_done_t0 = 0u;   /* 有 RX ⇒ 正常空闲态，清冻结计时 */
         /* 周期性重查无线电状态（对端可能独立复位，或本板错过了某帧 $RD）。
          * 与 CMD_PH_RADIO 的开机首查互补：首查保证"快点拿到"，
          * 这里保证"长期不会失同步"。 */

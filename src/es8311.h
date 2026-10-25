@@ -131,6 +131,8 @@ int es8311_bus_ready(void);
  * @return 0 = 写完且回读确认（g_es_adc_on=1）；<0 = 有写失败或回读值不对
  */
 int es8311_adc_start(uint32_t mic_gain_reg);
+/* 录音中直接改 PGA 增益(REG16)，不必重起录音（扫增益用）。本板值越小增益越大。 */
+int es8311_adc_set_gain(uint32_t mic_gain_reg);
 /**
  * @brief  结束录音，把 codec 恢复成"DAC 静音起播"的干净状态（内部走 dac_path_regs(0x00)）
  * @return 0=OK；<0=有写失败
@@ -389,6 +391,21 @@ int es8311_set_volume(uint8_t vol);
  * 【谁调用】main.c 的音量持久化回调（控制中心音量滑杆松手时）与
  * es8311_start_dac()（开机/自检起播时把当前 UI 音量灌进 codec）。 */
 uint8_t es8311_volume_reg(uint32_t vol0_100);
+
+/* ---- 全局静音 + "有效音量"（2026-10-18 补丁32：控制中心「静音」瓦片）----
+ *
+ * 【为什么要有这个函数，而不是各处在用 g_audio_volume】
+ *   "把 UI 音量换算成 REG32" 的点一共有 7 处（起播、ramp 每拍、回读闭环目标值、
+ *   补写、wav 起播前三处）。静音只是"目标音量 = 0"，**不改用户的音量设定**；
+ *   若只在某一处拦，其它路径（尤其**回读闭环**与**起播 ramp**）会把 REG32 又写回
+ *   非零值 —— 表现为"点了静音还在响，或停了再播又开始响"。
+ *   ⇒ 所有需要"最终要写进芯片的音量"的地方一律调用本函数，不要直接读 g_audio_volume。
+ *
+ * g_audio_volume 是用户的音量设定（0..100，持久化）；g_audio_mute 是临时的静音开关。
+ * 本函数返回二者合成后的值：静音时恒 0。 */
+extern volatile uint32_t g_audio_volume;   /* 用户音量设定 0..100（main.c 定义）*/
+extern volatile uint32_t g_audio_mute;     /* 1 = 全局静音（main.c 定义）*/
+uint32_t es8311_ui_volume_effective(void);
 
 /**
  * @brief  按 UI 音量 0..100 写 REG32（越界先钳到 0..100）

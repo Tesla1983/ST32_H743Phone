@@ -45,8 +45,20 @@ static GYCTX context;
 static GYOBJ keyboard, query_label;
 static InputTarget *inputs, *active;
 static GYrect original_area;
-static Key keys[48], candidates[5], candidate_prev, candidate_next;
-static Key symbol_categories[7], symbol_keys[15], symbol_backspace;
+/* ⚠ 键盘 / 候选 / 符号这一大组 Key 结构**搬出 DTCM → SRAM2（.bss_sram2）**。
+ * 【为什么非搬不可】linker 里 `_heap0_start=_sbrk_end`、`_heap0_end=_estack−32KB`
+ *   ⇒ **DTCM 的 .bss 与 heap0 抢同一块内存**：.bss 多一字节，heap0 就少一字节。
+ *   而 phone_shell 开机就用 PhoneApps_Create 把所有 App 的 create() 跑一遍，
+ *   478 次分配把 35 KB 的 heap0 **用到 100% 满**（2026-10-18 白屏事故：
+ *   加 3 个按钮 ⇒ heap0 只剩 192 B ⇒ HardFault，主循环一次都没跑完）。
+ *   这一组（48+5+2+7+15+1 个 × 104 B ≈ **8 KB**）是 DTCM 里最大的**非热路径**数据：
+ *   键盘/候选/符号都是**人手速度**的交互，搬到 AXI SRAM2 对体验无影响，
+ *   却能让 heap0 多出约 8 KB 余量。
+ * ⚠ 反例（不要搬）：DMA 缓冲、音频环形缓冲、高频渲染缓冲 —— 那些必须留在
+ *   DTCM 或非缓存的 SRAM1（见 audio_out.c 的 AUDIO_BUF_ATTR 说明）。 */
+#define IME_KEYS_ATTR __attribute__((section(".bss_sram2"), aligned(8)))
+static Key IME_KEYS_ATTR keys[48], candidates[5], candidate_prev, candidate_next;
+static Key IME_KEYS_ATTR symbol_categories[7], symbol_keys[15], symbol_backspace;
 static int symbol_panel, symbol_category, symbol_page;
 static int key_count, visible, symbols, upper, bypass, page_start, page_count;
 

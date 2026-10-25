@@ -348,10 +348,37 @@ void PhoneUI_icon_draw(GYSURFACE surface, uint8 icon, int cx, int cy, GYcolor ti
 	}
 	else if (icon == ICON_FILES)
 	{
-		GYrect folder = {cx - 15, cy - 7, 30, 21};
-		PhoneUI_rounded(surface, &folder, white, 3, 255);
-		folder = (GYrect){cx - 15, cy - 13, 13, 10};
-		PhoneUI_rounded(surface, &folder, white, 2, 255);
+		/* Windows 风格扁平文件夹：黄色"手册式"（manila folder）。
+		 * 造型 = 后片（含左上标签）+ 压在上面的前盖，两档黄色拉开层次；
+		 * 纯色块、无描边无渐变 —— 与 ICON_FILE（文件）共用同一 30×28 画布和 2px 圆角
+		 * ⇒ 两者尺寸、对齐、视觉重量一致（列表里并排不会一高一矮）。 */
+		GYcolor back  = RGB(233, 174, 56);   /* 后片 + 标签：深一档的黄 */
+		GYcolor front = RGB(253, 212, 96);   /* 前盖：亮一档的黄 */
+		GYrect tab  = {cx - 15, cy - 13, 14, 7};    /* 左上标签 */
+		GYrect body = {cx - 15, cy - 7, 30, 20};    /* 后片 */
+		GYrect flap = {cx - 13, cy - 3, 26, 15};    /* 前盖 */
+
+		PhoneUI_rounded(surface, &tab, back, 2, GY_OPA_COVER);
+		PhoneUI_rounded(surface, &body, back, 2, GY_OPA_COVER);
+		PhoneUI_rounded(surface, &flap, front, 2, GY_OPA_COVER);
+	}
+	else if (icon == ICON_FILE)
+	{
+		/* Windows 风格扁平文档：白纸 + 右上折角 + 三行灰线。
+		 * 与 ICON_FILES 同画布、同圆角、同垂直中心 ⇒ 与文件夹图标并排时尺寸/对齐一致。 */
+		GYcolor paper = RGB(240, 244, 248);
+		GYcolor fold  = RGB(196, 208, 221);
+		GYcolor line  = RGB(150, 166, 182);
+		GYrect sheet  = {cx - 10, cy - 14, 20, 28};
+		GYrect corner = {cx + 3, cy - 14, 7, 7};
+
+		PhoneUI_rounded(surface, &sheet, paper, 2, GY_OPA_COVER);
+		PhoneUI_rounded(surface, &corner, fold, 2, GY_OPA_COVER);
+		for (int i = 0; i < 3; ++i)
+		{
+			GYrect l = {cx - 6, cy - 5 + i * 6, 12, 2};
+			YMGUI_Draw_Fill(surface, &l, line, GY_OPA_COVER);
+		}
 	}
 	else if (icon == ICON_GYROSCOPE)
 	{
@@ -748,7 +775,10 @@ GYOBJ PhoneUI_app_text(GYOBJ parent, int x, int y, int w, int h, const char* val
 	GYOBJ obj = YMGUI_Creat_TextView_Creat(parent, x, y, w, h);
 	YMGUI_TextView_SetWrap(obj, 1);
 	YMGUI_TextView_SetLineHeight(obj, 24);
-	YMGUI_TextView_SetTextColor(obj, RGB(234, 238, 247));
+	/* ⚠ 2026-10-18 修：原色 RGB(234,238,247) 是给**深色面板**用的近白色，
+	 *   而这里的父容器是 app view（浅色 PAPER=RGB(246,247,251)）⇒ 白底白字、
+	 *   说明区看起来一片空白（"内容没渲染出来"的假象）。改用正文灰。 */
+	YMGUI_TextView_SetTextColor(obj, RGB(86, 94, 106));
 	YMGUI_TextView_SetText(obj, value);
 	return obj;
 }

@@ -57,13 +57,49 @@ volatile uint32_t g_rec_bigblk_ms  = 0u;
 volatile uint32_t g_rec_pending    = 0u;
 volatile uint32_t g_rec_test       = 0u;
 volatile uint32_t g_rec_mono       = 0u;
-volatile uint32_t g_rec_mic_gain   = 0x24u;    /* 与官方 esp_codec_dev 的默认值一致 */
+/* ★ 模拟 PGA 增益(REG16)：**保留官方 0x24** —— 这是 2026-10-17 现场扫出来的结论。
+ * 【扫法】录音**中途**用 g_rec_gain_req/g_rec_gain_val 逐档改 REG16，
+ *   同一段连续语音、同一次录音内对比（峰值取自 g_rec_peak_max，改档即清零）。
+ * 【实测（用户在旁持续说话）】
+ *   0x24 → 峰值 26839（-1.7 dBFS）电平 49%，**不削顶** ← 最佳
+ *   0x18 → 峰值   977（很低）
+ *   0x0C → 峰值     0（完全没信号）
+ *   0x06 → 峰值 32599，**削顶**
+ * ⚠⚠ 结论：**本板 REG16 不是单调的**，也不是简单的"值越小增益越大"。
+ *   早期一轮（逐档停录/起录、且当时测得的多是毛刺）曾得出"越小越大、0x06 最好"，
+ *   用同语音对比法**证伪**了 —— 0x0C/0x18 反而几乎没信号，0x06 直接削顶。
+ *   ⇒ 别拿"单调增益"的直觉去调这个值；要调就用本文件说的同语音扫法重扫。
+ * ⚠ 26839 已经偏热（余量约 1.7 dB）：大声说话仍有削顶风险，但可选的几档里 0x24 最好。 */
+volatile uint32_t g_rec_mic_gain   = 0x24u;
 volatile uint32_t g_rec_max_ms     = 300000u;  /* 5 分钟上限（防止忘关把卡写满）*/
 volatile uint32_t g_rec_files      = 0u;
 /* ★ 麦克风"到底有没有信号"的判据量。为什么要它：DOUT 没接线时链路**照常跑通**
  *   （DMA 搬、文件生成、进度条走），唯一区别是采到的是悬空电平、峰值极小。
  *   没有这个量，UI 就只能显示"录音中"而实际是空的 —— 那正是本项目最忌讳的假数据。 */
 volatile uint32_t g_rec_peak_max   = 0u;       /* 本次录音见过的最大峰值（0..32767）*/
+volatile uint32_t g_rec_level      = 0u;       /* ★ 电平条的输入值 0..100（dB 刻度；= BoardRec_Level() 的返回值）*/
+volatile uint32_t g_rec_gain_req   = 0u;       /* 写 1 ⇒ 录音中直接把 REG16 改成 g_rec_gain_val（扫增益用）*/
+volatile uint32_t g_rec_gain_val   = 0x24u;    /* 要写入 REG16 的值（扫增益用，默认与 mic_gain 同步）*/
+
+/* ★ 补丁27：录音目录扫描的过程量 + SWD 钩子（见 audio_rec_scan_poll）。
+ *   为什么需要：文件管理器「录音」分类列不出卡上的 REC_xxxx.WAV，可能有两种完全不同的原因
+ *     ① 扫描本身没扫到（卷没挂载 / 目录打不开）② 扫到了但 UI 没画出来。
+ *   这两种靠看屏幕分不清，按铁律必须**直接计数**。 */
+volatile uint32_t g_rec_scan_req      = 0u;    /* 写 1 ⇒ 主循环跑一次真实扫描，跑完自动清 0 */
+volatile uint32_t g_rec_scan_mount_rc = 0u;    /* fatfs_ensure_mounted() 的返回（0 = 卷可用）*/
+volatile uint32_t g_rec_scan_rc       = 0u;    /* 0 = f_opendir 成功；0xFFFFFFFF = 打开失败 */
+volatile uint32_t g_rec_scan_entries  = 0u;    /* 目录里遍历到的条目数（含子目录）*/
+volatile uint32_t g_rec_scan_wav      = 0u;    /* 认成 .WAV 的条目数 */
+volatile uint32_t g_rec_scan_bad      = 0u;    /* WAV 头解析失败（显示"损坏"）的条目数 */
+volatile uint32_t g_rec_scan_n        = 0u;    /* 最终入表（= 卡片）数量 */
+volatile char     g_rec_scan_name[6][20];      /* 过滤前的头 6 个目录项名字（原样）*/
+volatile uint32_t g_rec_scan_attrib[6];        /* 与上面同序的 FAT 属性（0x10=目录）*/
+
+/* 前置声明：电平换算要在 audio_rec_tick() 里用（定义在文件后面的 BoardRec_Level 附近）。
+ * ⚠ 为什么把电平算在**引擎**里而不是只等在 App 调 BoardRec_Level() 时才算：
+ *   App 的 tick 只在 state.active 时才会问，而 SWD 钩子（g_rec_test=1）起的录音
+ *   根本不过 App ⇒ 那样电平量恒为 0、无法验收（铁律10：要看得到才叫修好）。 */
+static int level_from_peak_db(uint32_t pk);
 volatile uint32_t g_rec_mic_thresh = 128u;     /* 判"有麦克风信号"的峰值阈值（≈ -48 dBFS）*/
 /* ★ 停止时把**卡上文件**的 WAV 头回读进 RAM 并自检 —— 让"到底写没写成一个能播的 WAV"
  *   变成可验证的事实，而不是"我写了所以应该对"。主机读不到 TF 卡，只能这样把它带出来。
@@ -119,6 +155,29 @@ static uint32_t s_adc_left  = 0u;
  *   有它，主循环就能替钩子把重试驱动完（判据用 g_rec_pending，重试自然结束）。 */
 static uint8_t  s_auto_retry = 0u;
 static uint8_t  s_opened   = 0u;
+
+/* ---- 文件管理器录音卡片：目录枚举表（2026-10-16 补丁19）----
+ * 与 rec_scan_max_index() 不同：后者只为「试听最近一段」找最大编号；这里把
+ * /YMGUI/RECORD 里**所有 .WAV** 枚举成一张表，供文件管理器按卡片列出
+ * （名称 / 大小 / 时长 / 录制日期 / WAV 头有效性）。
+ * ⚠ 大数组放 SRAM2（REC_BUF_ATTR，NOLOAD 零初始化）：7 KB 的表若进 DTCM 的 .bss
+ *   会直接吃光 heap0 余量（当前仅 ~1.2 KB），开机即 HardFault —— 与 s_chunk 同款铁律。 */
+#define REC_LIST_MAX 64
+typedef struct
+{
+	char     name[32];      /* 含扩展名的文件名（REC_0001.WAV 或重命名后的名字）*/
+	char     path[48];
+	uint32_t size;          /* 文件总字节 */
+	uint32_t dur_ms;        /* 时长（按 WAV 头 data 区折算；损坏/无效 = 0）*/
+	uint16_t fdate;         /* FATFs fdate（年/月/日，详见 rec_date_text）*/
+	uint16_t ftime;         /* FATFs ftime（时/分/秒）*/
+	uint8_t  valid;         /* 1 = WAV 头解析成功（可播放）*/
+	uint8_t  bad;           /* 损坏原因位图（valid==0 时有效；便于 UI 说清哪坏）*/
+} rec_list_entry_t;
+static rec_list_entry_t REC_BUF_ATTR s_rec_list[REC_LIST_MAX];
+static int  s_rec_list_n   = 0;
+static int  s_rec_scan_rc  = 0;
+static int  s_rec_play_idx = -1;   /* 文件管理器当前在放/暂停的卡片下标（复用 wav_play 会话）*/
 
 /* ====================== 纯函数：WAV 头 ======================
  * 只依赖入参、无副作用 ⇒ 可单独复算与验证（本项目要求"换算写成纯函数"）。
@@ -182,6 +241,204 @@ static uint32_t rec_scan_max_index(void)
     (void)f_closedir(&d);
     g_rec_files = cnt;
     return maxv;
+}
+
+/* 文件管理器：把目录里**所有 .WAV** 枚举成 s_rec_list[]，并解析每份的 WAV 头。
+ * 这是「列出录音卡片」唯一的数据来源；与 rec_scan_max_index() 互不干扰
+ * （后者只给「试听最近一段」用，仍按 REC_ 前缀取最大编号）。 */
+static int rec_list_build(void)
+{
+	DIR     d;
+	FILINFO fi;
+	int     n       = 0;
+	int     entries = 0;
+	int     n_wav   = 0;
+	int     n_bad   = 0;
+
+	s_rec_scan_rc = 0;
+
+	/* ★★ 补丁27：必须先确保卷已挂载。★★
+	 *   直接 f_opendir 在"卷还没工作区"时返回 FR_NOT_ENABLED(12) ⇒ 本函数
+	 *   返回 -1 ⇒ 文件管理器把录音分类画成"暂无录音文件"。
+	 *   这正是 img_store.c:1805 在 2026-10-09 踩过并写成注释的同一个坑
+	 *   （照片/笔记分类因此一直正常，而录音分类**独独**没有这一步）。
+	 *   触发条件很日常：开机后**没先开过音乐/相册**，直接进「文件管理 → 录音」
+	 *   —— 此时 FATFS 从未被挂载，卡上明明有 REC_xxxx.WAV 也列不出来。 */
+	{
+		int mrc = fatfs_ensure_mounted();
+		g_rec_scan_mount_rc = (uint32_t)mrc;
+		if (mrc != 0)
+		{
+			s_rec_scan_rc = -2;
+			s_rec_list_n  = 0;
+			g_rec_scan_rc = 0xFFFFFFFEu;
+			g_rec_scan_n  = 0u;
+			return -2;
+		}
+	}
+
+	/* 目录不存在时也建一下（与 img_scan_mkdir 的父目录规则一致：f_mkdir 不级联）。
+	 * 建不出来不算错 —— 后面 f_opendir 会如实返回失败。 */
+	{
+		char parent[16] = "/YMGUI";
+		(void)f_mkdir(parent);
+		(void)f_mkdir(REC_DIR);
+	}
+
+	if (f_opendir(&d, REC_DIR) != FR_OK)
+	{
+		s_rec_scan_rc = -1;
+		s_rec_list_n  = 0;
+		g_rec_scan_rc = 0xFFFFFFFFu;      /* f_opendir 失败（FRESULT 见 s_rec_scan_rc）*/
+		g_rec_scan_n  = 0u;
+		return -1;
+	}
+	g_rec_scan_rc = 0u;
+	for (;;)
+	{
+		if (f_readdir(&d, &fi) != FR_OK) { break; }
+		if (fi.fname[0] == 0)            { break; }
+		entries++;
+		if ((fi.fattrib & AM_DIR) != 0u) { continue; }
+
+		/* ★ 补丁27：把**过滤之前**的前 6 个名字原样带出来。
+		 *   本轮实测：目录 75 个条目、f_opendir 成功，却一个都没认成 .WAV
+		 *   ⇒ 必须看清真实文件名/属性，而不是继续猜。 */
+		if (entries <= 6)
+		{
+			(void)snprintf((char*)g_rec_scan_name[entries - 1],
+			               sizeof(g_rec_scan_name[0]), "%s", fi.fname);
+			g_rec_scan_attrib[entries - 1] = (uint32_t)fi.fattrib;
+		}
+
+		/* 只收 .WAV（不区分大小写）；其余文件（临时/碎片）不进卡片列表。
+		 *
+		 * ★★ 补丁27：修掉"卡上所有录音都不显示"的真根因 ★★
+		 *   旧代码取的是**末 4 个字符**，却拿它去比 "WAVE"：
+		 *       名字 REC_0001.WAV 的末 4 字符 = '.', 'W', 'A', 'V'
+		 *       ⇒ e3='.' 永远 ≠ 'W'，e0='V' 永远 ≠ 'E' ⇒ is_wav 恒为 0
+		 *   ⇒ 目录里每一个 .WAV 都被 continue 掉，文件管理器「录音」分类永远是
+		 *     "暂无录音文件"。只有叫 *.wave 的文件才碰巧通过（本板不会产生）。
+		 *   板上实测证据（补丁27 的 SWD 扫描钩子）：
+		 *       mount_rc=0、f_opendir=成功、目录条目=75、**认成 .WAV = 0**
+		 *       —— 文件名原样读出来是 REC_0001.WAV（属性 0x20 普通文件）。
+		 *   现按"末 4 字符 == .WAV（点+WAV）"判，与 img_store 的 ext_match 同一口径。 */
+		{
+			int len = 0;
+			while (fi.fname[len] != 0) { ++len; }
+			if (len < 4) { continue; }
+			{
+				char e3 = fi.fname[len - 4], e2 = fi.fname[len - 3],
+				     e1 = fi.fname[len - 2], e0 = fi.fname[len - 1];
+				int is_wav = (e3 == '.') &&
+				             (e2 == 'W' || e2 == 'w') &&
+				             (e1 == 'A' || e1 == 'a') &&
+				             (e0 == 'V' || e0 == 'v');
+				if (!is_wav) { continue; }
+			}
+		}
+		n_wav++;
+
+		/* ★ 补丁27：表满时的处理。
+		 *   旧代码是 `if (n >= REC_LIST_MAX) break;` —— 目录里按创建顺序排，
+		 *   于是**保留最旧的 64 个、把最新的丢掉** ⇒ 录到第 65 段以后，
+		 *   文件管理器里"新录音永远不出现"（正是用户报的"找不到录音文件"的另一半）。
+		 *   改为：丢掉最旧的一条，把新的放到末尾 —— 始终显示**最新**的 64 条。 */
+		if (n >= REC_LIST_MAX)
+		{
+			memmove(&s_rec_list[0], &s_rec_list[1],
+			        sizeof(s_rec_list[0]) * (size_t)(REC_LIST_MAX - 1));
+			n = REC_LIST_MAX - 1;
+		}
+
+		rec_list_entry_t* e = &s_rec_list[n];
+		(void)snprintf(e->name, sizeof(e->name), "%s", fi.fname);
+		(void)snprintf(e->path, sizeof(e->path), "%s/%s", REC_DIR, fi.fname);
+		e->size  = fi.fsize;
+		e->fdate = fi.fdate;
+		e->ftime = fi.ftime;
+		e->valid = 0u;
+		e->bad   = 0u;
+		e->dur_ms = 0u;
+
+		/* 解析 WAV 头（只读前 44 字节）：RIFF/WAVE/fmt/PCM + 采样率/声道/位深/data 长 */
+		{
+			FIL   vf;
+			UINT  br = 0u;
+			uint8_t h[44];
+			if (f_open(&vf, e->path, FA_READ) == FR_OK)
+			{
+				if ((f_read(&vf, h, 44u, &br) == FR_OK) && (br == 44u) &&
+				    h[0] == 'R' && h[1] == 'I' && h[2] == 'F' && h[3] == 'F' &&
+				    h[8] == 'W' && h[9] == 'A' && h[10] == 'V' && h[11] == 'E' &&
+				    h[12] == 'f' && h[13] == 'm' && h[14] == 't' && h[15] == ' ' &&
+				    h[20] == 1u)
+				{
+					uint32_t rate = (uint32_t)h[24] | ((uint32_t)h[25] << 8) |
+					                ((uint32_t)h[26] << 16) | ((uint32_t)h[27] << 24);
+					uint16_t ch   = (uint16_t)((uint16_t)h[22] | ((uint16_t)h[23] << 8));
+					uint16_t bits = (uint16_t)((uint16_t)h[34] | ((uint16_t)h[35] << 8));
+					uint32_t datalen = (uint32_t)h[40] | ((uint32_t)h[41] << 8) |
+					                   ((uint32_t)h[42] << 16) | ((uint32_t)h[43] << 24);
+					if (rate > 0u && ch > 0u && bits >= 8u)
+					{
+						uint32_t bps = (uint32_t)ch * ((uint32_t)bits / 8u);
+						e->dur_ms = (uint32_t)((uint64_t)datalen * 1000u /
+						                     ((uint64_t)rate * (uint64_t)bps));
+						e->valid = 1u;
+					}
+					else { e->bad |= 1u; }      /* 头里有 0 率/0 声道/位数过低 */
+				}
+				else if (br != 44u) { e->bad |= 2u; }   /* 头读不全 */
+				else                { e->bad |= 4u; }   /* 不是合法 RIFF/PCM WAV */
+				(void)f_close(&vf);
+			}
+			else { e->bad |= 8u; }                 /* 打不开（卡卸了/文件坏了）*/
+		}
+		if (e->valid == 0u) { n_bad += 1; }
+		++n;
+	}
+	(void)f_closedir(&d);
+	s_rec_list_n = n;
+
+	/* 过程量落 RAM：SWD 可直接读，用于区分"没扫到"和"扫到了没显示" */
+	g_rec_scan_entries = (uint32_t)entries;
+	g_rec_scan_wav     = (uint32_t)n_wav;
+	g_rec_scan_bad     = (uint32_t)n_bad;
+	g_rec_scan_n       = (uint32_t)n;
+	return n;
+}
+
+/* ★ SWD 钩子（补丁27）：写 g_rec_scan_req=1 ⇒ 主循环里跑一次真实的目录扫描，
+ *   把 FRESULT/目录项数/.WAV 数/入表数/前 4 个文件名留在 RAM。
+ *   为什么需要它：录音分类"列不出文件"有两种完全不同的原因（扫不到 / 扫到了没画出来），
+ *   靠肉眼看屏幕分不清；按本项目铁律，分支必须**直接计数**而不是拿别的现象反推。 */
+void audio_rec_scan_poll(void)
+{
+	if (g_rec_scan_req == 0u) { return; }
+	g_rec_scan_req = 0u;
+	(void)rec_list_build();
+}
+
+/* FATFs fdate 折算成「YYYY-MM-DD HH:MM」；年 < 2020（没 RTC / NORTC 默认 1980）视为无日期，
+ * 不让假日期混进卡片（本项目假数据零容忍）。 */
+static void rec_date_text(const rec_list_entry_t* e, char* out, int n)
+{
+	uint16_t fd = e->fdate;
+	uint16_t ft = e->ftime;
+	int year = (int)(fd >> 9) + 1980;
+	int mon  = (int)((fd >> 5) & 0x0F);
+	int day  = (int)(fd & 0x1F);
+	int hh   = (int)((ft >> 11) & 0x1F);
+	int mm   = (int)((ft >> 5) & 0x3F);
+
+	if (fd == 0u || year < 2020)
+	{
+		(void)snprintf(out, (size_t)n, "无日期");
+		return;
+	}
+	(void)snprintf(out, (size_t)n, "%04d-%02d-%02d %02d:%02d",
+	               year, mon, day, hh, mm);
 }
 
 /* 把一个 chunk 写进文件（立体声直存 / 单声道取左）。返回 0 = 成功。 */
@@ -333,6 +590,13 @@ int audio_rec_start(void)
     }
     s_adc_left    = 0u;                      /* 成功 ⇒ 额度清零 */
     g_rec_pending = 0u;
+    /* ★ 每次起录都把"本次录音见过的最大峰值"清零 —— 它的注释就是这么写的，
+     * 但**从来没有清零过**（跨录音单调累加）⇒ 两个后果：
+     *   ① 名字叫"本次录音"、实际是"开机以来"，读到的是历史最大值（假数据）；
+     *   ② BoardRec_MicOk() 拿它判"有没有麦克风信号" ⇒ 一旦历史上响过一次就**永久为真**，
+     *      以后真没麦克风了它也不报（本项目最忌的"看不出来的坏状态"）。
+     * ⇒ 起录清零后，它才是真的"本次录音"，扫增益时也能逐档比较。 */
+    g_rec_peak_max = 0u;
 
     /* ---- ③ 文件：目录 + 命名 + 占位 WAV 头 ---- */
     if (fatfs_ensure_mounted() != 0)
@@ -614,11 +878,46 @@ int audio_rec_poll(void)
 
     rec_drain();
 
-    /* 维护"见过多大峰值" —— UI 的"有没有麦克风信号"就靠它判（见 g_rec_peak_max 说明）。*/
+    /* ★ 在线改增益钩子：录音中直接改 REG16，**不重起录音**。
+     *   改完顺手把 g_rec_peak_max 清零 ⇒ 它变成"本档增益下见过的最大峰值"，
+     *   扫增益时逐档可比（不清零的话它是跨录音累加的单调最大值，没法按档比较）。 */
+    if (g_rec_gain_req != 0u)
     {
-        uint32_t pk = (g_cap_peak_l > g_cap_peak_r) ? g_cap_peak_l : g_cap_peak_r;
+        g_rec_gain_req = 0u;
+        (void)es8311_adc_set_gain(g_rec_gain_val);
+        g_rec_peak_max = 0u;        /* 重开测量窗 */
+    }
+
+    /* ★ 麦克风硬件诊断钩子（docs/MIC_RECORD_DESIGN.md §7 阶梯第 1 步）。
+     * 写 g_cap_line_req = N ⇒ 本拍录音时连续采样 N 次 PC2（模块 DOUT）的电平。
+     * ⚠ 放在 rec_drain() 之后：这时 I2S2 主收已在跑、模块正在往线上发数据。 */
+    if (g_cap_line_req != 0u)
+    {
+        uint32_t n = g_cap_line_req;
+
+        g_cap_line_req = 0u;
+        if (n > 400000u) { n = 400000u; }   /* 防御：别把单拍拖到几十毫秒 */
+        audio_out_capture_probe_line(n);
+    }
+
+    /* 维护"见过多大峰值" —— UI 的"有没有麦克风信号"就靠它判（见 g_rec_peak_max 说明）。
+     * ★ 同时把**电平条的输入值**在这里算好：引擎侧算 ⇒ 无论走 App 还是 SWD 钩子起的录音，
+     *   这个量都是真实的、SWD 可直接读（否则只有 App 打开时才更新，无法验收）。 */
+    {
+        /* ★★ 电平只取 **R 声道** —— 这是本板实测的结论（有原始采样为证）★★
+         *   板上实测（tools/_mic_dump.py 把 s_chunk 里的原始 int16 直接读出来）：
+         *     L = [-1,-1,-1,-1,-1,-1,-1,-1]        ← 恒 -1：空时隙，没有音频
+         *     R = [-9,26,-8,45,37,43,32,55,…]      ← 真实音频，随声音变化
+         *   ⇒ 本板麦克风是**单声道**，音频落在 R 时隙；L 时隙是空的。
+         *   ⚠ 而空时隙**不老实**：它会偶发吐出 0x3FF / 0x1FFF / 0x7FFF 这类
+         *     **连续位模式**（2^n−1，典型 I2S 位对齐错位的产物，不是音频）。
+         *     若沿用 max(L,R)，这些毛刺会随机把电平条顶到 100%（实测到 level 突然=99
+         *     而当时 L/R 峰值才 1/236）⇒ 电平条变成"乱跳"，同样是坏体验。
+         *   ⇒ 取 R 声道 = 取真正有音频的那一路。换了立体声输入请把这里改回 max(L,R)。 */
+        uint32_t pk = g_cap_peak_r;
 
         if (pk > g_rec_peak_max) { g_rec_peak_max = pk; }
+        g_rec_level = (uint32_t)level_from_peak_db(pk);
     }
     return 0;
 }
@@ -660,18 +959,58 @@ const char* BoardRec_StatusText(void)
 
 int BoardRec_Scan(void)
 {
-    (void)rec_scan_max_index();
-    return (int)g_rec_files;
+    /* 文件管理器进录音分类时调用：把 /YMGUI/RECORD 里所有 .WAV 枚举成表。
+     * 与 rec_scan_max_index() 解耦 —— 后者仍服务「试听最近一段」。 */
+    return rec_list_build();
 }
 
-/* 当前输入电平 0..100（取 L/R 峰值较大者，按 0..32767 线性折算）。
- * ⚠ 这是**采样峰值**，不是分贝；UI 的进度条用它就够了。 */
+/* 峰值(0..32767) → 电平 0..100，**按 dB 对数刻度**（-60 dBFS ⇒ 0%，0 dBFS ⇒ 100%）。
+ *
+ * ★★ 为什么必须换掉线性折算（这就是用户报的"点击开始录音波形条没有反应"的根因）★★
+ *   板上实测（tools/_mic_dump.py 直接把原始采样点读出来看）：
+ *       L 声道 = [-1,-1,-1,…] 恒 -1（本板麦克风只落在 R 声道）
+ *       R 声道 = [-9,26,-8,45,37,43,32,55,…]  ← **真实音频，确实在随声音变化**
+ *   即麦克风硬件**是好的**，但常态峰值只有 **~100（-50 dBFS 左右）**。
+ *   而旧实现是线性的 `100*pk/32768` ⇒ 100 算出来是 **0** ⇒ 电平条恒为 0、怎么发声都不动。
+ *   ⇒ 麦克风没坏，**是电平表的刻度错了**：音频电平表本来就该用 dB（人耳也是对数响应）。
+ *
+ * 实现：20*log10(pk/32768) = 6.0206*log2(pk) - 90.31。
+ *   用"最高位位置 + 其下 6 位线性插值"近似 log2（≈0.75 dB 步进，对电平表足够），
+ *   全程整数运算、无浮点、无 libm。
+ * ⚠ 仍然是**采样峰值**（不是 RMS）；UI 的电平条用它，语义与以前一致，只是刻度改对。 */
+static int level_from_peak_db(uint32_t pk)
+{
+    int      bp;        /* 最高位位置 0..14 */
+    uint32_t s, frac;
+    int      db_x100;   /* dB × 100 */
+
+    if (pk == 0u) { return 0; }
+    if (pk > 32767u) { pk = 32767u; }
+
+    bp = 14;
+    while (((pk >> bp) & 1u) == 0u) { bp--; }   /* pk>0 ⇒ 一定会停 */
+
+    /* 把 pk 左移到最高位在 bit31，取其下 6 位作插值小数（单位 1/64 倍频程）*/
+    s    = pk << (31 - bp);
+    frac = (s >> 25) & 0x3Fu;
+
+    /* dB×100 = 602*(bp + frac/64) - 9031 */
+    db_x100 = (int)((602u * (uint32_t)((bp * 64) + (int)frac)) / 64u) - 9031;
+
+    /* 映射：-60 dB ⇒ 0%，0 dB ⇒ 100% */
+    {
+        int lv = (db_x100 + 6000) / 60;
+
+        if (lv < 0)   { lv = 0; }
+        if (lv > 100) { lv = 100; }
+        return lv;
+    }
+}
+
 int BoardRec_Level(void)
 {
-    uint32_t pk = (g_cap_peak_l > g_cap_peak_r) ? g_cap_peak_l : g_cap_peak_r;
-
-    if (pk > 32767u) { pk = 32767u; }
-    return (int)((pk * 100u) / 32768u);
+    /* 电平由 audio_rec_tick() 每拍算好（见 g_rec_level 说明），这里只把它交给 UI。 */
+    return (int)g_rec_level;
 }
 
 /* 1 = 本次录音期间**采到过明显信号**；0 = 一直很小。
@@ -687,3 +1026,223 @@ uint32_t BoardRec_PeakRaw(void)
 {
     return g_rec_peak_max;
 }
+
+/* ====================== 文件管理器录音卡片接口（补丁19）======================
+ * 在 BoardRec_* 基础上再开一组「按索引枚举 / 播放 / 删除 / 重命名 / 分享」的接口，
+ * 让文件管理器把录音当成卡片列出。与 BoardRec_PlayLast() 复用**同一个** wav_play
+ * 会话（一次只能放一个），所以文件管理器起的播放也会体现在 BoardRec_Playing() 上。 */
+
+int BoardRec_Count(void)
+{
+    return s_rec_list_n;
+}
+
+int BoardRec_ListName(int i, char* out, int n)
+{
+    if (i < 0 || i >= s_rec_list_n || n <= 0) { return -1; }
+    (void)snprintf(out, (size_t)n, "%s", s_rec_list[i].name);
+    return 0;
+}
+
+/* 完整路径（"/YMGUI/RECORD/REC_0001.WAV"）—— 补丁29 新增。
+ * 「播放」按钮要把录音交给音乐播放器，需要的是**绝对值路径**而不是文件名；
+ * 让 UI 自己拼 "/YMGUI/RECORD/" 会把目录常量复制到 phone_shell 里（分层破坏），
+ * 所以由这一层给出。 */
+int BoardRec_ListPath(int i, char* out, int n)
+{
+    if (i < 0 || i >= s_rec_list_n || out == NULL || n <= 0) { return -1; }
+    (void)snprintf(out, (size_t)n, "%s", s_rec_list[i].path);
+    return 0;
+}
+
+int BoardRec_ListSize(int i, uint32_t* size)
+{
+    if (i < 0 || i >= s_rec_list_n) { return -1; }
+    *size = s_rec_list[i].size;
+    return 0;
+}
+
+uint32_t BoardRec_DurationMs(int i)
+{
+    if (i < 0 || i >= s_rec_list_n) { return 0u; }
+    return s_rec_list[i].dur_ms;
+}
+
+int BoardRec_DateText(int i, char* out, int n)
+{
+    if (i < 0 || i >= s_rec_list_n || n <= 0) { return -1; }
+    rec_date_text(&s_rec_list[i], out, n);
+    return 0;
+}
+
+int BoardRec_IsValid(int i)
+{
+    if (i < 0 || i >= s_rec_list_n) { return 0; }
+    return (int)s_rec_list[i].valid;
+}
+
+int BoardRec_PlayIndex(void)
+{
+    if (s_rec_play_idx < 0) { return -1; }
+    /* 播放会话可能被别处（音乐 App）接手，或已自然结束 ⇒ 卡片下标作废 */
+    if (!wav_play_busy() && !wav_play_paused())
+    {
+        s_rec_play_idx = -1;
+        return -1;
+    }
+    return s_rec_play_idx;
+}
+
+int BoardRec_PlayList(int i)
+{
+    int rc;
+    if (i < 0 || i >= s_rec_list_n) { return -1; }
+    /* 与录音互斥：若正在录音，先正常收尾（回填 WAV 头）再放，别留半个文件 */
+    if (g_rec_state != 0u) { audio_rec_stop(); }
+    rc = wav_play_start(s_rec_list[i].path);
+    g_rec_play_rc = rc;
+    if (rc == 0) { s_rec_play_idx = i; }
+    else          { s_rec_play_idx = -1; }
+    return rc;
+}
+
+void BoardRec_PlayStop(void)
+{
+    wav_play_stop();
+    s_rec_play_idx = -1;
+}
+
+int BoardRec_PlayPause(void)
+{
+    int r = wav_play_pause();
+    if (r != 0) { s_rec_play_idx = -1; }
+    return r;
+}
+
+int BoardRec_PlayResume(void)
+{
+    return wav_play_resume();
+}
+
+int BoardRec_PlayPaused(void)
+{
+    return wav_play_paused();
+}
+
+uint32_t BoardRec_PlayElapsedMs(void)
+{
+    return wav_play_elapsed_ms();
+}
+
+uint32_t BoardRec_PlayTotalMs(void)
+{
+    return wav_play_total_ms();
+}
+
+int BoardRec_PlaySeek(uint32_t ms)
+{
+    (void)ms;
+    return -1;   /* 录音卡片只做进度展示，不提供拖动跳播 */
+}
+
+int BoardRec_Delete(int i, int* next_valid)
+{
+    int rc;
+    if (i < 0 || i >= s_rec_list_n) { return 2; }   /* 下标非法 */
+    rc = f_unlink(s_rec_list[i].path);
+    if (rc != FR_OK) { return 1; }                   /* 删除失败（卡卸了/文件锁）*/
+    (void)rec_list_build();                          /* 重建列表 */
+    if (next_valid != NULL)
+    {
+        *next_valid = (i < s_rec_list_n) ? i : (s_rec_list_n > 0 ? s_rec_list_n - 1 : -1);
+    }
+    return 0;
+}
+
+/* 把新文件名收敛成合法的 FAT 文件名：去路径分隔符、限长、强制 .WAV 后缀。
+ * 返回 0 = 收敛成功（dst 已填好）；-1 = 输入不可用。 */
+static int rec_sanitize_name(const char* src, char* dst, int n)
+{
+    int k = 0;
+    if (src == NULL || src[0] == 0) { return -1; }
+    /* 复制可见字符、丢掉 \ / : * ? " < > | 等 FAT 非法字符 */
+    for (const char* p = src; *p != 0 && k < n - 6; ++p)
+    {
+        char c = *p;
+        if (c == '\\' || c == '/' || c == ':' || c == '*' || c == '?' ||
+            c == '"' || c == '<' || c == '>' || c == '|') { continue; }
+        dst[k++] = c;
+    }
+    dst[k] = 0;
+    if (k == 0) { return -1; }
+    /* 强制 .WAV 后缀（不区分已有扩展名的大小写，缺就补）*/
+    {
+        int len = k;
+        int has_ext = (len >= 4) &&
+            (dst[len - 4] == '.' || dst[len - 4] == '.') &&
+            ((dst[len - 3] == 'W' || dst[len - 3] == 'w') &&
+             (dst[len - 2] == 'A' || dst[len - 2] == 'a') &&
+             (dst[len - 1] == 'V' || dst[len - 1] == 'e'));
+        if (!has_ext)
+        {
+            if (k + 4 >= n) { dst[k - 1] = 0; }   /* 太长就先砍一字符腾位置 */
+            (void)snprintf(dst + k, (size_t)(n - k), ".WAV");
+        }
+    }
+    return 0;
+}
+
+int BoardRec_Rename(int i, const char* newname)
+{
+    char dst[48];
+    if (i < 0 || i >= s_rec_list_n) { return 2; }   /* 下标非法 */
+    if (rec_sanitize_name(newname, dst, (int)sizeof(dst)) != 0) { return 3; }
+    {
+        char full[48];
+        (void)snprintf(full, sizeof(full), "%s/%s", REC_DIR, dst);
+        if (f_rename(s_rec_list[i].path, full) != FR_OK) { return 1; }  /* 重命名失败 */
+    }
+    (void)rec_list_build();                          /* 重建列表（位置可能变）*/
+    /* 重建后找回新名字的下标，方便 UI 续选 */
+    for (int k = 0; k < s_rec_list_n; ++k)
+    {
+        if (strncmp(s_rec_list[k].name, dst, (size_t)sizeof(dst)) == 0)
+        {
+            s_rec_play_idx = (s_rec_play_idx == i) ? k : s_rec_play_idx;
+            return k;                                /* 返回新下标 */
+        }
+    }
+    return 0;
+}
+
+/* 分享：把文件**真实复制**到 /YMGUI/SHARE（用户可拔卡由电脑取走）。
+ * 本设备无网络 / 蓝牙发送通道，故「分享」= 复制到导出目录 —— 是实打实的文件操作，不造假。 */
+int BoardRec_Share(int i)
+{
+    static const char* SHARE_DIR = "/YMGUI/SHARE";
+    char dst[48];
+    FIL  sf, df;
+    UINT br = 0u, bw = 0u;
+    uint8_t buf[512];
+    int  rc = 0;
+
+    if (i < 0 || i >= s_rec_list_n) { return 2; }
+    (void)f_mkdir(SHARE_DIR);
+    (void)snprintf(dst, sizeof(dst), "%s/%s", SHARE_DIR, s_rec_list[i].name);
+    if (f_open(&sf, s_rec_list[i].path, FA_READ) != FR_OK) { return 1; }
+    if (f_open(&df, dst, FA_CREATE_ALWAYS | FA_WRITE) != FR_OK)
+    {
+        (void)f_close(&sf);
+        return 1;
+    }
+    for (;;)
+    {
+        if (f_read(&sf, buf, sizeof(buf), &br) != FR_OK) { rc = 1; break; }
+        if (br == 0u) { break; }
+        if (f_write(&df, buf, br, &bw) != FR_OK || bw != br) { rc = 1; break; }
+    }
+    (void)f_close(&sf);
+    (void)f_close(&df);
+    return rc;
+}
+

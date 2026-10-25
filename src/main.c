@@ -88,6 +88,20 @@ volatile uint32_t g_boot_magic = 0;
  * ⚠ 必须与 AppConfig_GetVolume() 同源：开机在这里同步一次，之后由
  *   app_volume_persist（音量滑杆松手）两边一起更新。 */
 volatile uint32_t g_audio_volume = 70;
+/* 全局静音开关（2026-10-18 补丁32：控制中心「静音」瓦片）。
+ *
+ * 【语义】1 = 静音。**只压输出、不改 g_audio_volume** —— 用户关掉静音后音量回到原值，
+ *   这是"静音"与"音量拖到 0"的区别（后者会真的把设定改成 0 并落盘）。
+ *
+ * 【为什么是一个全局量而不是 phone_shell 内部的选项位】
+ *   真正把音量写进芯片的有 7 处（起播通路 es8311_start_dac、ramp 每拍、
+ *   回读闭环目标、整段补写、wav_play 的三处起播前置写）。
+ *   静音必须在这 7 处的**共同入口**生效，否则任一路径都会把 REG32 写回非零值
+ *   ⇒ 表现为"点了静音还在响 / 停了再播又开始响"。共同入口 = es8311_ui_volume_effective()。
+ *
+ * 【不持久化】重启后恢复响铃：静音是临时操作，写进 AppConfig 反而会让用户
+ *   "开机没声音还找不到原因"。 */
+volatile uint32_t g_audio_mute = 0;
 volatile uint32_t g_loop_count = 0;
 volatile uint32_t g_lcd_id     = 0;
 volatile int32_t  g_port_rc    = 99;          /* ymgui_port_init 的返回值，0 = 成功 */
@@ -616,12 +630,50 @@ static void app_brightness_persist(uint8_t brightness)
 static void app_volume_persist(uint8_t volume)
 {
     g_audio_volume = (uint32_t)volume;
+    /* 补丁32：**拖音量即退出静音**（与手机一致）。否则用户在静音态下把滑杆拖到 60
+     *   会发现"一点声音都没有"，误以为音量坏了。
+     *   判据用 volume > 0：拖到 0 不是"想听声音"，不解除静音。 */
+    if ((volume > 0u) && (g_audio_mute != 0u))
+    {
+        g_audio_mute = 0u;
+    }
     AppConfig_SetVolume((uint32_t)volume);
     AppConfig_Save();
     /* 顺手把音量写进 ES8311（REG32）：拖动过程即时可听。
      * es8311_set_volume_ui 内部有"codec 没起来就不动总线"的守卫，
-     * 所以没接模块 / 还没开始播放时调它只是空转，不会污染 I2C 失败计数。 */
-    (void)es8311_set_volume_ui((uint32_t)volume);
+     * 所以没接模块 / 还没开始播放时调它只是空转，不会污染 I2C 失败计数。
+     * ⚠ 必须写**有效音量**（静音合并后）：直接写 volume 会让刚才那句
+     *   "拖音量解除静音"在静音仍开着时（volume==0）把 0 写进去 —— 无害但要一致。 */
+    (void)es8311_set_volume_ui(es8311_ui_volume_effective());
+}
+
+/* ---- 控制中心「静音」瓦片的板级落地（2026-10-18 补丁32）----
+ *
+ * 【为什么放在 main.c】静音的权威量 g_audio_mute 与音量镜像 g_audio_volume 都在本文件，
+ *   二者合成只由 es8311_ui_volume_effective() 一处给出；放到别处就要再复制一份判据。
+ *
+ * 【即时性】设置后立刻把**当前有效音量**写进 REG32（播放中瞬间生效）。
+ *   codec 没起来时 es8311_set_volume_ui 只空转（有守卫），随后起播的 8 拍 ramp
+ *   读的也是有效音量（=0）⇒ 起播依然安静，不会"静音了却一开播就有声"。
+ *
+ * 【平滑性】只写 REG32（数字音量），**绝不碰 REG31 的 mute 位**：
+ *   按本项目补丁15 的实测结论，REG31 的 DSMMUTE/DEMMUTE 切换本身就是那声"咔"的
+ *   根因；REG32 归零走芯片自身的软 ramp，是平滑渐弱。 */
+int BoardAudio_MuteOn(void)
+{
+    return (g_audio_mute != 0u) ? 1 : 0;
+}
+
+void BoardAudio_SetMute(int on)
+{
+    uint32_t v = (on != 0) ? 1u : 0u;
+
+    if (g_audio_mute == v)
+    {
+        return;                     /* 幂等：同一状态不重复写总线（避免无谓的 I2C 写）*/
+    }
+    g_audio_mute = v;
+    (void)es8311_set_volume_ui(es8311_ui_volume_effective());
 }
 
 /* 注：阶段 2/3 的"最小界面 + 按钮点击计数"已被 phone_shell 取代，
@@ -1060,6 +1112,10 @@ int main(void)
          * 在卡上建 /YMGUI 目录 → 写 1 KB 文件 → 读回逐字节比对 → 删掉该文件。
          * 只在被触发时跑（阻塞几百毫秒），不影响正常 UI 帧率。见 src/fatfs_port.h。 */
         fatfs_bench_poll();
+
+        /* 录音目录扫描钩子（补丁27）：写 g_rec_scan_req=1 触发一次真实扫描，
+         * 过程量（挂载/打开/条目数/WAV 数/入表数）留在 RAM 供 SWD 读。 */
+        audio_rec_scan_poll();
 
         /* TF 卡自检（路线图 L2-2）：写 g_sd_test=1 触发，跑完自动清 0。
          * 会阻塞几百毫秒（轮询读写 4 KB + 备份恢复），所以只在被触发时跑，

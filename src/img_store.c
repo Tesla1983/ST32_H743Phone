@@ -70,6 +70,7 @@ volatile uint32_t g_img_fs_rc  = 0xFFFFFFFFu;
 volatile uint32_t g_img_qspi_rc = 0;
 volatile uint32_t g_img_cyc    = 0;
 volatile uint32_t g_img_count  = 0;
+volatile uint32_t g_img_dup_skip = 0;   /* 导入去重跳过的次数（见 find_duplicate_of）*/
 
 volatile uint32_t g_img_mk       = 0;
 volatile uint32_t g_img_mk_len   = 0;
@@ -454,6 +455,68 @@ static uint16_t px_to_565(const uint8_t *p, uint32_t bpp)
     }
 }
 
+/* ===========================================================================
+ * 导入去重（2026-10-18）
+ *
+ * 【为什么需要】图库以前**完全不查重**：同一张卡上图片每导入一次就新增一条索引 +
+ *   一份数据。于是任何"重复触发"都会让相册里的图片越攒越多 —— 重复点同一张卡片、
+ *   蓝牙重传同一文件、验收脚本重跑，用户看到的表现都是"又冒出一张图"，而内容其实一样。
+ *
+ * 【判据】① 宽、高、字节数全相同（不同图同尺寸很常见，单靠它不够）；
+ *         ② 数据区 **5 段各 32 B 逐字节相同**（0、1/4、1/2、3/4、末段）。
+ *   同尺寸的两张不同照片要在 5 个采样点全部撞上，实际上只有纯色/空白图可能，
+ *   而那类图在相册里本来也无法区分。
+ *
+ * 【调用时机】像素数据已写完、索引条目已写好之后。命中即**撤销本次新增**
+ *   （img_store_delete 只清 VALID 位，数据区空洞由下一次导入复用）。
+ *   ⚠ 必须在内存映射模式下调用（这里用 XIP_PTR 直接读数据区）。
+ *
+ * @return 1 = 与已有条目重复；0 = 不重复
+ * =========================================================================== */
+static int find_duplicate_of(uint32_t slot, uint32_t off, uint32_t len,
+                             uint32_t w, uint32_t h)
+{
+    static const uint8_t frac[5] = {0u, 1u, 2u, 3u, 4u};   /* 0、1/4、1/2、3/4、末段 */
+    const uint8_t *src;
+    uint32_t step;
+    uint32_t i;
+
+    if (len < 32u) { return 0; }        /* 太短：不采样（也没有可比的意义）*/
+    src  = (const uint8_t *)XIP_PTR(IMG_DATA_ADDR + off);
+    step = len / 4u;
+
+    for (i = 0u; i < IMG_MAX_SLOTS; i++)
+    {
+        const uint8_t *e = XIP_PTR(IMG_IDX_ADDR + i * IMG_ENTRY_BYTES);
+        const uint8_t *dst;
+        uint32_t o2, l2, k;
+        int      same = 1;
+
+        if (i == slot) { continue; }
+        if ((rd16(e) != IMG_MAGIC) || ((rd16(e + 2u) & IMG_FLAG_VALID) == 0u)) { continue; }
+        if ((uint32_t)rd16(e + 12u) != w || (uint32_t)rd16(e + 14u) != h) { continue; }
+        l2 = rd32(e + 8u);
+        if (l2 != len) { continue; }
+        o2  = rd32(e + 4u);
+        dst = (const uint8_t *)XIP_PTR(IMG_DATA_ADDR + o2);
+
+        for (k = 0u; k < 5u; ++k)
+        {
+            uint32_t at = (k == 4u) ? (len - 32u) : (frac[k] * step);
+            uint32_t m;
+
+            if (at + 32u > len) { at = len - 32u; }
+            for (m = 0u; m < 32u; ++m)
+            {
+                if (src[at + m] != dst[at + m]) { same = 0; break; }
+            }
+            if (same == 0) { break; }
+        }
+        if (same != 0) { return 1; }
+    }
+    return 0;
+}
+
 static uint32_t import_bmp(void)
 {
     uint8_t hdr[54];
@@ -690,6 +753,19 @@ static uint32_t import_bmp(void)
      *   读 256 次（扫描索引）必挂。
      * ⇒ 这条规矩是硬的：**任何 indirect 写之后、下一次 XIP 读之前，必须 enter_mmap**。 */
     (void)qspi_enter_mmap();
+
+    /* ★ 导入去重（2026-10-18）：同一张图再导一次不再新增条目。
+     * 判据与取舍见 find_duplicate_of() 的说明。命中就撤销刚写的这条索引 ——
+     * 只清 VALID 位，数据区空洞留给下一次导入复用，不浪费空间。 */
+    if (find_duplicate_of(slot, slot_off, out_len, out_w, out_h) != 0)
+    {
+        (void)img_store_delete(slot);
+        g_img_dup_skip++;
+        g_img_used = used_bytes();
+        g_img_slot = slot;
+        return RC_DUP;
+    }
+
     g_img_used = used_bytes();
     return 0u;
 }
@@ -1467,6 +1543,17 @@ static uint32_t import_jpeg(void)
     }
 
     (void)qspi_enter_mmap();
+
+    /* ★ 导入去重（2026-10-18，与 import_bmp 同一条规则，见 find_duplicate_of） */
+    if (find_duplicate_of(slot, slot_off, out_len, out_w, out_h) != 0)
+    {
+        (void)img_store_delete(slot);
+        g_img_dup_skip++;
+        g_img_used = used_bytes();
+        g_img_slot = slot;
+        return RC_DUP;
+    }
+
     g_img_used = used_bytes();
     return 0u;
 }
@@ -2007,6 +2094,44 @@ int BoardNote_Name(int i, char* out, int n)
 int BoardNote_Size(int i, uint32_t* size)
 {
     return img_scan_size(i, size);
+}
+
+/* ---- 删除（文件管理器「删除」按钮用，2026-10-18 新增）----
+ * 【为什么必须**真删并重扫**】文件列表的下标是扫描表的下标，删掉一个文件后表就失效了：
+ *   不重扫的话 UI 会拿着旧下标继续 Name/Size/Delete ⇒ 删错文件 / 读到空名。
+ *   ⇒ 拼绝对路径 → f_unlink → 立刻 BoardXxx_Scan() 重建。
+ * 【返回值】与 BoardRec_Delete 同风格，UI 按码如实提示（假数据零容忍）：
+ *     0 = 成功；2 = 下标无效（已删/越界）；-1 = 卡未挂载；-3 = 路径拼接失败；-4 = f_unlink 失败。 */
+int BoardPic_Delete(int i)
+{
+    char    full[IMG_PATH_MAX];
+    FRESULT fr;
+
+    if (i < 0 || i >= img_scan_count()) { return 2; }
+    if (fatfs_ensure_mounted() != 0)    { return -1; }
+    if (img_scan_path(i, IMG_PIC_DIR, full, (int)sizeof(full)) != 0) { return -3; }
+
+    fr = f_unlink(full);
+    if (fr != FR_OK) { return -4; }
+
+    (void)BoardPic_Scan();          /* 重建扫描表，让后续下标有效 */
+    return 0;
+}
+
+int BoardNote_Delete(int i)
+{
+    char    full[IMG_PATH_MAX];
+    FRESULT fr;
+
+    if (i < 0 || i >= img_scan_count()) { return 2; }
+    if (fatfs_ensure_mounted() != 0)    { return -1; }
+    if (img_scan_path(i, IMG_NOTE_DIR, full, (int)sizeof(full)) != 0) { return -3; }
+
+    fr = f_unlink(full);
+    if (fr != FR_OK) { return -4; }
+
+    (void)BoardNote_Scan();         /* 同上：重建扫描表 */
+    return 0;
 }
 
 int BoardNote_Load(int i, char* out, int n)

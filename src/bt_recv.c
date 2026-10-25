@@ -814,6 +814,7 @@ static const char* imp_result_text(uint32_t rc)
     switch (rc)
     {
         case 0u:              return "已存入相册";
+        case RC_DUP:          return "这张已在相册里（未重复添加）";
         case RC_NOT_BMP:      return "格式不支持（仅 BMP/JPG）";
         case RC_BPP:          return "位深不支持";
         case RC_COMPRESS:     return "压缩方式不支持";

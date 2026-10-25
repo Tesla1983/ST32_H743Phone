@@ -92,7 +92,12 @@ extern volatile uint32_t g_img_rc;          /* 0=成功；非 0 见下面的 RC_
 #define RC_CLOSE       14u
 #define RC_JPEG_DEC    15u   /* JPEG：HAL_JPEG_Decode 没返回 HAL_OK */
 #define RC_JPEG_SHORT  16u   /* JPEG：解码出的字节数与头里声明的宽高不一致（多半是截断文件） */
+/* 17：**这张图已经在图库里了**（导入去重，2026-10-18 补丁33）。
+ * ⚠ 语义上它不是"失败"：像素数据已完整转换、只是与已有条目逐字节相同，于是本次不新增条目。
+ *   UI 应按"已存在，未重复添加"提示，不要报"导入失败"。 */
+#define RC_DUP         17u
 extern volatile uint32_t g_img_step;        /* 失败时看它卡在哪一步 */
+extern volatile uint32_t g_img_dup_skip;    /* 已被去重跳过的导入次数（>0 = 确实发生过重复导入）*/
 extern volatile uint32_t g_img_slot;        /* 分配到的槽位 */
 extern volatile uint32_t g_img_scale;       /* 抽样倍率：1=原尺寸 2=1/2 4=1/4 */
 extern volatile uint32_t g_img_src_w;

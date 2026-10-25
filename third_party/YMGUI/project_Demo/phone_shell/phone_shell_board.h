@@ -114,6 +114,10 @@ int  BoardPic_Size(int i, uint32_t* size);                  /* 字节数 */
 int  BoardPic_Import(int i);                                /* 异步导入到图库：0=已排队，<0=没排上 */
 int  BoardPic_Busy(void);                                   /* 1 = 正在导入（导入中不要重复点） */
 int  BoardPic_LastRc(void);                                 /* 上一次导入的返回码（0 = 成功） */
+/* 返回码里唯一需要 UI 特判的一个：这张图**已经在图库里**（导入去重，2026-10-18）。
+ * ⚠ 它不算失败：像素数据完整、只是与已有条目逐字节相同，所以没有新增条目。
+ *   数值必须与 src/img_store.h 的 RC_DUP 保持一致（改那边要同步这里）。 */
+#define BOARD_PIC_RC_DUP   17
 
 /* ---- 笔记分类：/YMGUI/NOTE 下的 .txt ----
  * ⚠ **文件名一律用 ASCII**（note0.txt / note1.txt …），不拿标题当文件名：
@@ -124,6 +128,10 @@ int  BoardNote_Scan(void);                                  /* 扫一次，返�
 int  BoardNote_Count(void);
 int  BoardNote_Name(int i, char* out, int n);
 int  BoardNote_Size(int i, uint32_t* size);
+/* 删除第 i 个文件（真删 + 立刻重扫，使后续下标有效）。
+ * 返回：0=成功  2=下标无效  -1=卡未挂载  -3=路径拼接失败  -4=f_unlink 失败。 */
+int  BoardPic_Delete(int i);
+int  BoardNote_Delete(int i);
 /* 读第 i 条正文到 out（NUL 结尾），返回读到的字节数；<0 = 失败 */
 int  BoardNote_Load(int i, char* out, int n);
 /* 写正文：i >= 0 覆盖第 i 条，i < 0 新建一个文件。返回写入后的索引；<0 = 失败 */
@@ -177,6 +185,15 @@ int PhoneHost_GetBrightness(void);
  * 用途：每 band 的固定开销 ∝ 对象数 × 树深，数出来才知道裁剪/减 band 能省多少。 */
 int PhoneShell_BoardObjStats(int* out_max_depth);
 
+/* ---- 输出静音（2026-10-18 补丁32）：控制中心「静音」瓦片的板级落地 ----
+ * 【为什么不复用音量滑杆】静音**不改用户的音量设定**：关掉静音后要回到原来的档位。
+ *   若用"把音量设 0"实现，用户的设定就被改掉了，且重启后仍然 0（"开机没声音"）。
+ * 实现在 src/main.c（g_audio_mute 与 g_audio_volume 在同一处，合成走
+ * es8311_ui_volume_effective()）。播放中调用立即生效（写 REG32），
+ * 未播放时只记标志 —— 随后起播的 ramp 目标也是 0。 */
+int         BoardAudio_MuteOn(void);                /* 1 = 静音中 */
+void        BoardAudio_SetMute(int on);             /* 幂等；只压输出，不动用户音量设定 */
+
 /* ---- 音乐：TF 卡 /YMGUI/MUSIC 下的 .wav（2026-10-12）----
  * 与 BoardPic_* / BoardNote_* 同一套分层：phone_shell 不认识 FatFs，
  * 实现在 src/wav_play.c（播放链路）与 src/img_store.c（目录扫描表）。
@@ -190,7 +207,15 @@ int         BoardMusic_Scan(void);                  /* 扫一次，返回条目�
 int         BoardMusic_Count(void);
 int         BoardMusic_Name(int i, char* out, int n);
 int         BoardMusic_Size(int i, uint32_t* size);
+/* 补丁30：/YMGUI/MUSIC 的完整路径与删除（文件管理器新增的「音乐」分类用）。
+ * ⚠ 扫描表与照片/笔记共用一张 ⇒ 进「音乐」分类必须先 BoardMusic_Scan()，
+ *   进去后别再调 BoardPic_Scan/BoardNote_Scan，否则表被覆盖、下标全错。 */
+int         BoardMusic_Path(int i, char* out, int n);
+int         BoardMusic_Delete(int i);   /* 0=成功 2=下标无效 -1=未挂载 -3=路径错 -4=删失败 */
 int         BoardMusic_Play(int i);                 /* 0 = 已起播；<0 = 失败（看 g_wav_rc）*/
+/* 播放任意路径的 WAV（补丁29）：文件管理器的「播放」用它把录音交给音乐 App。
+ * 不走 /YMGUI/MUSIC 扫描表 —— 录音在 /YMGUI/RECORD，下标语义不同，套用会播错文件。 */
+int         BoardMusic_PlayFile(const char* path);  /* 0 = 已起播；<0 = 失败 */
 void        BoardMusic_Stop(void);
 int         BoardMusic_Playing(void);               /* 1 = 在播 */
 int         BoardMusic_LastRc(void);                /* 上一次动作的返回码（UI 直接显示）*/
@@ -244,6 +269,32 @@ int         BoardRec_PlayName(char* out, int n); /* 正在试听的文件名；<
  *  -3 = 总线上找不到 ES8311（模块没接好或接线松）/ -4 = I2C 总线本身起不来。 */
 int         BoardRec_EsRc(void);
 int         BoardRec_AdcRetry(void);   /* ADC 配置"整段重试"的累计次数（排障用）*/
+
+/* ---- 文件管理器录音卡片（2026-10-16 补丁19）----
+ * 在 BoardRec_* 基础上再开一组"按索引枚举 / 播放 / 删除 / 重命名 / 分享"的接口，
+ * 让文件管理器把 /YMGUI/RECORD 里的录音当成卡片列出。
+ * ⚠ 与 BoardRec_PlayLast() 复用**同一个** wav_play 会话（一次只能放一个），
+ *   文件管理器起的播放也会体现在 BoardRec_Playing() 上。 */
+int         BoardRec_Count(void);                  /* 枚举到的录音条数 */
+int         BoardRec_ListName(int i, char* out, int n);  /* 第 i 条文件名（不含目录）*/
+/* 第 i 条完整路径（补丁29）：文件管理器「播放」把它交给音乐播放器，UI 不自己拼目录。 */
+int         BoardRec_ListPath(int i, char* out, int n);
+int         BoardRec_ListSize(int i, uint32_t* size);    /* 字节数 */
+uint32_t    BoardRec_DurationMs(int i);             /* 时长（按 WAV 头 data 区折算；损坏=0）*/
+int         BoardRec_DateText(int i, char* out, int n);  /* "YYYY-MM-DD HH:MM"；无日期="无日期" */
+int         BoardRec_IsValid(int i);                /* 1 = WAV 头可解析（可播放）；0 = 损坏 */
+int         BoardRec_PlayIndex(void);               /* 当前在放/暂停的卡片下标；-1 = 无 */
+int         BoardRec_PlayList(int i);               /* 播放第 i 条；返回码同 wav_play_start */
+void        BoardRec_PlayStop(void);                /* 停当前播放 */
+int         BoardRec_PlayPause(void);
+int         BoardRec_PlayResume(void);
+int         BoardRec_PlayPaused(void);
+uint32_t    BoardRec_PlayElapsedMs(void);
+uint32_t    BoardRec_PlayTotalMs(void);
+int         BoardRec_PlaySeek(uint32_t ms);
+int         BoardRec_Delete(int i, int* next_valid);     /* 删第 i 条；成功写回 next_valid(-1=空) */
+int         BoardRec_Rename(int i, const char* newname);  /* 重命名；返回新下标 / <0 失败 */
+int         BoardRec_Share(int i);                      /* 复制到 /YMGUI/SHARE；0 = 成功 */
 
 /* ---- 输入法自测（SWD 触发，无需碰屏）----
  * 板上没有物理键盘也没有 stdio，"看着屏幕上有没有候选"不算可靠判据。

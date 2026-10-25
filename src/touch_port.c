@@ -62,11 +62,29 @@ volatile uint32_t g_tp_inject_enable = 1;
 volatile uint32_t g_tp_int_count   = 0;  /* EXTI(PB13) 边沿中断累计次数（触碰屏时应增长）*/
 volatile uint32_t g_tp_scan_count  = 0;  /* 实际进 I2C 扫描的拍数 */
 volatile uint32_t g_tp_poll_skip   = 0;  /* 因门控跳过 I2C 的拍数（空闲时快速增长）*/
-volatile uint32_t g_tp_poll_period = 10; /* 空闲心跳周期（帧）。10 = 与旧节流同量级；EXTI 验证可靠后可调大 */
+/* 空闲心跳周期（帧）。原值 10 ⇒ 若 EXTI 漏沿，按下最多等 160 ms 才被探到
+ * （"点了没反应"的直接来源）。降到 4（≈64 ms）：代价只是空闲时每秒多读 ~15 次 I2C
+ * （每次约 0.5 ms，≈0.7% CPU），换来的是点击手感。 */
+volatile uint32_t g_tp_poll_period = 4;
+
+/* ---- 补丁25e：单帧丢点保护 ----
+ * 背景：一次 GSTID+TP1 的位拍 I2C 读约 0.5 ms，本板 I2C **没有外部上拉**
+ *   （只有 MCU 内部 ~40 kΩ），自然丢读/丢答是基线常态。旧实现只要某次 scan
+ *   返回"无触点"就立刻注入"抬起" ⇒ 拖动中途被切成 按下/抬起/按下…
+ *   ⇒ 上层的手势基准每帧重置、dy 恒 ≈0，表现为**完全滑不动**；
+ *   同一次假抬起还会被当成一次点击（选中错卡片 / 触发导入）。
+ * 现在：读到"无触点"时**先补读**（TP_UP_CONFIRM 次连续无触点才认抬起），
+ *   并且由 INT 触发却读空的那一帧额外重试一次。
+ * 代价：真实抬起最多晚 ~2 帧（≈32 ms），肉眼不可见。 */
+#define TP_UP_CONFIRM 2u
+volatile uint32_t g_tp_up_jitter = 0;   /* 被抑制的"单帧无触点"次数（曾经会把拖动打断）*/
+volatile uint32_t g_tp_retry_used = 0;  /* INT 触发但读空后的补读次数 */
 
 static uint32_t s_tp_int_seen = 0;       /* 上次 poll 见到的中断计数 */
 static uint8_t  s_tp_active   = 0;       /* 1 = 上一拍判为"按住中"（逐帧强制扫描：拖动平滑/抬起可测）*/
 static uint32_t s_tp_idle_cnt = 0;       /* 空闲心跳计数 */
+static uint32_t s_tp_up_cnt   = 0;       /* 连续"无触点"次数（>=TP_UP_CONFIRM 才认抬起）*/
+static uint32_t s_tp_retry    = 0;       /* 剩余强制补读拍数（INT 触发却读空时置 1）*/
 
 /* 合成触摸自测（SWD 写 g_synth_test 触发，不依赖真实手指）：
  *   = 1  单击 (g_synth_x, g_synth_y)          —— 两拍：按下 → 抬起
@@ -222,20 +240,29 @@ void touch_port_poll(void)
     g_poll_stage = 2;
 
     /* ---- INT 门控：空闲时不碰 I2C（省下每帧 ~210 µs 的位拍事务）----
-     * 三个判据满足任一即"本拍要真读 I2C"：
+     * 四个判据满足任一即"本拍要真读 I2C"：
      *   ① 中断计数变了（GT9xxx 说有新报告，紧接着就来）；
      *   ② 上一拍判为按住中（逐帧采样：拖动要平滑，抬起要能及时测到）；
-     *   ③ 空闲心跳到期（纯兜底：即便 EXTI 没动静，延迟也不劣于旧版）。 */
+     *   ③ 上一次是"INT 触发却读空" ⇒ 补读一拍（防单帧丢读把按下漏掉）；
+     *   ④ 空闲心跳到期（纯兜底：即便 EXTI 没动静，延迟也不劣于旧版）。 */
     {
         uint8_t need = 0;
+        uint8_t int_new = 0;
 
         if (g_tp_int_count != s_tp_int_seen)
         {
             s_tp_int_seen = g_tp_int_count;   /* 用"计数变化"而非"标志位"，避免与 ISR 抢标志 */
+            int_new = 1;
             need = 1;
         }
         else if (s_tp_active)
         {
+            need = 1;
+        }
+        else if (s_tp_retry != 0u)
+        {
+            s_tp_retry--;
+            g_tp_retry_used++;
             need = 1;
         }
         else if (++s_tp_idle_cnt >= g_tp_poll_period)
@@ -250,46 +277,67 @@ void touch_port_poll(void)
             g_poll_stage = 4;
             return;                            /* 空闲：跳过 I2C（上一拍已发过抬起）*/
         }
-    }
 
-    g_tp_scan_count++;
+        g_tp_scan_count++;
 
-    /* gt9xxx_scan(0) = 返回**屏幕坐标**（1 则返回物理坐标）；
-     * 返回非 0 表示本次扫描有有效触点，坐标在 tp_dev.x[0] / tp_dev.y[0]。 */
-    if (gt9xxx_scan(0) != 0)
-    {
-        x = tp_dev.x[0];
-        y = tp_dev.y[0];
-
-        if (x < YMGUI_PORT_W && y < YMGUI_PORT_H)
+        /* gt9xxx_scan(0) = 返回**屏幕坐标**（1 则返回物理坐标）；
+         * 返回非 0 表示本次扫描有有效触点，坐标在 tp_dev.x[0] / tp_dev.y[0]。 */
+        if (gt9xxx_scan(0) != 0)
         {
-            g_poll_stage = 3;
-            g_tp_points++;
-            g_tp_last_x = x;
-            g_tp_last_y = y;
-            s_tp_active   = 1;                 /* 进入按住：下一拍逐帧强制扫描 */
-            s_tp_idle_cnt = 0;
-            YMGUI_Inject_Pointer((GYcoord)x, (GYcoord)y, 1);   /* 按下 */
-            g_inject_ok++;
+            x = tp_dev.x[0];
+            y = tp_dev.y[0];
+
+            if (x < YMGUI_PORT_W && y < YMGUI_PORT_H)
+            {
+                g_poll_stage = 3;
+                g_tp_points++;
+                g_tp_last_x = x;
+                g_tp_last_y = y;
+                s_tp_active   = 1;             /* 进入按住：下一拍逐帧强制扫描 */
+                s_tp_idle_cnt = 0;
+                s_tp_up_cnt   = 0;             /* 有触点 ⇒ 抬起计数清零 */
+                s_tp_retry    = 0;
+                YMGUI_Inject_Pointer((GYcoord)x, (GYcoord)y, 1);   /* 按下 / 按住移动 */
+                g_inject_ok++;
+                g_poll_stage = 4;
+                return;
+            }
+        }
+
+        g_poll_stage = 3;
+
+        /* ---- 读到"无触点"：先确认，再认抬起（补丁25e，见 TP_UP_CONFIRM 说明）----
+         * ★这一道是"能拖动滑动"的前提：单帧丢读若立刻发抬起，上层的手势就被打断，
+         *   dy 每帧归零 ⇒ 永远滑不动（同时假抬起会被当成一次点击）。 */
+        s_tp_up_cnt++;
+        if (s_tp_up_cnt < TP_UP_CONFIRM)
+        {
+            g_tp_up_jitter++;
+            s_tp_retry = 1;                    /* 下一拍强制再读一次 */
+            return;                            /* 本拍不注入抬起：保持原按下状态 */
+        }
+        if (int_new != 0u)
+        {
+            /* INT 说有事件却连读两次都空：可能是一次性丢读。再多补读一拍，
+             * 但仍按"疑似抬起"处理下一拍（不无限拖着）。 */
+            s_tp_retry = 1;
+        }
+
+        s_tp_up_cnt = 0;
+        s_tp_active = 0;                       /* 本拍无有效触点 */
+
+        if (g_tp_inject_enable == 0)
+        {
             g_poll_stage = 4;
             return;
         }
-    }
 
-    g_poll_stage = 3;
-    s_tp_active = 0;                           /* 本拍无有效触点 */
-
-    if (g_tp_inject_enable == 0)
-    {
+        /* 未按下（或坐标越界）：以最后已知位置发抬起事件。
+         * YMGUI 需要这次抬起才会判定 Clicked，只发按下不发抬起按钮永远不会响应。 */
+        YMGUI_Inject_Pointer((GYcoord)(g_tp_last_x == 0xFFFF ? 0 : g_tp_last_x),
+                             (GYcoord)(g_tp_last_y == 0xFFFF ? 0 : g_tp_last_y),
+                             0);                               /* 抬起 */
+        g_inject_ok++;
         g_poll_stage = 4;
-        return;
     }
-
-    /* 未按下（或坐标越界）：以最后已知位置发抬起事件。
-     * YMGUI 需要这次抬起才会判定 Clicked，只发按下不发抬起按钮永远不会响应。 */
-    YMGUI_Inject_Pointer((GYcoord)(g_tp_last_x == 0xFFFF ? 0 : g_tp_last_x),
-                         (GYcoord)(g_tp_last_y == 0xFFFF ? 0 : g_tp_last_y),
-                         0);                               /* 抬起 */
-    g_inject_ok++;
-    g_poll_stage = 4;
 }

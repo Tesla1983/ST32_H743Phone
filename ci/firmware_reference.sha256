@@ -1915,5 +1915,398 @@
 #     ⚠⚠ 线断时 MCU 内部上拉会让 IDR 读成高 ⇒「电气空闲」与「线断」现象一致，别用电平排除接线。
 # FLASH 1 675 404 B（79.89%）；DTCM 46 564 B。
 # ===========================================================================================
-97dcb5782abe7d11ae4988d0e70c168134c86d4a01c539ee0f41c99392f61000  ymgui-h743.bin
-24b72f0ac52df02abed6df9ffe36a30c61298d8acc772cebe7d519146512b9a4  ymgui-h743.elf
+# 【已被补丁19 取代】补丁18c 最终版（见上）。
+# 97dcb5782abe7d11ae4988d0e70c168134c86d4a01c539ee0f41c99392f61000  ymgui-h743.bin
+# 24b72f0ac52df02abed6df9ffe36a30c61298d8acc772cebe7d519146512b9a4  ymgui-h743.elf
+# ===========================================================================================
+# 补丁19（2026-10-16 深夜）：文件管理器「录音」分类做成真实卡片列表
+#   · 进入即扫 /YMGUI/RECORD，按索引枚举（BoardRec_Count/ListName/ListSize/DurationMs/
+#     DateText/IsValid）；每张卡画 名称 / 时长 / 录制日期·大小 / 圆形播放-暂停键 / 进度条。
+#   · 卡片自绘 + 坐标命中（选 4 张可见卡）；按下拖拽滚动、顶部下拉=刷新、点击圆形键起播/暂停/续播。
+#   · 底部栏：删除（两段确认）/ 重命名（IME 浮层，去 .WAV 后缀预填）/ 分享（复制到 /YMGUI/SHARE）/
+#     返回上一级 / 刷新。
+#   · 加载中「加载中…」、空状态「暂无录音文件 / 去录音机录一段吧」、列表圆角托盘底。
+#   · 异常如实提示：播放失败按 rc 细分（卡未挂 / 文件损坏打不开 / 音频异常 / WAV 头坏）；
+#     WAV 头不可解析的卡标「损坏」红字并禁播。假数据零容忍（日期无 RTC 显示「无日期」）。
+#   · 重命名浮层改用 PhoneUI_panel（自带 panel_draw 实底），修正裸对象不画背景的问题。
+#   · 修复 照片 分类的 YMGUI_TextView_SetText 被误当 printf（多传参数）的编译错误。
+#   ⚠ 与音乐/录音机 App 共用同一个 wav_play 会话（一次只能放一个）；删除/重命名前若正在放先停。
+# FLASH 1 681 172 B（80.16%）；DTCM 46 668 B（heap0 余量仍紧，约 ~1.2 KB，未退化）。
+# ===========================================================================================
+# 上一基准（2026-10-16 补丁20：CMD_PH_DONE 冻结自愈）
+# 561465cc83a59dd4707f7a1b0ef6b9f6c5ef90b1bb0d7e36e9c1be885748e786  ymgui-h743.bin
+# 1299147160076b3539ec6909deb9ff6a4728ccf655b6696e669ff196f6114993  ymgui-h743.elf
+# ---- 新基准（2026-10-16 补丁21：暂停/停止淡出改时间基准修间歇爆音）----
+#   改动：audio_out.c/h 删 AO_PAUSE_FADE_TICKS，改 AO_PAUSE_MIN_RAMP_MS=300 / AO_PAUSE_HARD_CAP_MS=900；
+#        s_pause_fade_ticks 改态标志，新增 s_mute_t0/s_pause_start_t0；audio_out_pause 开头取消进行中上 ramp
+#        + 捕获静音确认时刻；tick 淡出分支静音未确认每拍重试；新增 g_ao_mute_retry/g_ao_fade_min/
+#        g_ao_fade_hardcap 直接计数；es8311.c/wav_play.c 注释同步。
+#   SWD 验收（g_wav_test 钩子跑 起播→暂停×3+连点）：g_ao_pause_calls=3 / g_ao_fade_min=3 /
+#        g_ao_fade_hardcap=0 / g_ao_silent_fail=0。
+# FLASH 1 681 372 B（80.17%）；DTCM 46 700 B（35.63%，heap0 余量未退化）。
+# 447b7f4846a0c21dde61596ec93c9d95f39693d463a1edd106fee2b9672eda9f  ymgui-h743.bin
+# 0c660f9dd235808fd3489aef0d33c017e5e1ffdac9181d705d2e6e0dfb3a4a35  ymgui-h743.elf
+# ---- 新基准（2026-10-17 补丁22：淡出期间禁写 REG32，修"点暂停/播放突然很大声"）----
+#   根因：audio_out_pause() 是异步淡出，返回时 g_ao_playing 仍为 1；而 wav_play_resume()
+#     在 audio_out_start() **之前**先调 audio_out_set_volume()，补丁16 的守卫只查 g_ao_playing
+#     ⇒ 淡出窗口内点播放会把 REG32 一步写成满音量，而 I2S 传输还在跑 ⇒ 满音量爆音。
+#   改法：audio_out_set_volume() 在 s_pause_fade_ticks!=0 时直接返回（音量交给 ramp 平滑爬升）。
+#   新增可直接计数 g_ao_vol_during_fade / g_ao_vol_fade_wrote / g_ao_vol_during_fade_val
+#     与 A/B 开关 g_ao_vol_guard_en。
+#   A/B 实测（板上 burst g_wav_test=5，间隔 30 ms < 淡出 300 ms）：
+#     守卫关 5/5 次 during_fade+5 / wrote+5（缺陷复现）；守卫开 5/5 次 during_fade+5 / wrote+0。
+# FLASH 1 681 420 B（80.18%）；DTCM 46 716 B（35.64%）。
+# 769ee2b210535a2f162824d34980ea1c464b15e2c529b049cb58aac3645a61b2  ymgui-h743.bin
+# 28d78e40258d64fc86897664ba8d456dadd50232ebd5f5ae6fbf20ba01385daa  ymgui-h743.elf
+# ---- 新基准（2026-10-17 补丁23：录音机电平条修"点击开始录音波形条没有反应"）----
+#   根因（三层层层递进，全靠板上原始采样说话）：
+#     ① 麦克风硬件**是好的**：PC2(DOUT) 线活动度采样 flips≈7000/100k、高电平 71%
+#        ⇒ 模块确实在发数据；ES8311 ADC 通路回读全对（adc0a bit6=0 / adc09 bit6=1 / adc17=0xBF）。
+#     ② 但原始采样显示 **L 声道恒 -1（空时隙），R 声道才是真实音频**，常态幅度只有
+#        **~200/32767 ≈ -44 dBFS**；
+#     ③ 而 BoardRec_Level() 用**线性**折算 100*pk/32768 ⇒ 200 算出 0 ⇒ 电平条恒 0 不动。
+#   改法：BoardRec_Level() 改 **dB 对数刻度**（-60 dBFS⇒0% … 0 dBFS⇒100%，整数近似 log2，无浮点）；
+#        电平改由**引擎每拍**算进 g_rec_level（不再只在 App 问时才算 ⇒ SWD 可直接验收）；
+#        电平只取 **R 声道**（L 空时隙会偶发吐 0x3FF/0x1FFF/0x7FFF 连续位模式，会把条顶到 100%）。
+#   新增固件钩子：g_cap_line_req/g_cap_line_n/hi/flips（PC2 线活动度，纯读 IDR、零风险），
+#        补上 docs/MIC_RECORD_DESIGN.md §7 阶梯第 1 步（tools/rec_check.py 仍未实现）。
+#   实测：旧线性 0~6（不可见）⇒ 新 dB 刻度 23~55 且随声音起伏、不再被毛刺顶到 99。
+# FLASH 1 681 644 B（80.19%）；DTCM 46 740 B（35.66%）。
+# 0dbcb04f7d50b06b69ff78f7dcd44f61b56f0e8e653db778d7ae584e41b847ef  ymgui-h743.bin
+# 39de76a3eba01dc0c72d05b4fad76e45f917c3eb2541d4efd1239c47ec7cb53e  ymgui-h743.elf
+# ---- 新基准（2026-10-17 补丁23b：扫 PGA 增益 + 修 g_rec_peak_max 不清零）----
+#   ① 真 bug：`g_rec_peak_max` 注释写"本次录音见过的最大峰值"但**起录时从不清零**
+#      ⇒ 跨录音单调累加（读到的是历史最大值=假数据），且 BoardRec_MicOk() 一旦响过一次
+#      就**永久为真**、以后真没麦克风也不报（最忌的"看不出来的坏状态"）。⇒ 起录清零。
+#   ② 加在线改增益钩子：`g_rec_gain_req/g_rec_gain_val` + `es8311_adc_set_gain(REG16)`，
+#      录音**中途**直接改增益（不用停录重起），改档即清零峰值窗 ⇒ 同一段语音下逐档可比。
+#   ③ 扫增益结论（用户在旁持续说话，同一次录音内逐档比）：
+#      **0x24 → 峰值 26839（不削顶，最佳）**；0x18→977；0x0C→0（没信号）；0x06→32599（削顶）。
+#      ⇒ ⚠ **本板 REG16 不是单调的**（不是"值越小增益越大"），早期那轮"0x06 最好"是
+#        逐档停录/起录、且当时测到的多为毛刺 ⇒ 已证伪。**结论：保持官方默认 0x24。**
+#   实测（0x24 + 说话）：瞬时峰值 643~1485、电平 **41~52%**、nz≈100%（真实信号）。
+# FLASH 1 681 716 B（80.19%）；DTCM 46 740 B（35.66%）。
+# 9186e4f3080148793aa54211b477aa441add73a8693d490bdd68ee10f7963d04  ymgui-h743.bin
+# 3c3f559aaee219866f95c2f272b59ffed432996719505edca2c924f155dc16f2  ymgui-h743.elf
+# ---- 新基准（2026-10-18 补丁24：文件管理器三项改造）----
+#   ① 修显示/交互 bug：
+#      · **笔记分类误用 BoardPic_Name/Size 取名**（进笔记扫的是 BoardNote_Scan）
+#        ⇒ 笔记列表显示的是照片的文件名/大小。改为按分类选接口，并把两份重复代码
+#          合并成 file_list_refresh()（防止再次分叉）。
+#      · **列表只能看前 3 个文件**：加翻页（page + 上一页/下一页），第 4 行仍是"返回上一级"。
+#        旧代码把**行号当文件下标**用，加翻页后会操作错文件 ⇒ 改为 file_global_index() 换算。
+#      · file_open 的 index 未命中时默认 0（会静默当成点了第 0 行）⇒ 改为 -1 直接返回。
+#   ② 图标：ICON_FILES 由白色文件夹改 **Windows 风格黄色手册式扁平文件夹**
+#      （后片/标签 #E9AE38 + 前盖 #FDD460）；新增配套的 ICON_FILE 扁平文档图标，
+#      两者同 30×28 画布、同 2px 圆角、同垂直中心 ⇒ 尺寸/对齐一致。
+#      列表行改自绘 file_row_draw：图标靠左、名称右区居中，选中态转暖黄底。
+#   ③ 删除：新增 BoardPic_Delete/BoardNote_Delete（f_unlink + 立刻重扫，使下标有效），
+#      UI 侧「删除」按钮两段确认（按下转红改"确认删除?"，再按才真删），
+#      失败按返回码如实提示（下标无效/卡未挂载/路径拼接/删除失败）。
+#      ⚠ 换页、换选中、返回、进入分类都会撤销待确认（否则会"以为删 A 其实删 B"）。
+#   ⚠ 构建教训：ninja 失败行是 "FAILED:"，不含 "error" ⇒ 只 grep error 会漏掉构建失败，
+#      必须同时看 FAILED/undefined/ninja:，并以 **bin 时间戳/哈希是否变化**为准。
+# FLASH 1 684 308 B（80.31%）；DTCM 46 844 B（35.74%，+104 B = AppState 新字段，heap0 余量仍紧）。
+# c9a0f646f1fdc9c1a0e0b6a64f492f13368361b7b2807768b950f1530648ec0f  ymgui-h743.bin
+# 19163b575f6afc213cff306f8657f414724bce29953086ad1631d1df9d2ee43a  ymgui-h743.elf
+# ---- 新基准（2026-10-18 补丁24b：修白屏 / heap0 挤出余量）----
+#   ⚠⚠ **白屏事故根因（三条叠在一起）**：
+#     ① phone_shell.c 开机就用 `PhoneApps_Create(i, app_views[i])` 把**所有** App 的
+#        create() 全部跑一遍 ⇒ 任何 App 新增对象都是**开机**就要堆分配。
+#     ② linker 里 `_heap0_start=_sbrk_end`、`_heap0_end=_estack−32KB`
+#        ⇒ **DTCM 的 .bss 与 heap0 抢同一块内存**：.bss 多一字节，heap0 少一字节。
+#     ③ 补丁24 给 files.c 的 AppState 加了 hint[80]+3 GYOBJ+3 int（+104 B），
+#        又加了 3 个 PhoneUI_button（对象 + PhoneButton≈104 B，合计 ≈480 B）
+#        ⇒ heap0 只剩 192 B ⇒ `GY_malloc` 失败 ⇒ HardFault
+#        （cfsr=0x01000000 → UFSR=UNALIGNED；g_loop_count=0，主循环一次都没跑完）⇒ 白屏。
+#   【修法（两手都要）】
+#     A. **减分配**：3 个按钮 → **1 个自绘操作栏**（file_bar，照 rec_list 的自绘+坐标命中做法），
+#        分配需求 480 B → 约 50 B。
+#     B. **腾内存**：
+#        · files.c 的 AppState 用 FILES_STATE_ATTR 移到 **.bss_sram2**（+264 B heap0）
+#        · phone_ime.c 的 keys/candidates/symbol_* 一组 Key（**8112 B**，DTCM 里最大的
+#          非热路径块，人手速度交互）移到 **.bss_sram2**（+8112 B heap0）
+#   【结果】DTCM 46580 → 38468；heap0 总量 35336 → **43448**；
+#        板上实测 peak=35320 ⇒ **峰值余量 8128 字节**（事故时为 0）。
+#        验证：g_loop_count 在跑、g_fault.magic=0（无故障）、g_shell_rc=0。
+#   【工具】新增 tools/white_screen_diag.py（读健康度/故障现场/堆余量，白屏急救用）。
+# FLASH 1 684 580 B（80.33%）；DTCM 38 468 B（29.35%）；SRAM1 77.12%；SRAM2 65.14%。
+# ---------------------------------------------------------------- 上一基准（2026-10-18 补丁24b，白屏修复后的出货形态）
+# d57a98bd4090e86009cb7f4e88ab4a94e6a1ff791d84b291118fca1865ec4e46  ymgui-h743.bin
+# 5d0b8d973b34aab8a09a38beab67420b9df25a8127ec197afde7177849dee414  ymgui-h743.elf
+# ---------------------------------------------------------------- 新基准（2026-10-18 补丁25）
+# a 类更新（有意为之的功能改动）：**文件管理 App 照片/笔记列表改为连续滑动 + 右侧边条**
+#   （照 settings.c 的滚动范式：视口自绘 + 像素级 scroll + 右侧滑块指示位置）。
+#   旧实现是「3 行 + 翻页」，文件一多就得到处翻；新实现用 1 个自绘容器（pic_list）
+#   画出全部卡片并自己裁剪，点击命中选中、拖拽连续滚动、右侧边条指示位置，避免给每张
+#   卡片建对象（heap0 与 DTCM 抢内存，多一个对象就多一次开机分配，见 24b 白屏事故）。
+#   同时清理废弃的分页模型（file_row_text/file_page_count/file_global_index/file_page_prev/
+#   file_page_next 及 page/sel_row 字段），删除改用 pic_sel（全局下标）。
+#   FLASH 1 684 604 B（80.33%）；DTCM 38 468 B（29.35%）；SRAM1 77.12%；SRAM2 65.15%。
+#   验证：cmake 干净构建通过（无 FAILED）；bin/elf 哈希已更新；上板核验待烧录后跑。
+# ---------------------------------------------------------------- 上一基准（2026-10-18 补丁25，照片/笔记滑动列表 + 边条初版）
+# b9098d54d44cd5d3d8834f90b8e11c8bac7e3d7aaef7bdcdb639762e11b6dd7a  ymgui-h743.bin
+# 9bc78c02da08ad9f37b95bf2d937505aff30b9fe4171e2437f87b523de136298  ymgui-h743.elf
+# ---------------------------------------------------------------- 新基准（2026-10-18 补丁25b，修"显示错误/不能下滑"）
+#   【修了什么】照片/笔记滑动列表两处实测 bug：
+#   ① 显示错误 = pic_list 是自绘容器、引擎不会自动裁到自身区域（只有 ClipChildren 的子
+#      对象才裁），导致卡片越过列表底边(296)画到下方说明区上、相互叠字 ⇒ 一片乱。
+#      现 pic_list_draw 进入时把 surface.clip 手动收窄到列表视口、绘制完恢复（与
+#      YMGUI_Button/List 同款做法），卡片不再越界。
+#   ② 不能下滑 = 旧版边条只是指示条、滑动只能拖列表体；现**边条可拖**（照 settings App
+#      的边条滑动 UI：拖滑块/拖列表体都映射到滚动），并保留点击卡片选中/导入。
+#   ③ 加诊断量 g_pic_evt(列表收到事件计数) / g_pic_scroll_diag(当前滚动偏移)，SWD 可读，
+#      用于客观验证"事件有没有进列表 / 能不能下滑"。
+#   【布局】列表托盘背景与录音卡片列表同色；卡片白底、选中转暖黄；文件图标=ICON_FILE。
+#   FLASH 1 685 044 B（80.35%）；DTCM 38 476 B（29.35%）；SRAM1 77.12%；SRAM2 65.16%。
+#   验证：cmake 干净构建通过（无 FAILED）；bin/elf 哈希已更新；上板抽样+全片比对 PASS。
+63dec1c481c677d5789e3442857979238e76601fec53911f657c75279710ac94  ymgui-h743.bin
+9681e89065c4b77521a65fae2d2d1bf908e7dee5a84e6c2fb0d2466f8e3ca009  ymgui-h743.elf
+# ---------------------------------------------------------------- 新基准（2026-10-18 补丁25c，修"渲染不匹配预览"）
+#   【修了什么】照片/笔记滑动列表的真实视觉缺陷：卡片宽度用了 PIC_LIST_W(296，右边界
+#      x=308)，而右侧边条画在 x=302~305 ⇒ 边条直接压在卡片右端文件名文案上 → 观感"渲染错误"。
+#      现引入 PIC_CARD_W = PIC_LIST_W - PIC_BAR_W - PIC_BAR_MARGIN - 4 (=286)，卡片收进
+#      边条左侧，边条落在留白里，不再压字。PIC_BAR_W 3→4、PIC_BAR_MARGIN 3→2。
+#   【说明】25b 的裁剪/clip 逻辑经源码核对正确（GY_Rect_Intersect 返回 1=有交、0=无交，
+#      与 YMGUI_List/Table 同款写法），卡片不会越界；25c 只修边条压字这一处视觉缺陷。
+#   FLASH 1 685 044 B（80.35%）；DTCM 38 476 B（29.35%）；SRAM1 77.12%；SRAM2 65.16%。
+#   验证：cmake 干净构建通过（无 FAILED）；bin/elf 哈希已更新；上板抽样比对 PASS（全片后台跑）。
+93c6906af83d9a531b5cc8369fe272fa5ef09c3ca3b8cb3cb344a51ca5bfd5f4  ymgui-h743.bin
+788708bcb010b8ae5432b2501fdfdd6c4ccf9fcf08ec4116283ac5e12dd3897c  ymgui-h743.elf
+# ---------------------------------------------------------------- 新基准（2026-10-18 补丁25d，修"照片卡片全部渲染错乱"）
+#   【根因】pic_list_draw 里文件名调用 PhoneUI_draw_text(..., cx=area->x+48, top)，
+#      但该函数的 cx 是**文本中心 X**（内部 x = cx - text_width/2），不是左边界！
+#      传 area->x+48(=60) ⇒ 每张卡的文件名以 x=60 为中心向左右各散一半，长名直接
+#      盖住左侧 ICON_FILE 并冲出屏幕左缘 → "所有照片卡片都没渲染正确"。
+#   【修法】改为传**文本区中心**（与 file_row_draw 同范式）：
+#      tx = area->x + 48（图标右侧文本区左边界）；tw = PIC_CARD_W - 48 - 10（右侧留 10）；
+#      cx = tx + tw/2；top = cy + (PIC_CARD_H-4-24)/2。文件名不再溢出、不再压图标。
+#   【核查】files.c 其余 PhoneUI_draw_text 调用（file_row_draw / file_bar / 空状态 /
+#      rec_draw_text*）均已正确传"中心"，无同类错误。
+#   FLASH 1 685 044 B（80.35%）；DTCM 38 476 B（29.35%）；SRAM1 77.12%；SRAM2 65.16%。
+#   验证：cmake 干净构建通过（无 FAILED）；bin/elf 哈希已更新；上板抽样 PASS（全片后台跑）。
+### 补丁25d 最终版（左对齐微调）：文本区中心→左对齐，贴文件管理器习惯与预览
+###   tx=area->x+48；twz=PIC_CARD_W-48-10；twt=PhoneUI_text_width(line,0) 夹到 twz；
+###   cx=tx+twt/2（左对齐）；top 不变。FLASH 1 685 076 B（80.35%）。
+# 706e3874f83cc99d13b38987e2868d898edf0300fea48a913634e42cd2f9bd7a  ymgui-h743.bin
+# 73c814b2f0923f7d17b817058a47511b8e691a3678c31556fb4fbb8a70467f6b  ymgui-h743.elf
+# ---------------------------------------------------------------- 新基准（2026-10-18 补丁25d-final，照片卡片文本左对齐）
+# e82bcea1c50756e0e2cd99ca101a5a98620671695a6249d657e2d0120c55311d  ymgui-h743.bin
+# e1d3245685b4fd9801a9dced03ca0ec6dc60947926525760a239abf8d67291fa  ymgui-h743.elf
+# ================================================================ 新基准（2026-10-18 补丁25e：照片卡片滑动 + 点击响应）
+# 【现象】① 进照片分类后**不能下滑**；② 点卡片"响应不及时"（选错/没反应）。
+# 【根因1·坐标基准】PIC_LIST_X/Y 是 view 内局部坐标（app view 在 y=36），而事件里
+#   ctx->point_x/y 是**屏幕坐标** ⇒ 旧代码 `py - PIC_LIST_Y` 偏 36px（0.7 个卡片高）：
+#   按卡片上半部命中上一张；pic_draw_bar 用 PIC_LIST_Y 当绝对 y ⇒ 滑块画到视口外被裁掉
+#   （= "边条看不见"）。现一律经 pic_area()（YMGUI_Obj_GetAbsArea）取绝对矩形。
+# 【根因2·手势基准】旧实现 scroll = press_scroll - (py - press_y)，要求按下/移动/抬起
+#   事件序列一帧不断。本板触摸是位拍 I2C（无外部上拉，自然丢读偏高），单帧读空就注入
+#   一次假抬起 ⇒ 引擎清 pressed_obj、下一帧再判按下 ⇒ press_y 被重置到手指当前位置
+#   ⇒ dy 恒≈0 = **完全滑不动**；同一次假抬起还会走 Released 且 moved=0 ⇒ 被当成点击
+#   ⇒ 随机触发导入 = "点击响应不及时/点错"。
+# 【修法】① files.c：滚动改**按拍增量**（pic_scroll_tick，基准=上一拍指针位置，
+#   app_tick 每拍调用，不依赖 Pressing）；累计位移 >PIC_TAP_MAX(12) 才不算点击；
+#   边条按绝对矩形绘制/命中；导入从事件回调挪到 app_tick（避免阻塞 UI）。
+#   ② touch_port.c：无触点需连续 TP_UP_CONFIRM(2) 次才认抬起，INT 触发却读空补读一拍；
+#   空闲心跳 10→4 帧（按下最坏延迟 160ms→64ms）。
+# 【诊断】g_pic_press_evt/g_pic_hold_evt/g_pic_move_px/g_pic_rel_evt/g_pic_tap/
+#   g_pic_scroll_diag；g_tp_up_jitter/g_tp_retry_used（app_inspect: pic_press/pic_hold/
+#   pic_move/pic_rel/pic_tap/pic_scroll）。
+# 【尺寸】FLASH 1 685 764 B（80.38%）；DTCM 38 508 B（29.38%）；SRAM1 77.12%；SRAM2 65.16%。
+f5686ab711eda3734e3cb6f8d67cd644334a783034e3b482ab7b76794be79584  ymgui-h743.bin
+4c77a0d61ea2e8c4b9acf56245576bb4945157c205f89f9bf81414d087b75d13  ymgui-h743.elf
+
+# ---------------------------------------------------------------- 新基准（2026-10-18 补丁26，纵向布局越界修复）
+# 【症状】照片页看不到底部「返回上一级 / 删除」两个按钮；右侧边条疑似不显示；
+#   顺带发现录音页「返回上一级 / 刷新」也不可见。
+# 【根因】app view = YMGUI_Creat_Obj_Creat(app_page, 0, 36, W, 412)（phone_shell.c:1788）
+#   ⇒ 本文件坐标全是 view 局部坐标，合法范围只有 0..411。
+#   旧 FILE_BAR_Y=402 + H=36 ⇒ 底边 438，**越出视口 26px**，只剩 10px 贴在屏幕最底边
+#   ⇒ 两个按钮等于看不见。录音页更糟：操作键 y=378..416、导航键 y=424..462 全排在外。
+#   另外 file_bar_event 拿 view 局部常量去比**屏幕坐标**（ctx->point_*），偏 36px ⇒ 命中区整体下移。
+#   边条：PIC_BAR_W=4 且在浅色托盘上只有滑块无轨道 ⇒ 几乎看不出来；内容没超出时干脆不画。
+# 【修法】① 整页纵向重排进 0..411：
+#     分类/蓝牙 4 行 92+i*46（末行 230..271）；pic_list 88..272（card 46×4）；
+#     file_preview 276..368（蓝牙页 SetPos 下移 310..402，给进度条 291..303 让位）；
+#     file_bar 372..406（H 34）。
+#   ② file_bar_event 改用 YMGUI_Obj_GetAbsArea 取绝对矩形做命中。
+#   ③ 边条加宽 4→6、加浅色轨道、内容未超出时画"满高浅色滑块"（不再整条消失）；
+#     PIC_CARD_W 286→282 收进边条左侧。
+#   ④ 录音页 REC_SLOTS 4→3（列表 88..286）⇒ 提示 290、操作键 312..350、导航键 354..392 全部进视口。
+# 【尺寸】FLASH 1 685 908 B（80.39%）；DTCM 38 508 B（29.38%）；SRAM1 77.12%；SRAM2 65.16%。
+#495b3c1c30d9c6ef49a7b4a28847a36953d1ea33f4cc2e5b33958e8d69d4a79b  ymgui-h743.bin
+#fdae444bc31de696fc99e21a8fc278f3bd5b583695b8c29b0973208316838472  ymgui-h743.elf
+# ↑ 补丁26 首个版本（布局已改、但说明区仍是白底白字），已被下面这版取代。
+# ---- 补丁26b：说明区文字色（2026-10-18）----
+# 【症状】底栏修好之后，说明区（app 内 y=276..368）看起来一片空白。
+# 【根因】PhoneUI_app_text 把文字色写死 RGB(234,238,247)（给深色面板用的近白），
+#   而它的父容器是 app view（浅色 PAPER=RGB(246,247,251)）⇒ 白底白字。
+# 【修法】phone_ui.c 的 PhoneUI_app_text 文字色改 RGB(86,94,106) 正文灰。
+# 【尺寸】FLASH 1 685 908 B（80.39%）；DTCM 38 508 B（29.38%）。
+# da12c183587420c04e2de30047ac028c7fc75a0afbafecf71a03e5cd2ddf96cf  ymgui-h743.bin
+# cef55f4b91408948b59098e1596485df675008a1d1af03600d84ffc52630ad0f  ymgui-h743.elf
+# ---------------------------------------------------------------- 新基准（2026-10-18 补丁27，文件管理「录音」分类列不出卡上文件）
+# 【症状】文件管理器 → 录音：永远是"暂无录音文件"，卡上 REC_xxxx.WAV 明明存在（录音机 App 能录）。
+# 【根因·板上实锤】audio_rec.c 的 rec_list_build() 扩展名判断取"末 4 个字符"却去比 "WAVE"：
+#   REC_0001.WAV 的末 4 字符是 '.','W','A','V' ⇒ e3='.'≠'W'、e0='V'≠'E' ⇒ is_wav 恒 0
+#   ⇒ 每个 .WAV 都被 continue 掉（只有 *.wave 会碰巧通过，本板不产生）。
+#   SWD 扫描钩子实测：mount_rc=0、f_opendir 成功、目录条目 75、**认成 .WAV = 0**。
+# 【同批第二个根因】表长 64 且满时 break ⇒ 保留最旧 64 条、丢掉最新的 ⇒ 录到第 65 段后
+#   "新录音永远不出现"。改为表满时丢最旧一条（memmove），始终保留最新 64 条。
+# 【同批两处健壮性】
+#   ① rec_list_build 开头补 fatfs_ensure_mounted()（img_store 在 2026-10-09 为此栽过并写了注释，
+#      录音分类独独漏了 ⇒ 开机后没先开过音乐/相册就直接进录音分类会拿到 FR_NOT_ENABLED）；
+#   ② 录音卡片列表 draw/event 改用屏幕绝对矩形（原来用 view 局部常量，整体偏 36px：
+#      画在路径条上、点卡片命中上一张）。与补丁25b/26 的照片列表/底栏同一纪律。
+# 【验证】SWD 钩子 g_rec_scan_req 实测：entries=75、wav=75、n=64（首条 REC_0012 → 末条 REC_0075，
+#   证明保留的是最新 64 条）；bad=1（一段头损坏，UI 如实显示"损坏"）。
+# 【尺寸】FLASH 1 686 460 B（80.42%）；DTCM 38 684 B（29.51%）。
+# bd4ec5b3d8c486264d59d7b29529d5e58b228ab14a167723d220cab3ac24dcc4  ymgui-h743.bin
+# 208d6ba167915965eba0f8666c231d5bae0e43b343841da504b9a79a250e3238  ymgui-h743.elf
+# ---------------------------------------------------------------- 新基准（2026-10-18 补丁28，录音列表加右侧下拉滑条）
+# 【需求】文件管理 → 录音分类的卡片列表，右侧要有和照片列表一样的"下拉滑条"，可拖着跳。
+# 【做法】与照片列表 pic_draw_bar 同一套算法（滑块高 = vh*vh/内容高，下限 24；
+#   位置 = (vh−滑块高)·scroll/最大位移），差别只在滚动单位：
+#   照片列表 pic_scroll 是**像素**，录音列表 rec_scroll 是**首条卡片下标**（整数张）
+#   ⇒ 滑条用 rec_scroll / (rec_n−REC_SLOTS) 的比例换算，不改动已有卡片滚动与下拉刷新逻辑。
+# 【配套改动】
+#   ① 卡片宽 w(296) → REC_CARD_W(284)：否则卡片右边界盖住滑条（照片列表补丁26 踩过同坑），
+#      卡片内右对齐的时长/损坏字样与进度条宽度一并改用 cw；
+#   ② 滑条可拖：按在滑条区（bar_x−4 .. bar_x+REC_BAR_W+4）⇒ rec_bar_drag=1，
+#      Pressing 里绝对映射到卡片下标（+ (vh−th)/2 四舍五入，否则拖到底也差一张）；
+#      Released/ReleasedOff 复位，且拖过滑条一律不算点击、不触发下拉刷新；
+#   ③ 抓取区取 4px 是算过的：卡片右缘 295、滑条左缘 300，"300−4=296" 在卡片之外
+#      ⇒ 点卡片右缘不会误抓滑条；
+#   ④ 内容全部可见时画"满高浅色滑块"（不整条消失），与照片列表一致；
+#   ⑤ 函数名 rec_scrollbar_draw / rec_scrollbar_set_from_pointer —— 避开已有的
+#      卡片进度条 rec_draw_bar（同名会直接编译失败，已踩过）。
+# 【尺寸】FLASH 1 687 004 B（80.44%）；DTCM 38 684 B（29.51%）。
+# c5f2d447c1ef872f6f3c6d23bef16bbb00455d84624c74ddfeec64851471d32a  ymgui-h743.bin
+# c1f42aa608d946efa262a57738d954d1a183b6b9ce1260f7896e0aeb4a95817d  ymgui-h743.elf
+
+# ============================================================================
+# 补丁29（2026-10-18）：文件管理器 —— 去掉"演示存储 /"路径前缀；录音「分享」改「播放」
+#
+#   ① 顶部路径：file_refresh() 不再拼 "演示存储 / <分类>"，分类页只显示分类名、
+#      根页留空（顶部标题已经是"文件管理"，重复一条假多级路径没有意义）；
+#   ② 录音底栏第 3 键「分享」→「播放」（state.rec_share → rec_play，底色调蓝
+#      RGB(91,103,222)），点击 = PhoneHost_Open(MUSIC, <录音绝对路径>) ——
+#      **真的调用音乐播放器 App**，不是就地播一下；
+#   ③ 参数约定：show(argument) 见到 '/' 开头即"外部文件" ⇒ music.c 走 ext_mode，
+#      用新接口 BoardMusic_PlayFile(path) 直接 wav_play_start，**不查 /YMGUI/MUSIC
+#      扫描表**（录音在 /YMGUI/RECORD，套音乐下标必然播错文件）；ext_path 自己拷一份
+#      （参数只在本次 show 内有效，续播/播完重按还要用）；
+#   ④ ext_mode 下：标题取 BoardMusic_CurrentName()、状态显示"录音回放 · 播放中/已暂停"、
+#      暂停/续播/播完重按全走路径，前后曲键直接不动（录音没有"下一首"）；
+#   ⑤ 新增 board 接口：BoardRec_ListPath()（UI 不自己拼目录常量）、
+#      BoardMusic_PlayFile()；on_music 尾部抽成 apply_play_ui() 两条分支共用。
+# 【尺寸】FLASH 1 687 148 B（80.45%）；DTCM 38 740 B（29.56%）。SRAM2 65.16%。
+# 【验收】构建无 FAILED；烧录 + reset 后 bench.py「健康度 OK，76 拍/秒」；
+#         verify_board_image.py --sampled 4096 五段全一致 ⇒ 板上跑的就是这份固件。
+# 97123f6754885e9f77fcb204f396028e9f58f4e6e9ba618d664d02a53f7ae532  ymgui-h743.bin
+# 1a2c54cb3ba3d377d860c9050ee06252ec38b7aba8039d090accd93bf6e048d2  ymgui-h743.elf
+
+# ============================================================================
+# 补丁30（2026-10-18）：文件管理器新增「音乐」分类（/YMGUI/MUSIC），显示在照片下面
+#
+#   ① 分类 id 与显示顺序解耦：id 仍是 0照片/1录音/2笔记/3蓝牙/4音乐，新增 root_order[]
+#      = {0,4,1,2,3} 做"行号→分类 id"映射。**没有重排 id**，否则文件里几十处
+#      `folder == 0/1/2/3` 判定全部要改（改动面越大越容易漏）。
+#   ② 根页 4 行 → 5 行：行距 46→40、行高 41→36（5×46 会压到说明区），
+#      说明区随之下移 276→294（只在根页；照片/音乐/笔记列表页仍是 276）。
+#   ③ 音乐分类复用照片/笔记那套滑动列表 + 边条（pic_list），只加两个分歧点：
+#      取名/大小走 BoardMusic_Name/Size，点一个 = PhoneHost_Open(MUSIC, 绝对路径)
+#      ⇒ 与录音「播放」同一条"外部文件"路径（music.c 的 ext_mode）。
+#   ④ 删除走新接口 BoardMusic_Delete()（真删 + 立刻重扫）；路径走 BoardMusic_Path()。
+#   ⑤ 扫描表只有一张（img_scan_*）⇒ 进分类必须先 BoardMusic_Scan()，绘制回调里绝不扫卡。
+# 【尺寸】FLASH 1 687 748 B（80.48%）；DTCM 38 740 B（29.56%）。
+#        heap0 余量实测 7 712 B（peak 35 464 / total 43 176，比上版 +144 B = 多一个按钮）。
+# 【验收】构建无 FAILED；烧录 + reset 后 g_loop_count 递增、heap0 peak 35 464；
+#         verify_board_image.py --sampled 4096 五段一致；
+#         g_wav_test=1 起播 /YMGUI/MUSIC/TOKYOHOT.WAV 返回 g_wav_rc=0
+#         ⇒ 该目录确实有这首、音乐分类扫得到它。
+# 1bee037ca9273020edf603ab936cac067056e2ef00eeec15b1e064e0d975b838  ymgui-h743.bin
+# 1401398c0b4d127568a0403c47290defead4532a0dda4a3b5c2dd086b70566a4  ymgui-h743.elf
+
+# ============================================================================
+# 补丁31（2026-10-18）：音乐播放器「播放列表」两态界面 + 修"录音回放"错文案
+#
+#   ① 新增歌单页（整页第二态，不做弹层）：
+#      · 播放页状态行右侧加「列表」入口键（status 标签宽 280→200 让位）；
+#      · 歌单页 = 标题「播放列表 · n 首」+「返回」+ 自绘列表(12,98,296,282)；
+#      · 列表复用 files.c 的 pic_list 范式：一个自绘容器 + 手动 clip + 右侧边条
+#        (可拖) + **按拍增量滚动**(ml_scroll_tick 在 app_tick 最前面调用)；
+#      · 卡片 46px：两位序号 + 文件名(>18 截断) + 当前曲暖黄底 + 三根音柱
+#        (播放中橙 / 暂停灰)；点卡片 = 起播该曲并留在列表里连续切歌。
+#   ② 修「文件管理器点音乐文件 → 标题写"录音回放"」：
+#      根因 = 补丁29/30 把两条入口都当"外部文件"(ext_mode)，状态栏文案不分来源
+#      一律写"录音回放"。现在 ext_play() 先调 music_locate()：
+#      · 路径在 /YMGUI/MUSIC/ 下 → 现扫表、按**绝对路径**匹配出下标，
+#        转成正常音乐模式(ext_mode=0) ⇒ 状态"3/7 · 播放中"、前后曲/歌单高亮全部有效；
+#      · 只有真正的外部路径(录音等)才留 ext_mode，且按前缀分 ext_kind：
+#        /YMGUI/RECORD/ → "录音回放"，其它 → "文件播放"。
+#   ③ app_inspect 增加 music_list_view / music_ext_mode / music_ext_kind /
+#      music_list_scroll 四个诊断量（板上可直接确认两态与来源判定）。
+# 【尺寸】FLASH 1 690 340 B（80.60%）；DTCM 38 804 B（29.61%）。
+#        heap0：total 43 112 / peak 35 752 / n_alloc 484 ⇒ 余 7 360 B
+#        （比补丁30 少 352 B = 新增 4 个对象：入口键/返回键/标题/列表容器）。
+# 【验收】构建无 FAILED；烧录 + reset 后 g_loop_count=0x1f0 递增、g_fault 全 0；
+#         verify_board_image.py --sampled 4096 五段一致；
+#         g_wav_test=1 起播 /YMGUI/MUSIC/TOKYOHOT.WAV → g_wav_rc=0（wav 链路未破）。
+# ab1baf02f8e382398776830ae6d5cc8a36b186530899f66d8b41c9c260ec95e0  ymgui-h743.bin
+# 138ee5056eb493c4e5c93ddde3a2a021a5b56e4b6749715bcef1e0d2b221e1b2  ymgui-h743.elf
+
+# ============================================================================
+# 补丁32（2026-10-18）：打通下拉控制中心「静音」瓦片的实际作用
+#
+#   旧实现：`sound` 瓦片只翻本地 options[SOUND] 这一位 ⇒ 图标亮了，喇叭照响。
+#   现在：
+#   ① 新增全局 g_audio_mute（src/main.c，不持久化：重启恢复响铃）；
+#   ② 新增 es8311_ui_volume_effective() = 静音时 0、否则 g_audio_volume，
+#      **7 处"把 UI 音量换算成 REG32"的点全部改走它**：
+#      es8311_start_dac / es8311_dac_readback(闭环目标) / es8311_dac_repair /
+#      audio_out demo 起播 / audio_out 音量 ramp 每拍目标 / wav_play 两处起播前置写。
+#      ⇒ 起播 ramp、回读闭环、整段补写都抬不起音量，静音不会被任一路径覆盖。
+#   ③ BoardAudio_MuteOn/SetMute（main.c）→ phone_quick_builtin 的 sound 瓦片；
+#      active 与图标判据都改读真实状态（不再读 options[]）。
+#   ④ 拖音量滑杆（app_volume_persist，值 > 0）自动解除静音（与手机一致）。
+#   ⑤ 静音只写 REG32（数字音量），**不碰 REG31 的 mute 位**（补丁15：那是"咔"的根因）。
+# 【尺寸】FLASH 1 690 476 B（80.62%）；DTCM 38 804 B（29.61%）。
+# 【验收】构建无 FAILED；
+#   ① 播放中 REG32 回读 = 0x61（= 音量 51 换算值）；
+#   ② SWD 置 g_audio_mute=1 → 3 s 后 REG32 回读 = 0x00（静音真落到芯片）；
+#   ③ 置回 0 → REG32 回到 0x61；
+#   ④ 静音态起播：g_wav_rc=0 且 REG32 = 0x00（ramp 目标被压成 0，起播即安静）；
+#   ⑤ 播放中解除静音：REG32 → 0x61。
+#   verify_board_image.py --sampled 4096 五段一致。
+# 842883e2cbac9809d2e390e5dbac7a4ba2c57d7afcd1a93df7d739988b6af0e6  ymgui-h743.bin
+# b2473d124ed2e8642882fad3a19be79654f050a381fa20ed50c83497f2bc6fc4  ymgui-h743.elf
+
+# ============================================================================
+# 补丁33（2026-10-18）：图库导入去重（同一张图不再重复进相册）
+#
+#   调查结论（板上实测，不是推测）：
+#   ① 烧录本身不写图库：烧录+复位、全程不碰 UI，图库张数 0 → 0；
+#   ② 全仓会写图库索引的**只有导入**（import_bmp / import_jpeg），入口两条：
+#      文件管理器「照片」点卡片、蓝牙接收收尾（finish_ok → img_import_path）；
+#   ③ 旧实现**完全不查重** ⇒ 同一张图被重复触发（重复点、蓝牙重传、脚本重跑）
+#      就新增一条索引 + 一份数据，相册里越攒越多 —— 这正是"每次烧录后相册又多图"。
+#   本补丁把"重复"这件事在导入末尾掐掉。
+#
+#   实现：
+#   · find_duplicate_of()：宽/高/字节数全同 + 数据区 **5 段各 32 B 逐字节相同**
+#     （0、1/4、1/2、3/4、末段）⇒ 判为同一张；
+#   · 命中则 img_store_delete(new_slot) 撤销本次新增（只清 VALID 位，空洞下次复用），
+#     计数 g_img_dup_skip++，返回新增的 RC_DUP(=17)；
+#   · BMP 与 JPEG 两条导入路径都接上；
+#   · UI：files.c 导入完成后按返回码提示（成功/已在图库里/rc=N，以前只记数字不显示）；
+#     bt_recv 的 imp_result_text 补 RC_DUP 文案；
+#   · phone_shell_board.h 暴露 BOARD_PIC_RC_DUP(17)，与 src 的 RC_DUP 对齐。
+# 【尺寸】FLASH 1 691 188 B（80.64%）。
+# 【验收】SWD 连导同一张 bt_test.bmp 两次：
+#   第 1 次 g_img_rc=0、g_img_count 0→1、g_img_dup_skip=0；
+#   第 2 次 g_img_rc=17(RC_DUP)、g_img_count **仍为 1**、g_img_dup_skip=1；
+#   再导另一张 bt_recv.bmp（非 BMP 内容）走原错误路径 rc=4 ⇒ 去重不会误伤不同文件。
+#   之后用 mode 3 清空图库，恢复原状（count=0）；抽样 5 段逐字节一致。
+72608281cc9d28e8357200f11a6694b5b8b4b580cd16de82070e5a08d63fc66e  ymgui-h743.bin
+af0c0638767831e22b6c886533f97b4818a5ba9a1d793bf83d9369d3ae0368be  ymgui-h743.elf

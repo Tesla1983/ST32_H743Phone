@@ -17,6 +17,11 @@ enum
 };
 /* SOUND 表示静音已开启；默认正常响铃。
  *
+ * ⚠ 2026-10-18（补丁32）：SOUND 一项**不再是本地假开关** —— 拨它必须真的把输出压到
+ *   静音（BoardAudio_SetMute），状态也改读 BoardAudio_MuteOn()。旧实现只翻
+ *   options[SOUND] 这一位，图标会亮，但喇叭照样出声（用户报的"静音按钮没作用"）。
+ *   与 WIFI/BLUETOOTH 的处理方式一致：options[] 里那一位只作历史残留，不参与显示与逻辑。
+ *
  * ⚠ 2026-10-10：WIFI / BLUETOOTH 两项**不再用这里的本地假开关** ——
  *   WiFi 射频与蓝牙射频都在对端 ESP32 上，下拉抽屉拨开关必须真的下发命令
  *   （$?RADIO,<WIFI|BT>,<ON|OFF>）并以下发回来的 $RD 帧为准。
@@ -34,6 +39,8 @@ static int builtin_active(int id)
 		return BoardNet_RadioWifiOn() > 0 ? 1 : 0;
 	if (id == BLUETOOTH)
 		return BoardNet_RadioBtOn() > 0 ? 1 : 0;
+	if (id == SOUND)
+		return BoardAudio_MuteOn() > 0 ? 1 : 0;   /* 补丁32：真实静音态 */
 	return options[id];
 }
 
@@ -63,6 +70,13 @@ static void toggle(int id)
 		BoardNet_SetBt(BoardNet_RadioBtOn() > 0 ? 0 : 1);
 		return;
 	}
+	/* 补丁32：静音是**真实输出闸**（写 ES8311 REG32=0），不是本地选项位。
+	 * 不改 g_audio_volume ⇒ 关掉后回到用户原来的音量档。 */
+	if (id == SOUND)
+	{
+		BoardAudio_SetMute(BoardAudio_MuteOn() > 0 ? 0 : 1);
+		return;
+	}
 	options[id] = !options[id];
 	if (id == FLIGHT && options[id])
 		options[DATA] = options[HOTSPOT] = 0;
@@ -88,7 +102,9 @@ static void draw(int id, GYSURFACE s, int x, int y, GYcolor bg)
 		YMGUI_Draw_Line(s, x - 4, y - 4, x + 1, y - 9, WHITE);
 		YMGUI_Draw_Line(s, x + 1, y - 9, x + 1, y + 9, WHITE);
 		YMGUI_Draw_Line(s, x + 1, y + 9, x - 4, y + 4, WHITE);
-		if (options[id])
+		/* ⚠ 判据必须走 builtin_active：直接读 options[SOUND] 会让图标与真实静音态脱钩
+		 *   （拖音量解除静音、或 SWD 改 g_audio_mute 时，叉号不会跟着变）。 */
+		if (builtin_active(SOUND))
 		{
 			YMGUI_Draw_Line(s, x + 6, y - 4, x + 13, y + 4, WHITE);
 			YMGUI_Draw_Line(s, x + 6, y + 4, x + 13, y - 4, WHITE);

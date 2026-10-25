@@ -154,7 +154,14 @@ int         BoardMusic_Scan(void);
 int         BoardMusic_Count(void);
 int         BoardMusic_Name(int i, char *out, int n);
 int         BoardMusic_Size(int i, uint32_t *size);
+/* 补丁30：第 i 首的完整路径 / 删除第 i 首（文件管理器的「音乐」分类用；
+ * 删除返回 0=成功 2=下标无效 -1=未挂载 -3=路径拼接失败 -4=f_unlink 失败）。 */
+int         BoardMusic_Path(int i, char *out, int n);
+int         BoardMusic_Delete(int i);
 int         BoardMusic_Play(int i);
+/* 播放任意路径的 WAV（补丁29）：文件管理器「播放」把 /YMGUI/RECORD 里的录音交给本函数。
+ * 不经过 /YMGUI/MUSIC 的扫描表 ⇒ 录音下标与音乐下标互不干扰。0 = 已起播；<0 = 失败。 */
+int         BoardMusic_PlayFile(const char *path);
 void        BoardMusic_Stop(void);
 int         BoardMusic_Playing(void);
 int         BoardMusic_LastRc(void);   /* 上一次动作的返回码（UI 直接显示）*/
